@@ -38,6 +38,7 @@
 #include <melee/pl/player.h>
 
 #include <stddef.h>
+#include <string.h>
 
 #include "mu_ak_fighter.h"
 #include "mu_test_env.h"
@@ -960,6 +961,110 @@ static void fill_fighter(int slot, const MuAkFighter* ft)
     }
 }
 
+/* ---- clones ---- */
+
+/* A clone: an added fighter with no code of its own. Its fighter file carries no ftFunction (the
+ * symbol m-ex loads a fighter's code from), and every function MxDt gives it is the game's own,
+ * so each of its slots is the retail fighter's that has the same function (default_kind): Dr.
+ * Mario's moves on another model, a second Marth. Such a fighter needs no descriptor written for
+ * it and no plugin; one is made here. A fighter with code of its own is not one, and stays locked
+ * until its code is there. */
+void* mu_native_alloc(u32 size);
+void mu_native_free(void* ptr);
+
+static MuAkFighter ak_clone[MU_AK_KIND_SLOTS];
+static const char* ak_clone_file[MU_AK_KIND_SLOTS];   /* the file the verdict below is for */
+static signed char ak_clone_verdict[MU_AK_KIND_SLOTS];   /* 1 a clone, -1 not, 0 not looked at */
+
+static u32 clone_be32(const u8* p)
+{
+    return (u32) p[0] << 24 | (u32) p[1] << 16 | (u32) p[2] << 8 | p[3];
+}
+
+/* Whether a file of the disc names a public symbol: 1, 0, or -1 when the file cannot be read as
+ * an archive. */
+static int file_has_symbol(const char* file, const char* symbol)
+{
+    size_t length = lbFileGetSize(file);
+    u8* block;
+    u8* data;
+    u32 data_size, relocs, publics, externs, table, names, i;
+    int found = 0;
+    /* The disc reads into a buffer on a 32-byte boundary, a whole number of 32 bytes long. */
+    if (length < 0x20 || length > 32u * 1024u * 1024u || (block = mu_native_alloc((u32) length + 96)) == NULL) {
+        return -1;
+    }
+    data = (u8*) (((uintptr_t) block + 31) & ~(uintptr_t) 31);
+    lbFile_8001668C(file, data, &length);
+    data_size = clone_be32(data + 4);
+    relocs = clone_be32(data + 8);
+    publics = clone_be32(data + 0xC);
+    externs = clone_be32(data + 0x10);
+    table = 0x20 + data_size + relocs * 4;
+    names = table + (publics + externs) * 8;
+    if (data_size > length || relocs > length / 4 || publics > 4096 || externs > 4096 || names > length) {
+        mu_native_free(block);
+        return -1;
+    }
+    for (i = 0; i < publics && !found; i++) {
+        const u32 at = names + clone_be32(data + table + i * 8 + 4);
+        size_t k = 0;
+        while (at + k < length && symbol[k] != '\0' && data[at + k] == (u8) symbol[k]) {
+            k++;
+        }
+        found = at + k < length && symbol[k] == '\0' && data[at + k] == '\0';
+    }
+    mu_native_free(block);
+    return found;
+}
+
+/* The retail game's code and data on the console: an address MxDt gives inside it is the game's
+ * own function or table, one outside it is code a mod brought. */
+static int retail_address(unsigned int address)
+{
+    return address >= 0x80003100u && address < 0x804DEC00u;
+}
+
+/* The descriptor of slot `slot` when its fighter is a clone, NULL when it is not. */
+static const MuAkFighter* clone_fighter(int slot, int mex, const char* file, const char* name)
+{
+    if (ak_clone_file[slot] != file) {
+        int table, own_code;
+        unsigned int outside = 0;
+        ak_clone_file[slot] = file;
+        ak_clone_verdict[slot] = -1;
+        for (table = 0; table < 46 && outside == 0; table++) {
+            const unsigned int fn = mu_mex_fighter_function(table, mex);
+            if (fn >= 0x80000000u && !retail_address(fn)) {   /* a smaller word is a number, not an address */
+                outside = fn;
+            }
+        }
+        own_code = outside != 0 ? 1 : file_has_symbol(file, "ftFunction");
+        if (own_code == 0) {
+            const int as = default_kind(0, mex);   /* whose onload: the fighter it is made from */
+            ak_clone_verdict[slot] = 1;
+            OSReport("[ak] %s (%s): no code of its own and every function the game's: a clone, its slots retail kind %d's\n",
+                     name != NULL ? name : "?", file, as);
+        } else if (outside != 0) {
+            OSReport("[ak] %s (%s): not a clone, MxDt gives it a function outside the game (%08X)\n", name != NULL ? name : "?",
+                     file, outside);
+        } else if (own_code > 0) {
+            OSReport("[ak] %s (%s): not a clone, its file carries code of its own (ftFunction)\n", name != NULL ? name : "?",
+                     file);
+        } else {
+            OSReport("[ak] %s (%s): its file could not be read to see whether it is a clone\n", name != NULL ? name : "?", file);
+        }
+    }
+    if (ak_clone_verdict[slot] != 1) {
+        return NULL;
+    }
+    memset(&ak_clone[slot], 0, sizeof ak_clone[slot]);
+    ak_clone[slot].name = name != NULL ? name : "?";
+    ak_clone[slot].file = file;
+    ak_clone[slot].flags = MU_AK_READY;
+    return &ak_clone[slot];
+}
+
 /* At each content view change (shim/mu_mex.c): the mod view fills the added fighters' slots, the
  * retail view (and a retail disc) leaves them empty. */
 void mu_ak_apply(void)
@@ -991,6 +1096,12 @@ void mu_ak_apply(void)
         }
         ak_mex[slot] = (signed char) mex;
         ft = find_fighter(file, mu_mex_fighter_name(mu_mex_external_of_internal(mex)));
+#ifdef MU_AKANEIA_FIGHTERS
+        if (ft == NULL) {
+            /* No code written or loaded for it: playable all the same when it needs none. */
+            ft = clone_fighter(slot, mex, file, mu_mex_fighter_name(mu_mex_external_of_internal(mex)));
+        }
+#endif
         ak_fighter[slot] = ft;
         if (ft == NULL) {
             /* No descriptor for this file: the slot keeps no table entry, no character kind
