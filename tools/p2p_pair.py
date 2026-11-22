@@ -15,7 +15,10 @@ damages the traffic between them in a repeatable way.
 
 PASS needs, on both sides: the handshake done and the match started, more than 0 checksums compared
 with 0 mismatched, no DESYNC and no crash line, a result file written, and the two result files
-holding the same descriptor digest and the same input transcript digest.
+holding the same descriptor digest and the same input transcript digest. A transcript keeps growing
+after the game's end, until its instance stops, so two transcripts can end a frame or so apart (a
+lossy link loses the last pads); then the agreement the games judged themselves stands in for the
+digests: see transcripts_agree.
 
 With --games n both instances get --p2p-games n and play n games without a new connection. Game k
 after the first writes result.g<k>.json. PASS then needs all of the above for every game (each
@@ -98,11 +101,13 @@ def check_games(logs, firsts, games, labels=("P1", "P2")):
     print("\ngame  side  frames compared mismatched result  peer        descriptor        transcript")
     for game in range(1, games + 1):
         pair = []
+        game_ends = []
         for i in range(2):
             ends = logs[i]["games"]
             end = ends[game - 1] if len(ends) >= game else None
             res = parse_result(result_file(firsts[i], game))
             pair.append(res)
+            game_ends.append(end)
             print(f"{game:4}  {labels[i]:5} {end['frames'] if end else 0:6} {end['compared'] if end else 0:8} "
                   f"{end['mismatched'] if end else 0:10} {'yes' if res else 'no':6}  {(res['peer_agreement'] if res else '-'):10}  "
                   f"{(res['descriptor_digest'][:16] if res else '-'):16}  {(res['transcript_digest'][:16] if res else '-'):16}")
@@ -110,10 +115,14 @@ def check_games(logs, firsts, games, labels=("P1", "P2")):
                 ok = False
         if all(pair):
             a, b = pair
-            for key, label in (("descriptor_digest", "descriptor digest"), ("transcript_digest", "input transcript digest")):
-                if not a[key] or a[key] != b[key]:
-                    print(f"      game {game}: {label} DIFFERENT")
-                    ok = False
+            if not a["descriptor_digest"] or a["descriptor_digest"] != b["descriptor_digest"]:
+                print(f"      game {game}: descriptor digest DIFFERENT")
+                ok = False
+            agree, line = transcripts_agree(a, b, game_ends)
+            if not agree or a["transcript_frames"] != b["transcript_frames"]:
+                print(f"      game {game}: {line}")
+            if not agree:
+                ok = False
             if any(p["peer_agreement"] == "mismatch" for p in pair):
                 print(f"      game {game}: a side reports the other's inputs as different")
                 ok = False
@@ -141,7 +150,43 @@ def parse_result(path):
     for key in ("transcript_frames", "winner"):
         m = re.search(r'"%s"\s*:\s*(-?\d+)' % key, text)
         out[key] = int(m.group(1)) if m else -1
+    m = re.search(r'"transcript_complete"\s*:\s*(true|false)', text)
+    out["transcript_complete"] = bool(m) and m.group(1) == "true"
     return out
+
+
+def transcripts_agree(a, b, ends):
+    """Whether two result files say the two games played the same inputs, and the line that says so.
+    `ends` holds each side's game end entry from its log (parse_log "games"), None where missing.
+
+    A session goes on adding frames to its transcript after the game's end while the two games still
+    trade pads (rollback_session.cpp: each side has to reach the other's count to compare), up to
+    whenever its instance stops, so the two files can hold transcripts of different lengths (a lossy
+    link loses the last pads). Two digests over the same frames must be equal. Over different frames
+    they say nothing, and the comparison the games made at the game's end stands in: each side's
+    digest through the other's game end count, which is the file's peer_agreement. Then neither side
+    may report a mismatch, the side whose peer ended last must report a match (its comparison runs
+    through the game's last confirmed frame), and both transcripts must be complete and reach that
+    frame, so that only frames after the game's end differ."""
+    fa, fb = a["transcript_frames"], b["transcript_frames"]
+    da, db = a["transcript_digest"], b["transcript_digest"]
+    if fa == fb:
+        same = bool(da) and da == db
+        return same, f"input transcript digest: {'same' if same else 'DIFFERENT'} ({da[:16] or 'none'} / {db[:16] or 'none'})"
+    game_end = max((e["frames"] for e in ends if e), default=0)
+    agreement = (a["peer_agreement"], b["peer_agreement"])
+    complete = a["transcript_complete"] and b["transcript_complete"]
+    through_end = any(agreement[i] == "match" and ends[1 - i] and ends[1 - i]["frames"] == game_end for i in (0, 1))
+    ok = game_end > 0 and min(fa, fb) >= game_end and complete and "mismatch" not in agreement and through_end
+    if ok:
+        why = f"the frames after the game's end at {game_end}; the inputs through it agree ({agreement[0]} / {agreement[1]})"
+    elif "mismatch" in agreement or not through_end:
+        why = f"and the games did not confirm the inputs through the game's end ({agreement[0]} / {agreement[1]})"
+    elif not complete:
+        why = "and a transcript stopped before the game's end"
+    else:
+        why = f"and a transcript ends before the game's end at {game_end or '?'}"
+    return ok, f"input transcript digest: {'over different frames' if ok else 'DIFFERENT'} ({fa} / {fb} frames, {why})"
 
 
 def main():
@@ -281,11 +326,13 @@ def main():
             ok = False
     if all(results):
         a, b = results
-        for key, label in (("descriptor_digest", "descriptor digest"), ("transcript_digest", "input transcript digest")):
-            same = bool(a[key]) and a[key] == b[key]
-            print(f"{label}: {'same' if same else 'DIFFERENT'} ({a[key][:16] or 'none'} / {b[key][:16] or 'none'})")
-            if not same:
-                ok = False
+        same = bool(a["descriptor_digest"]) and a["descriptor_digest"] == b["descriptor_digest"]
+        print(f"descriptor digest: {'same' if same else 'DIFFERENT'} "
+              f"({a['descriptor_digest'][:16] or 'none'} / {b['descriptor_digest'][:16] or 'none'})")
+        agree, line = transcripts_agree(a, b, [r["games"][0] if r["games"] else None for r in logs])
+        print(line)
+        if not same or not agree:
+            ok = False
     if args.games > 1:
         if not check_games(logs, [out / f"p{i + 1}" / "result.json" for i in range(2)], args.games):
             ok = False
