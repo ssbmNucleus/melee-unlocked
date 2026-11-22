@@ -43,6 +43,11 @@ typedef struct MuFighterPlugin {
  * (may be NULL), else the one whose file is `file`; NULL when none. The first call loads the
  * plugins. */
 const void* mexft_plugin_fighter(const char* file, const char* mex_name);
+/* Looks in the folder again and loads the plugins put there since the last look (a download, a
+ * file copied in while the game runs); returns how many it loaded. Called between major modes
+ * (shim/mu_mex.c mu_mex_boot), where no fighter exists: the registry is then built again. A plugin
+ * already loaded stays as it is. */
+int mexft_plugins_rescan(void);
 /* The loaded plugins' variables as snapshot ranges ({address, size} pairs, MuStateRegion's
  * layout); returns how many there are, and writes at most `capacity`. */
 unsigned int mexft_plugin_ranges(void* out, unsigned int capacity);

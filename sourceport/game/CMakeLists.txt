@@ -424,7 +424,7 @@ if(MU_AKANEIA_FIGHTERS)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
   endif()
   set(MEXFT_ABI_INPUTS "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h"
-    "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugin.h" "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighter.h")
+    "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighter.h")
   if(MEXFT_MANIFESTS)
     list(APPEND MEXFT_ABI_INPUTS "${CMAKE_CURRENT_BINARY_DIR}/mexft/overlay")
   else()

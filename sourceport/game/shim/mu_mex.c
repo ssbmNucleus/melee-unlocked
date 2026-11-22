@@ -374,6 +374,19 @@ void mu_mex_boot(void)
         return;
     }
     if (mex != NULL) {
+#ifdef MU_AKANEIA_FIGHTERS
+        /* The mod view is already up. A fighter plugin put in the folder since the last mode
+         * (mexft/mexft_plugins.c) is loaded now, where no fighter exists, and the registry is built
+         * again so its fighter is no longer locked. */
+        {
+            int mexft_plugins_rescan(void);
+            const int added = mexft_plugins_rescan();
+            if (added > 0) {
+                mu_ak_apply();
+                OSReport("[mex] %d fighter plugins added while running: the fighters are registered again\n", added);
+            }
+        }
+#endif
         return;
     }
     if (mex_loaded == NULL) {

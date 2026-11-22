@@ -653,7 +653,42 @@ static int by_name(const void* a, const void* b)
     return strcmp((const char*) a, (const char*) b);
 }
 
-static void load_all(void)
+/* The files already tried, by name and by what the folder says of them (size and time of the last
+ * write): a scan tries a file once, and again only when it has been replaced. */
+typedef struct Seen {
+    char name[MAX_PATH];
+    unsigned int stamp[3];
+} Seen;
+static Seen seen[MAX_PLUGINS];
+static int seen_count;
+
+static int was_seen(const WIN32_FIND_DATAA* found, int remember)
+{
+    const unsigned int stamp[3] = { found->size_low, found->times[4], found->times[5] };
+    int i;
+    for (i = 0; i < seen_count; i++) {
+        if (same_text(seen[i].name, found->cFileName)) {
+            if (memcmp(seen[i].stamp, stamp, sizeof stamp) == 0) {
+                return 1;
+            }
+            if (remember) {
+                memcpy(seen[i].stamp, stamp, sizeof stamp);
+            }
+            return 0;
+        }
+    }
+    if (remember && seen_count < MAX_PLUGINS) {
+        strcpy(seen[seen_count].name, found->cFileName);
+        memcpy(seen[seen_count].stamp, stamp, sizeof stamp);
+        seen_count++;
+    }
+    return 0;
+}
+
+/* Loads the plugins in the folder that have not been tried yet; returns how many it loaded. The
+ * first scan is the one at startup. A later one (mexft_plugins_rescan) finds a file put there
+ * while the game runs. */
+static int scan(void)
 {
     char library_dir[MAX_PATH], dir[MAX_PATH], pattern[MAX_PATH + 16], path[MAX_PATH * 2];
     static char names[MAX_PLUGINS][MAX_PATH];
@@ -661,10 +696,11 @@ static void load_all(void)
     HANDLE find;
     char* slash;
     int count = 0, i;
+    const int before = plugin_count;
     const char* named = getenv("MELEE_FIGHTER_PLUGINS");
     const unsigned int n = GetModuleFileNameA((HANDLE) __ImageBase, library_dir, MAX_PATH - 16);
     if (n == 0 || n >= MAX_PATH - 16 || (slash = strrchr(library_dir, '\\')) == NULL) {
-        return;
+        return 0;
     }
     *slash = '\0';
     if (named != NULL && named[0] != '\0' && strlen(named) < MAX_PATH - 16) {
@@ -677,16 +713,16 @@ static void load_all(void)
     strcat(pattern, "\\*" MU_FIGHTER_PLUGIN_EXTENSION);
     find = FindFirstFileA(pattern, &found);
     if (find == INVALID_HANDLE_VALUE) {
-        return;
+        return 0;
     }
     do {
-        if (count < MAX_PLUGINS && strlen(found.cFileName) < MAX_PATH) {
+        if (count < MAX_PLUGINS && strlen(found.cFileName) < MAX_PATH && !was_seen(&found, 1)) {
             strcpy(names[count++], found.cFileName);
         }
     } while (FindNextFileA(find, &found));
     FindClose(find);
     if (count == 0) {
-        return;
+        return 0;
     }
     if (syms_load(library_dir)) {
         qsort(names, (size_t) count, sizeof names[0], by_name);
@@ -698,11 +734,16 @@ static void load_all(void)
         }
     }
     syms_free();
-    OSReport("[plugin] %d of %d fighter plugins loaded from %s\n", plugin_count, count, dir);
+    OSReport("[plugin] %d of %d new fighter plugins loaded from %s (%d loaded in all)\n", plugin_count - before, count,
+             dir, plugin_count);
+    return plugin_count - before;
 }
 #else
 /* The ELF builds link their fighters in for now. */
-static void load_all(void) {}
+static int scan(void)
+{
+    return 0;
+}
 #endif
 
 const void* mexft_plugin_fighter(const char* file, const char* mex_name)
@@ -710,7 +751,7 @@ const void* mexft_plugin_fighter(const char* file, const char* mex_name)
     int i;
     if (!loaded) {
         loaded = 1;
-        load_all();
+        scan();
     }
     /* The fighter's own name first: a build may give the fighter any slot, and so any file name. */
     for (i = 0; mex_name != NULL && mex_name[0] != '\0' && i < fighter_count; i++) {
@@ -725,6 +766,14 @@ const void* mexft_plugin_fighter(const char* file, const char* mex_name)
         }
     }
     return NULL;
+}
+
+int mexft_plugins_rescan(void)
+{
+    if (!loaded) {
+        return 0; /* the registry has not asked yet: its first lookup scans */
+    }
+    return scan();
 }
 
 unsigned int mexft_plugin_ranges(void* out, unsigned int capacity)
