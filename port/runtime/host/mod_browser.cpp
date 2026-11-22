@@ -45,7 +45,9 @@ constexpr uint64_t kMaxPageBytes = 2u * 1024u * 1024u;
 constexpr uint64_t kMaxFileBytes = 96u * 1024u * 1024u;
 constexpr auto kPageLife = std::chrono::minutes(10);
 
-struct File { int id = 0; std::string name, url; bool plugin = false; };
+// plugin: a fighter's built code. source: one file of its C (a "code" folder in the post).
+// info: the post's fighter.json, which names the fighter.
+struct File { int id = 0; std::string name, url; bool plugin = false, source = false, info = false; };
 struct Mod : Row { std::vector<File> files; };
 struct Page {
   int status = kLoading;
@@ -175,6 +177,8 @@ std::string text_of(const json& j, const char* key) {
   return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
 }
 
+std::string safe_name(const std::string& name);
+
 std::string url_encode(const std::string& s) {
   static const char hex[] = "0123456789ABCDEF";
   std::string out;
@@ -196,6 +200,162 @@ bool game_file(const std::string& name) {
   return ext == ".dat" || ext == ".usd";
 }
 bool plugin_file(const std::string& name) { return extension(name) == kPluginExtension; }
+std::string base_name(const std::string& name) {
+  const auto slash = name.find_last_of("/\\");
+  return slash == std::string::npos ? name : name.substr(slash + 1);
+}
+// A file of a fighter's C: directly in a folder named "code", C or a header or the hand edits.
+bool source_file(const std::string& name) {
+  std::string path = name;
+  for (auto& c : path) c = c == '\\' ? '/' : (char)std::tolower((unsigned char)c);
+  const auto slash = path.rfind('/');
+  const std::string folder = slash == std::string::npos ? std::string() : path.substr(0, slash);
+  const bool in_code = folder == "code" || (folder.size() > 5 && folder.compare(folder.size() - 5, 5, "/code") == 0);
+  const std::string ext = extension(path);
+  return in_code && (ext == ".c" || ext == ".h" || base_name(path) == "native.edits");
+}
+bool info_file(const std::string& name) {
+  std::string base = base_name(name);
+  for (auto& c : base) c = (char)std::tolower((unsigned char)c);
+  return base == "fighter.json";
+}
+
+// The fighter tools: what builds a plugin from a fighter's C on this computer. One folder
+// (MELEE_FIGHTER_TOOLS) holding the fighter plugin kit (kit), a MinGW-w64 GCC (gcc) and a Python
+// (python). Every player must build with the same ones: the compiler decides the code, and two
+// builds of one fighter that differ would not stay in step online (the plugin's digest in the
+// state checksum says so on the first frame compared).
+struct Tools { fs::path kit, gcc_bin, python; };
+bool find_tools(Tools* tools, std::string* problem) {
+  const char* v = std::getenv("MELEE_FIGHTER_TOOLS");
+  if (!v || !*v) { *problem = "Building a fighter needs the fighter tools (MELEE_FIGHTER_TOOLS)"; return false; }
+  const fs::path root = fs::u8path(v);
+  tools->kit = root / L"kit";
+  tools->gcc_bin = root / L"gcc" / L"bin";
+  tools->python = root / L"python" / L"python.exe";
+  std::error_code ec;
+  if (!fs::is_regular_file(tools->kit / L"tools" / L"mexft_build.py", ec) || !fs::is_regular_file(tools->gcc_bin / L"gcc.exe", ec) ||
+      !fs::is_regular_file(tools->python, ec)) {
+    *problem = "The fighter tools folder is incomplete";
+    return false;
+  }
+  return true;
+}
+
+// Runs a program to its end, its output to a file. False when it could not start, ran past the
+// time allowed, or ended with an error.
+bool run_program(const std::wstring& command, const fs::path& folder, const fs::path& output, int seconds) {
+#ifdef _WIN32
+  SECURITY_ATTRIBUTES inherit{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+  HANDLE out = CreateFileW(output.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &inherit, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (out == INVALID_HANDLE_VALUE) return false;
+  STARTUPINFOW si{};
+  si.cb = sizeof si;
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = out;
+  si.hStdError = out;
+  PROCESS_INFORMATION pi{};
+  std::wstring line = command;
+  const BOOL started = CreateProcessW(nullptr, line.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, folder.c_str(), &si, &pi);
+  CloseHandle(out);
+  if (!started) return false;
+  DWORD code = 1;
+  if (WaitForSingleObject(pi.hProcess, (DWORD)seconds * 1000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
+  else TerminateProcess(pi.hProcess, 1);   // the one this call started
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return code == 0;
+#else
+  (void)command; (void)folder; (void)output; (void)seconds;
+  return false;
+#endif
+}
+
+// A plugin file into the fighters folder, when it is one: a 64-bit object that names the plugin's
+// record. Whole or not at all, since the game may look at the folder at any change of mode.
+bool keep_plugin(const fs::path& path, const std::string& wanted_name, const std::string& fighters_folder, std::string* problem,
+                 std::string* kept) {
+  std::error_code ec;
+  if (fighters_folder.empty()) { *problem = "This game has no fighters folder"; return false; }
+  std::ifstream in(path, std::ios::binary);
+  const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  in.close();
+  if (bytes.size() < 64 || bytes.size() > kMaxPluginBytes || (unsigned char)bytes[0] != 0x64 || (unsigned char)bytes[1] != 0x86 ||
+      bytes.find("mu_fighter_plugin") == std::string::npos) {
+    *problem = "That file is not a fighter plugin";
+    return false;
+  }
+  std::string name;
+  for (const char c : wanted_name) name += std::isalnum((unsigned char)c) ? (char)std::tolower((unsigned char)c) : '_';
+  if (name.empty()) name = "fighter";
+  const fs::path target = fs::u8path(fighters_folder) / fs::u8path(name + kPluginExtension);
+  const fs::path staged = fs::u8path(fighters_folder) / fs::u8path(name + ".part");
+  fs::create_directories(target.parent_path(), ec);
+  fs::copy_file(path, staged, fs::copy_options::overwrite_existing, ec);
+  if (!ec) fs::rename(staged, target, ec);
+  if (ec) { *problem = "The plugin could not be written to the fighters folder"; fs::remove(staged, ec); return false; }
+  *kept = target.u8string();
+  return true;
+}
+
+std::wstring quoted(const fs::path& path) { return L"\"" + path.wstring() + L"\""; }
+
+// Builds a fighter's plugin from the C its post carries, with the fighter tools, and keeps it.
+bool build_from_source(const Mod& mod, const fs::path& folder, const std::string& fighters_folder, std::string* problem) {
+  Tools tools;
+  if (!find_tools(&tools, problem)) return false;
+  // The fighter's name: the post's fighter.json says what the disc calls it, else the title.
+  std::string fighter_name = mod.title;
+  for (const auto& file : mod.files) {
+    if (!file.info) continue;
+    std::string body, error;
+    if (https_get(file.url, nullptr, &body, kMaxPageBytes, &error)) {
+      const json doc = json::parse(body, nullptr, false);
+      if (doc.is_object() && !text_of(doc, "name").empty()) fighter_name = text_of(doc, "name");
+    }
+  }
+  std::string ident;
+  for (const char c : fighter_name) ident += std::isalnum((unsigned char)c) ? (char)std::tolower((unsigned char)c) : '_';
+  while (!ident.empty() && ident.back() == '_') ident.pop_back();
+  if (ident.empty() || std::isdigit((unsigned char)ident[0])) ident = "f_" + ident;
+  std::error_code ec;
+  const fs::path stage = folder / fs::u8path(ident);
+  fs::create_directories(stage / L"code", ec);
+  int sources = 0;
+  for (const auto& file : mod.files) {
+    if (!file.source) continue;
+    const std::string base = safe_name(base_name(file.name));
+    // The hand edits sit beside the manifest, the C in its folder (tools/mexft/mexft_build.py).
+    const fs::path path = base == "native.edits" ? stage / L"native.edits" : stage / L"code" / fs::u8path(base);
+    std::string error;
+    if (!https_get(file.url, &path, nullptr, kMaxPageBytes, &error)) { *problem = error; return false; }
+    if (extension(base) == ".c") ++sources;
+  }
+  if (!sources) { *problem = "This post has no C source"; return false; }
+  {
+    std::ofstream manifest(stage / L"mexft.txt", std::ios::binary);
+    manifest << "name " << fighter_name << "\nfile Pl" << ident << ".dat\nmex-name " << fighter_name << "\n";
+  }
+  const fs::path built = folder / fs::u8path(ident + kPluginExtension);
+  const fs::path log = folder / L"build.txt";
+  const std::wstring command = quoted(tools.python) + L" -I " + quoted(tools.kit / L"tools" / L"mexft_build.py") + L" --kit " +
+                               quoted(tools.kit) + L" --gcc-bin " + quoted(tools.gcc_bin) + L" --fighter " + quoted(stage) +
+                               L" --out " + quoted(built) + L" --work " + quoted(folder / L"work");
+  if (!run_program(command, folder, log, 180) || !fs::is_regular_file(built, ec)) {
+    // The last line the tools printed is the reason (a compile error, a missing export).
+    std::ifstream in(log);
+    std::string line, last;
+    while (std::getline(in, line)) if (!line.empty()) last = line;
+    host::log("mod browser: mod %d \"%s\": the build failed: %s", mod.id, mod.title.c_str(), last.c_str());
+    *problem = "The fighter did not build: " + (last.empty() ? std::string("no output") : last);
+    return false;
+  }
+  std::string kept;
+  if (!keep_plugin(built, ident, fighters_folder, problem, &kept)) return false;
+  host::log("mod browser: mod %d \"%s\": built %s from %d C files -> %s", mod.id, mod.title.c_str(), fighter_name.c_str(), sources,
+            kept.c_str());
+  return true;
+}
 bool plugins_allowed() {
   const char* v = std::getenv("MELEE_ALLOW_PLUGIN_DOWNLOADS");
   return v && v[0] == '1' && v[1] == '\0';
@@ -248,15 +408,24 @@ void fetch_page(const PageKey& key) {
             file.url = text_of(f, "download_url");   // the API's own download address, never the media file's
             if (f.count("id") && f["id"].is_number_integer()) file.id = f["id"].get<int>();
             file.plugin = plugin_file(file.name);
-            // On the fighters tab only a fighter's plugin is something to install: the rest of such a
-            // post is built for the console.
-            if (!file.url.empty() && (file.plugin || (!fighters_tab && game_file(file.name)))) mod.files.push_back(file);
+            file.source = fighters_tab && source_file(file.name);
+            file.info = fighters_tab && info_file(file.name);
+            // On the fighters tab only a fighter's plugin, or the C to build one from, is something to
+            // install: the rest of such a post is built for the console.
+            if (!file.url.empty() && (file.plugin || file.source || file.info || (!fighters_tab && game_file(file.name))))
+              mod.files.push_back(file);
           }
+        }
+        // fighter.json alone is nothing to install.
+        if (fighters_tab) {
+          bool usable = false;
+          for (const auto& f : mod.files) usable = usable || f.plugin || (f.source && extension(f.name) == ".c");
+          if (!usable) mod.files.clear();
         }
         // A post that is one archive, or holds no file of a kind that can be handed on yet.
         if (mod.files.empty()) {
           mod.state = kUnsupported;
-          mod.note = fighters_tab ? "No Melee Unlocked fighter plugin in this post" : "This post has no single game file to install";
+          mod.note = fighters_tab ? "No fighter plugin or C source in this post" : "This post has no single game file to install";
         }
         result.ids.push_back(mod.id);
         mods.push_back(std::move(mod));
@@ -316,34 +485,15 @@ void run_download(int id) {
     if (g_blocked.load()) { problem = "Stopped: an online session started"; break; }
     const fs::path path = folder / fs::u8path(safe_name(file.name));
     std::string error;
+    if (file.source || file.info) continue;   // built after the loop, when the post has no plugin
     if (file.plugin) {
-      // A fighter's code. Kept only when the player allowed it, when it is a plugin file (a 64-bit
-      // object that names the plugin's record), and under a plain name in the fighters folder.
+      // A fighter's code, already built. Kept only when the player allowed it.
       if (!plugins_allowed()) { problem = "Fighter code: set MELEE_ALLOW_PLUGIN_DOWNLOADS=1 to allow it"; continue; }
-      if (fighters_folder.empty()) { problem = "This game has no fighters folder"; continue; }
       if (!https_get(file.url, &path, nullptr, kMaxPluginBytes, &error)) { problem = error; continue; }
-      std::ifstream in(path, std::ios::binary);
-      const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-      in.close();
-      if (bytes.size() < 64 || (unsigned char)bytes[0] != 0x64 || (unsigned char)bytes[1] != 0x86 ||
-          bytes.find("mu_fighter_plugin") == std::string::npos) {
-        problem = "That file is not a fighter plugin";
-        continue;
-      }
-      std::string name;
-      for (const char c : fs::u8path(safe_name(file.name)).stem().u8string())
-        name += std::isalnum((unsigned char)c) ? (char)std::tolower((unsigned char)c) : '_';
-      if (name.empty()) name = "fighter";
-      const fs::path target = fs::u8path(fighters_folder) / fs::u8path(name + kPluginExtension);
-      fs::create_directories(target.parent_path(), ec);
-      // Whole or not at all: the game may look at the folder at any change of mode.
-      const fs::path staged = fs::u8path(fighters_folder) / fs::u8path(name + ".part");
-      fs::copy_file(path, staged, fs::copy_options::overwrite_existing, ec);
-      if (!ec) fs::rename(staged, target, ec);
-      if (ec) { problem = "The plugin could not be written to the fighters folder"; fs::remove(staged, ec); continue; }
+      std::string kept;
+      if (!keep_plugin(path, fs::u8path(safe_name(base_name(file.name))).stem().u8string(), fighters_folder, &problem, &kept)) continue;
       ++plugins;
-      host::log("mod browser: mod %d \"%s\": fighter plugin %s -> %s", id, mod.title.c_str(), file.name.c_str(),
-                target.u8string().c_str());
+      host::log("mod browser: mod %d \"%s\": fighter plugin %s -> %s", id, mod.title.c_str(), file.name.c_str(), kept.c_str());
       continue;
     }
     if (!https_get(file.url, &path, nullptr, kMaxFileBytes, &error)) { problem = error; continue; }
@@ -363,6 +513,13 @@ void run_download(int id) {
       problem = result.message.empty() ? "This file cannot be used here" : result.message;
       host::log("mod browser: mod %d \"%s\": %s was not installed: %s", id, mod.title.c_str(), file.name.c_str(), problem.c_str());
     }
+  }
+  // No built plugin in the post, but its C: build it here.
+  bool has_source = false;
+  for (const auto& file : mod.files) has_source = has_source || file.source;
+  if (plugins == 0 && has_source && !g_blocked.load()) {
+    if (!plugins_allowed()) problem = "Fighter code: set MELEE_ALLOW_PLUGIN_DOWNLOADS=1 to allow it";
+    else if (build_from_source(mod, folder, fighters_folder, &problem)) ++plugins;
   }
   fs::remove_all(folder, ec);
   std::lock_guard<std::mutex> lock(g_mutex);
