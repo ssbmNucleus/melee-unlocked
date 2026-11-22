@@ -24,6 +24,7 @@ import io
 import json
 import os
 import runpy
+import shutil
 import subprocess
 import sys
 
@@ -126,6 +127,8 @@ def main():
                '--header-dir', os.path.join(kit, 'include', 'mexft'), '--abi-dir', os.path.join(kit, 'include', 'mexft'),
                '--name', name, '--fighter', 'mu_ak_mexft_%s=%s' % (name, mex_name or ''),
                '--out', os.path.abspath(a.out)] + objects + [descriptor]).strip())
+    # mexft_plugin.py keeps its own intermediate files beside the plugin: they belong with the rest.
+    shutil.rmtree(os.path.abspath(a.out) + '.work', ignore_errors=True)
 
 
 if __name__ == '__main__':
