@@ -9,7 +9,9 @@
  * Only content the retail game logic can use is enabled. Fighters m-ex adds run their own code
  * (compiled PowerPC in their fighter file) and are not playable natively. Extra costumes of the
  * original fighters are plain model files: each m-ex costume names the retail costume whose parts
- * tables it reuses (its visibility index), so the retail fighter data serves them unchanged. The
+ * tables it reuses (its visibility index), so the retail fighter data serves them unchanged. A
+ * build that replaces the original costumes with its own files (renamed, as many as retail or
+ * fewer) is served from the m-ex table the same way (mex_costumes_renamed). The
  * fighters with more per-costume tables: Kirby's copy hats go through the same parts index
  * (ftkirby.c), Jigglypuff's added costumes are built on her costume without an accessory (ftpurin.c
  * bounds the accessory table), the Ice Climbers widen as a pair, and Mr. Game & Watch keeps his
@@ -200,6 +202,44 @@ static int mex_prepare_costumes(int kind, int count, int ext)
     return c;
 }
 
+/* Two costume file names name the same disc file: compared up to the extension, ignoring case
+ * ("PlKbNr." is opened as "PlKbNr.dat"). */
+static int mex_same_costume_file(const char* a, const char* b)
+{
+    for (; *a != '\0' && *a != '.' && *b != '\0' && *b != '.'; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char) (x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char) (y - 'A' + 'a');
+        if (x != y) {
+            return 0;
+        }
+    }
+    return (*a == '\0' || *a == '.') && (*b == '\0' || *b == '.');
+}
+
+/* Whether the first `count` prepared m-ex costumes of `kind` name other files than its retail
+ * table. A build can replace a fighter's costumes without adding any: MexCLI's import-costumes
+ * followed by remove-costumes (PokéMelee, SSBM Nucleus) names them PlNsNrMod.dat,
+ * PlNsNrMod_001.dat and so on and drops PlNsNr.dat and PlNsYe.dat from the disc, with as many
+ * costumes as retail or fewer. Read before the kind is committed, while the retail table is up. */
+static int mex_costumes_renamed(int kind, int count)
+{
+    const Fighter_CostumeStrings* retail = ftData_803C2360[kind];
+    const int retail_count = CostumeListsForeachCharacter[kind].numCostumes;
+    int c;
+    if (count <= 0 || retail == NULL) {
+        return 0;
+    }
+    for (c = 0; c < count && c < retail_count; c++) {
+        const char* mine = mex_costume_strings[kind][c].dat_filename;
+        const char* theirs = retail[c].dat_filename;
+        if (mine == NULL || theirs == NULL || !mex_same_costume_file(mine, theirs)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void mex_commit_costumes(int kind, int count)
 {
     mex_retail_lists[kind] = CostumeListsForeachCharacter[kind];
@@ -220,27 +260,30 @@ static void mex_widen_costumes(void)
 
     for (ext = 0; ext < mex_ext_count && ext < CKind_Playable_Count; ext++) {
         const int kind = map[ext].internal;
-        int count;
+        int count, renamed;
         if (kind >= Ft_Kind_Max || !mex_costume_safe(kind) || mex_widened[kind]) {
             continue;
         }
         count = mex_prepare_costumes(kind, info[ext].count, ext);
+        renamed = mex_costumes_renamed(kind, count);
         if (kind == Ft_Kind_Popo) {
             /* Nana wears the player's costume too: both lists or neither. */
             const int nana = mex_prepare_costumes(Ft_Kind_Nana, info[ext].count, ext);
             if (nana < count) {
                 count = nana;
             }
-            if (count <= CostumeListsForeachCharacter[Ft_Kind_Nana].numCostumes) {
+            renamed = mex_costumes_renamed(kind, count) || mex_costumes_renamed(Ft_Kind_Nana, count);
+            if (count <= CostumeListsForeachCharacter[Ft_Kind_Nana].numCostumes && !renamed) {
                 continue;
             }
             mex_commit_costumes(Ft_Kind_Nana, count);
         }
-        if (count <= CostumeListsForeachCharacter[kind].numCostumes) {
-            continue;   /* nothing added */
+        if (count <= CostumeListsForeachCharacter[kind].numCostumes && !renamed) {
+            continue;   /* nothing added, the retail files */
         }
         mex_commit_costumes(kind, count);
-        OSReport("[mex] %s: %d costumes\n", mex_name(ext), count);
+        OSReport("[mex] %s: %d costumes%s\n", mex_name(ext), count,
+                 count <= mex_retail_lists[kind].numCostumes ? " (the disc's own files)" : "");
     }
 }
 
