@@ -18,9 +18,12 @@ usage: python tools/mexft_build.py --gcc-bin <mingw64>/bin --fighter <folder> --
 optionally "mex-name <the fighter's name in MxDt>" when that differs from the display name.
 """
 import argparse
+import contextlib
 import glob
+import io
 import json
 import os
+import runpy
 import subprocess
 import sys
 
@@ -32,6 +35,25 @@ def run(cmd):
     if r.returncode != 0:
         sys.exit('%s\nfailed: %s' % ((r.stdout + r.stderr).strip(), ' '.join(cmd[:3])))
     return r.stdout
+
+
+def run_tool(name, args):
+    """Runs a tool of the kit (a Python file beside this one) in this process and returns what it
+    printed. Not as `python <file>`: a packaged application that uses the kit has no interpreter
+    to start, only the one it is running in."""
+    path = os.path.join(HERE, name)
+    out = io.StringIO()
+    argv = sys.argv
+    sys.argv = [path] + [str(a) for a in args]
+    try:
+        with contextlib.redirect_stdout(out):
+            runpy.run_path(path, run_name='__main__')
+    except SystemExit as e:
+        if e.code not in (None, 0):
+            sys.exit('%s\n%s\nfailed: %s' % (out.getvalue().strip(), e.code, name))
+    finally:
+        sys.argv = argv
+    return out.getvalue()
 
 
 def main():
@@ -67,7 +89,7 @@ def main():
 
     os.makedirs(work, exist_ok=True)
     data = os.path.join(kit, 'data')
-    print(run([sys.executable, os.path.join(HERE, 'mexft_prepare.py'), '--manifest', manifest, '--name', name,
+    print(run_tool('mexft_prepare.py', ['--manifest', manifest, '--name', name,
                '--out', work, '--symbols', os.path.join(data, 'symbols.txt'),
                '--functions', os.path.join(data, 'ftFunction.txt'),
                '--functions', os.path.join(data, 'tmce', 'ftFunction.txt'),
@@ -87,7 +109,7 @@ def main():
             run(command('module') + ['-c', src, '-o', obj])
             compiled.append(obj)
         linked = os.path.join(work, 'tmce_%s.o' % module)
-        run([sys.executable, os.path.join(HERE, 'link_module.py'), '--ld', tool['ld'], '--nm', tool['nm'],
+        run_tool('link_module.py', ['--ld', tool['ld'], '--nm', tool['nm'],
              '--objcopy', tool['objcopy'], '--name', module, '--exports', os.path.join(work, module, 'exports.txt'),
              '--redefine', os.path.join(data, 'mextk_redefine.txt'), '--out', linked] + compiled)
         objects.append(linked)
@@ -99,7 +121,7 @@ def main():
         for line in open(manifest, encoding='utf-8'):
             if line.startswith(key) and mex_name is None:
                 mex_name = line[len(key):].strip()
-    print(run([sys.executable, os.path.join(HERE, 'mexft_plugin.py'), '--gcc', tool['gcc'], '--ld', tool['ld'],
+    print(run_tool('mexft_plugin.py', ['--gcc', tool['gcc'], '--ld', tool['ld'],
                '--objcopy', tool['objcopy'], '--nm', tool['nm'],
                '--header-dir', os.path.join(kit, 'include', 'mexft'), '--abi-dir', os.path.join(kit, 'include', 'mexft'),
                '--name', name, '--fighter', 'mu_ak_mexft_%s=%s' % (name, mex_name or ''),
