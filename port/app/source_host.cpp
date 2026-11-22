@@ -145,6 +145,7 @@
 #include "pack_skin_rule.h"
 #include "disc_skin_scan.h"
 #include "cosmetic_mods.h"
+#include "mod_browser.h"
 #include "stage_dat_safety.h"
 #include "pack_audio_safety.h"
 #include "texture_pack.h"
@@ -2582,6 +2583,59 @@ constexpr uint8_t CMD_STAGE_SKIN_CYCLE = 0xFB;
 // Title demo memory check (shim/mu_content.c mu_title_demo_stage): reply is four bytes, big endian,
 // the sum of the four largest growths among the installed skins that are not stage files.
 constexpr uint8_t CMD_SKIN_GROWTH = 0xFC;
+
+// ---- the in-game mod browser (shim/mu_mod_browser.c, runtime/host/mod_browser.h) ----
+// payload[0] 0: the page to show. payload: tab, page (big-endian u16).
+//   reply: status (0 loading, 1 ready, 2 error), tab, page u16, pages u16, has_next, row count,
+//   a 64-byte message, then per row: id u32, state, downloads u32, title[44], author[20], note[40].
+// payload[0] 1: download and install a mod. payload: id u32. reply: 1 when it was queued.
+// Text fields are ASCII, ended by 0 and filled with 0.
+constexpr uint8_t CMD_MOD_BROWSER = 0xC5;
+void put_text(std::vector<uint8_t>& out, const std::string& text, size_t width) {
+  const size_t start = out.size();
+  out.resize(start + width, 0);
+  size_t at = 0;
+  for (size_t i = 0; i < text.size() && at + 1 < width; ++i) {
+    const unsigned char c = (unsigned char)text[i];
+    if (c >= 0x80) {
+      // The game's menu font is ASCII here: one '?' for a whole multi-byte character.
+      if ((c & 0xC0) != 0x80) out[start + at++] = '?';
+    } else if (c >= 32) {
+      out[start + at++] = c;
+    }
+  }
+}
+void mod_browser_command(const uint8_t* p, size_t n, std::vector<uint8_t>& reply) {
+  reply.assign(1, 0);
+  host::mod_browser::set_blocked(g_replaying || host::cosmetics::online_active());
+  if (p[0] == 1 && n == 5) {
+    const int id = (int)((uint32_t)p[1] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 8 | p[4]);
+    reply[0] = host::mod_browser::download(id) ? 1 : 0;
+    host::log("mod browser: download of mod %d %s", id, reply[0] ? "queued" : "refused");
+    return;
+  }
+  if (p[0] != 0 || n != 4) return;
+  const auto view = host::mod_browser::view(p[1], (p[2] << 8) | p[3]);
+  reply.clear();
+  reply.push_back((uint8_t)view.status);
+  reply.push_back((uint8_t)view.tab);
+  reply.push_back((uint8_t)(view.page >> 8)); reply.push_back((uint8_t)view.page);
+  const int pages = std::min(view.pages, 0xFFFF);
+  reply.push_back((uint8_t)(pages >> 8)); reply.push_back((uint8_t)pages);
+  reply.push_back(view.has_next ? 1 : 0);
+  const size_t rows = std::min<size_t>(view.rows.size(), host::mod_browser::kRowsPerPage);
+  reply.push_back((uint8_t)rows);
+  put_text(reply, view.message, 64);
+  for (size_t i = 0; i < rows; ++i) {
+    const auto& row = view.rows[i];
+    const uint32_t id = (uint32_t)row.id, downloads = (uint32_t)std::max(row.downloads, 0);
+    reply.insert(reply.end(), {(uint8_t)(id >> 24), (uint8_t)(id >> 16), (uint8_t)(id >> 8), (uint8_t)id, (uint8_t)row.state,
+                               (uint8_t)(downloads >> 24), (uint8_t)(downloads >> 16), (uint8_t)(downloads >> 8), (uint8_t)downloads});
+    put_text(reply, row.title, 44);
+    put_text(reply, row.author, 20);
+    put_text(reply, row.note, 40);
+  }
+}
 void cycle_stage_skin(const std::string& file, int direction, std::vector<uint8_t>& reply) {
   reply.assign(1, 0);
   if (g_replaying || g_cosmetic_fst.empty() || slippi::online::session_mode() >= 0) return;
@@ -2913,6 +2967,7 @@ int32_t h_slippi_command(uint8_t command, const uint8_t* payload, uint32_t paylo
           reply.assign(bytes, bytes + sizeof cfg);
           return true;
         }
+        if (c == CMD_MOD_BROWSER && n >= 1) { mod_browser_command(p, n, reply); return true; }
         if (c == CMD_SKIN_CYCLE && (n == 4 || (n == 5 && p[4] != 0))) {
           cycle_costume_skin(p[1], p[2], p[3] ? 1 : -1, reply, n == 5 ? p[4] : 0);
           return true;

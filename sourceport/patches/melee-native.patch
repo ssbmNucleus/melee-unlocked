@@ -185979,7 +185979,7 @@ index a9841632c..9f22ab616 100644
      gobjproc =
          HSD_GObj_SetupProc(GObj_Create(0, 1, 0x80), mnLanguage_8024BFE0, 0);
 diff --git a/src/melee/mn/mnmain.c b/src/melee/mn/mnmain.c
-index dc6746eee..b53251c6f 100644
+index dc6746e..9ebfd47 100644
 --- a/src/melee/mn/mnmain.c
 +++ b/src/melee/mn/mnmain.c
 @@ -1,4 +1,7 @@
@@ -186451,17 +186451,21 @@ index dc6746eee..b53251c6f 100644
  {
      HSD_Fog* fog = GET_FOG(mn_804D6BA8);
      if (HSD_CObjSetCurrent(GET_COBJ(gobj)) != 0) {
-@@ -1685,6 +1888,9 @@ void mn_8022BEDC(HSD_GObj* gobj)
+@@ -1685,6 +1888,13 @@ void mn_8022BEDC(HSD_GObj* gobj)
      temp_r3->gxlink_prios = 0x80;
      HSD_GObj_SetupProc(temp_r3, mn_8022BA1C, 0);
      mn_804D6BB4 = HSD_SisLib_803A611C(0, temp_r3, 7, 8, 0x80, 7, 0x80, 0);
 +#ifdef MU_NATIVE
 +    mu_slippi_menu_soon(-1, 0);   /* a new menu scene: the last one's text went with it */
++    {
++        void mu_mod_browser_forget(void);
++        mu_mod_browser_forget();
++    }
 +#endif
  }
  
  GXColor* mn_8022BFBC(int arg0)
-@@ -1727,6 +1933,9 @@ int mn_8022C010(int menu_kind, int selection)
+@@ -1727,6 +1937,9 @@ int mn_8022C010(int menu_kind, int selection)
      case MENU_KIND_RULES_ITEMS:
      case MENU_KIND_RULES_STAGE:
      case MENU_KIND_NAME_ENTRY:
@@ -186471,7 +186475,7 @@ index dc6746eee..b53251c6f 100644
          return 1;
      case MENU_KIND_TOY:
          return 2;
-@@ -1996,6 +2205,57 @@ void mn_8022C4F4(HSD_GObj* gp)
+@@ -1996,6 +2209,57 @@ void mn_8022C4F4(HSD_GObj* gp)
  
  MenuFlow mn_804A04F0;
  
@@ -186529,7 +186533,7 @@ index dc6746eee..b53251c6f 100644
  static inline u8 mn_8022C7CC_inline(void)
  {
      int i;
-@@ -2164,7 +2424,11 @@ void mn_8022CC28(HSD_GObj* gp)
+@@ -2164,7 +2428,11 @@ void mn_8022CC28(HSD_GObj* gp)
          case SEL_REG_ALLSTAR:
              sfxForward();
              data = gm_GetCurrentSceneExitData();
@@ -186541,7 +186545,7 @@ index dc6746eee..b53251c6f 100644
              gm_801A4B60();
              return;
          }
-@@ -2482,9 +2746,36 @@ void mn_8022D594(HSD_GObj* gp)
+@@ -2482,9 +2750,36 @@ void mn_8022D594(HSD_GObj* gp)
              gm_801A4B60();
              break;
          case SEL_VS_TOURNAMENT:
@@ -186578,7 +186582,7 @@ index dc6746eee..b53251c6f 100644
              gm_801A4B60();
              break;
          case SEL_VS_SPECIAL:
-@@ -2596,9 +2887,20 @@ void mn_8022D7F4(HSD_GObj* gp)
+@@ -2596,9 +2891,20 @@ void mn_8022D7F4(HSD_GObj* gp)
              break;
          case SEL_1P_EVENT:
              sfxForward();
@@ -186600,7 +186604,25 @@ index dc6746eee..b53251c6f 100644
          case SEL_1P_TRAINING:
              sfxForward();
              data = gm_GetCurrentSceneExitData();
-@@ -2727,7 +3029,7 @@ void mnMain_Scene_OnFrame(void)
+@@ -2661,6 +2967,17 @@ void mn_8022DB10(HSD_GObj* gp)
+ 
+     selection_count = mn_803EB6B0[MENU_KIND_MAIN].selection_count & 0xFF;
+     buttons = mn_80229624(4);
++#ifdef MU_NATIVE
++    /* The mod browser (shim/mu_mod_browser.c): Y opens it here, and while it is open the frame's
++     * input is its own. */
++    {
++        int mu_mod_browser_think(int canvas, unsigned int buttons);
++        if (mu_mod_browser_think(mn_804D6BB4, buttons)) {
++            mf->buttons = 0;
++            return;
++        }
++    }
++#endif
+     mf->buttons = buttons;
+     if (buttons & MenuInput_Confirm) {
+         mn_804D6BC8.cooldown = 5;
+@@ -2727,7 +3044,7 @@ void mnMain_Scene_OnFrame(void)
          sfxBack();
          mn_8022F268();
          gm_801603B0();
@@ -186609,7 +186631,7 @@ index dc6746eee..b53251c6f 100644
          lbMthp_8001F800();
          mn_8022EBDC();
          HSD_SisLib_803A5E70();
-@@ -2776,6 +3078,9 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2776,6 +3093,9 @@ void mnMain_Scene_OnEnter(void* user_data)
      *hovered_selection = data->hovered_selection;
      mn_804D6BAC = NULL;
      mn_804D6BB0 = NULL;
@@ -186619,7 +186641,7 @@ index dc6746eee..b53251c6f 100644
      if (data->load_assets != false) {
          mn_804D6BB8 = lbArchive_LoadSymbols(
              "MnMaAll", &MenMainBack_Top.joint, "MenMainBack_Top_joint",
-@@ -2924,7 +3229,19 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2924,7 +3244,19 @@ void mnMain_Scene_OnEnter(void* user_data)
              &MenMainCursorSs_Top.shapeanim_joint,
              "MenMainCursorSs_Top_shapeanim_joint",
  
@@ -186640,7 +186662,7 @@ index dc6746eee..b53251c6f 100644
  
          if (lbLang_IsSavedLanguageUS()) {
              HSD_SisLib_803A62A0(0, "SdMenu.usd", "SIS_MenuData");
-@@ -2944,7 +3261,7 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2944,7 +3276,7 @@ void mnMain_Scene_OnEnter(void* user_data)
  
      switch (data->menu_kind) {
      case MENU_KIND_EVENT:
@@ -186649,7 +186671,7 @@ index dc6746eee..b53251c6f 100644
          break;
      case MENU_KIND_MULTI_VS:
          mnHyaku_8024CD64(data->hovered_selection);
-@@ -2959,7 +3276,11 @@ void mnMain_Scene_OnEnter(void* user_data)
+@@ -2959,7 +3291,11 @@ void mnMain_Scene_OnEnter(void* user_data)
          break;
      }
      lbAudioAx_80023F28(gmMainLib_8015ECB0());
@@ -186662,7 +186684,7 @@ index dc6746eee..b53251c6f 100644
  }
  
  char null_terminator[1] = "\0";
-@@ -3043,3 +3364,48 @@ void mn_8022EBDC(void)
+@@ -3043,3 +3379,48 @@ void mn_8022EBDC(void)
  /// fn_8022F538\n"); } void mn_8022FB88() { OSPanic(__FILE__, __LINE__, "not
  /// implemented: mn_8022FB88\n"); } void mn_8022FD18() { OSPanic(__FILE__,
  /// __LINE__, "not implemented: mn_8022FD18\n"); }
