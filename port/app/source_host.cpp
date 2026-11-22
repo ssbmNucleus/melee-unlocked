@@ -2585,9 +2585,11 @@ constexpr uint8_t CMD_STAGE_SKIN_CYCLE = 0xFB;
 constexpr uint8_t CMD_SKIN_GROWTH = 0xFC;
 
 // ---- the in-game mod browser (shim/mu_mod_browser.c, runtime/host/mod_browser.h) ----
-// payload[0] 0: the page to show. payload: tab, page (big-endian u16).
+// payload[0] 0: the page to show. payload: tab, page (big-endian u16), sort, fighter (an index of
+//   host::mod_browser::fighters(), 0 all), then the search text (0 to 24 ASCII bytes).
 //   reply: status (0 loading, 1 ready, 2 error), tab, page u16, pages u16, has_next, row count,
 //   a 64-byte message, then per row: id u32, state, downloads u32, title[44], author[20], note[40].
+// payload[0] 2: the fighter filter's names. reply: a count, then 20 bytes a name.
 // payload[0] 1: download and install a mod. payload: id u32. reply: 1 when it was queued.
 // Text fields are ASCII, ended by 0 and filled with 0.
 constexpr uint8_t CMD_MOD_BROWSER = 0xC5;
@@ -2614,11 +2616,25 @@ void mod_browser_command(const uint8_t* p, size_t n, std::vector<uint8_t>& reply
     host::log("mod browser: download of mod %d %s", id, reply[0] ? "queued" : "refused");
     return;
   }
-  if (p[0] != 0 || n != 4) return;
-  const auto view = host::mod_browser::view(p[1], (p[2] << 8) | p[3]);
+  if (p[0] == 2 && n == 1) {
+    const auto& names = host::mod_browser::fighters();
+    reply.assign(1, (uint8_t)names.size());
+    for (const auto& name : names) put_text(reply, name.empty() ? "All" : name, 20);
+    return;
+  }
+  if (p[0] != 0 || n < 6 || n > 6 + (size_t)host::mod_browser::kMaxSearch) return;
+  host::mod_browser::set_fighters_folder((g_loaded_game_path.parent_path() / "fighters").u8string());
+  host::mod_browser::Query query;
+  query.tab = p[1];
+  query.sort = p[4];
+  query.fighter = p[5];
+  for (size_t i = 6; i < n; ++i) {
+    if (p[i] >= 32 && p[i] < 127) query.search += (char)p[i];
+  }
+  const auto view = host::mod_browser::view(query, (p[2] << 8) | p[3]);
   reply.clear();
   reply.push_back((uint8_t)view.status);
-  reply.push_back((uint8_t)view.tab);
+  reply.push_back((uint8_t)query.tab);
   reply.push_back((uint8_t)(view.page >> 8)); reply.push_back((uint8_t)view.page);
   const int pages = std::min(view.pages, 0xFFFF);
   reply.push_back((uint8_t)(pages >> 8)); reply.push_back((uint8_t)pages);

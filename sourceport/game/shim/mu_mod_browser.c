@@ -3,16 +3,18 @@
  *
  * Opened with Y on the main menu's first page. While it is open it owns the menu's input
  * (mn/mnmain.c mn_8022DB10 asks mu_mod_browser_think first):
- *   Up / Down     the row
- *   Left / Right  the page
- *   L / R         the tab (Costumes, Stage skins)
- *   A             download and install the row's mod
- *   B             close
+ *   L / R         the tab (Costumes, Stage skins, Fighters)
+ *   Up / Down     the row; Up from the first row reaches the filters
+ *   on a row      Left / Right the page, A download and install, B close
+ *   on a filter   Left / Right the filter (Fighter, Sort, Search), A the next choice, X the one
+ *                 before; on Search, A starts typing
+ *   typing        Up / Down the letter, Right one more letter, Left one fewer, A search, B cancel
  *
  * This half only draws and asks. The catalog, the download and the installation are the host's
  * (port/runtime/host/mod_browser.h), reached through one command; the game never touches the
  * network or a file. An installed costume or stage skin is one of the choices the character or
- * stage select already offers with L and R, at once.
+ * stage select already offers with L and R, at once. A fighter's plugin is loaded at the next
+ * change of mode (mexft/mexft_plugins.c).
  *
  * The design follows GurekamDhillon's Nucleus browser for his Melee build (GPL-3.0).
  * SPDX-License-Identifier: GPL-3.0-or-later */
@@ -32,9 +34,12 @@ int mu_online_abi_command(unsigned int command, const unsigned char* payload, un
 int snprintf(char* buffer, __SIZE_TYPE__ size, const char* format, ...);
 
 #define CMD_MOD_BROWSER 0xC5
-enum { ROWS = 8, TABS = 2, POLL_FRAMES = 6 };
+enum { ROWS = 8, TABS = 3, SORTS = 3, POLL_FRAMES = 6, SEARCH_MAX = 24, FIGHTERS_MAX = 40 };
 enum { ST_LOADING, ST_READY, ST_ERROR };
 enum { ROW_NONE, ROW_QUEUED, ROW_DOWNLOADING, ROW_INSTALLED, ROW_FAILED, ROW_UNSUPPORTED };
+enum { FILTER_FIGHTER, FILTER_SORT, FILTER_SEARCH, FILTERS };
+/* Where the cursor is: a list row (0..count-1), or FOCUS_FILTERS (the line of filters). */
+enum { FOCUS_FILTERS = -1 };
 
 typedef struct BrowserRow {
     unsigned int id, downloads;
@@ -44,17 +49,25 @@ typedef struct BrowserRow {
 
 static struct {
     int open;
-    int tab, page, cursor;
+    int tab, page, cursor, filter;
+    int sort, fighter;
+    char search[SEARCH_MAX + 1];
+    int typing;                    /* the search is being typed: `draft` is on screen */
+    char draft[SEARCH_MAX + 1];
     int status, pages, has_next, count;
-    int host_missing;   /* the host has no such command (an older program) */
     int poll;
     char message[64];
     BrowserRow rows[ROWS];
+    char fighters[FIGHTERS_MAX][20];
+    int fighter_count;
     HSD_Text* box;
     HSD_Text* text;
 } mb;
 
-static const char* const tab_name[TABS] = { "Costumes", "Stage skins" };
+static const char* const tab_name[TABS] = { "Costumes", "Stage skins", "Fighters" };
+static const char* const sort_name[SORTS] = { "Most downloaded", "Newest", "Most liked" };
+/* What a search is typed from, in the order Up steps through it. */
+static const char letters[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
 /* Where the list is drawn, in the description canvas's units: left, top, text size, the step
  * between rows, and the box's width and height. MELEE_TEST_MOD_BROWSER overrides them for
@@ -62,7 +75,7 @@ static const char* const tab_name[TABS] = { "Costumes", "Stage skins" };
 typedef struct Layout { float x, y, size, step, w, h; } Layout;
 static Layout layout(void)
 {
-    Layout l = { -12.3f, -7.0f, 0.021f, 0.95f, 25.2f, 13.4f };
+    Layout l = { -12.3f, -7.6f, 0.021f, 0.95f, 25.2f, 14.6f };
     const char* v = mu_test_getenv("MELEE_TEST_MOD_BROWSER");
     float* f = &l.x;
     int n = 0;
@@ -96,24 +109,49 @@ static void copy_text(char* to, const unsigned char* from, int width)
     to[width - 1] = '\0';
 }
 
+static void no_host(void)
+{
+    mb.status = ST_ERROR;
+    mb.count = 0;
+    snprintf(mb.message, sizeof mb.message, "This version of the program has no mod browser.");
+}
+
+static void ask_fighters(void)
+{
+    static unsigned char response[4096];
+    unsigned char payload[1] = { 2 };
+    unsigned int got = 0;
+    int i;
+    mb.fighter_count = 0;
+    if (mu_online_abi_command(CMD_MOD_BROWSER, payload, 1, response, sizeof response, &got) != 0 || got < 1) {
+        return;
+    }
+    mb.fighter_count = response[0] <= FIGHTERS_MAX ? response[0] : FIGHTERS_MAX;
+    if (got < 1u + (unsigned int) mb.fighter_count * 20u) {
+        mb.fighter_count = 0;
+    }
+    for (i = 0; i < mb.fighter_count; i++) {
+        copy_text(mb.fighters[i], response + 1 + i * 20, 20);
+    }
+}
+
 static void ask_page(void)
 {
     static unsigned char response[4096];
-    unsigned char payload[4];
-    unsigned int got = 0, i;
+    unsigned char payload[6 + SEARCH_MAX];
+    unsigned int got = 0, i, n = (unsigned int) strlen(mb.search);
     const unsigned char* p;
     payload[0] = 0;
     payload[1] = (unsigned char) mb.tab;
     payload[2] = (unsigned char) (mb.page >> 8);
     payload[3] = (unsigned char) mb.page;
-    if (mu_online_abi_command(CMD_MOD_BROWSER, payload, 4, response, sizeof response, &got) != 0 || got < 72) {
-        mb.host_missing = 1;
-        mb.status = ST_ERROR;
-        mb.count = 0;
-        snprintf(mb.message, sizeof mb.message, "This version of the program has no mod browser.");
+    payload[4] = (unsigned char) mb.sort;
+    payload[5] = (unsigned char) mb.fighter;
+    memcpy(payload + 6, mb.search, n);
+    if (mu_online_abi_command(CMD_MOD_BROWSER, payload, 6 + n, response, sizeof response, &got) != 0 || got < 72) {
+        no_host();
         return;
     }
-    mb.host_missing = 0;
     mb.status = response[0];
     mb.pages = (response[4] << 8) | response[5];
     mb.has_next = response[6];
@@ -131,8 +169,12 @@ static void ask_page(void)
         copy_text(r->author, p + 53, 20);
         copy_text(r->note, p + 73, 40);
     }
-    if (mb.cursor >= mb.count) {
-        mb.cursor = mb.count > 0 ? mb.count - 1 : 0;
+    /* Past the end of a shorter page: its last row. On the filters when the list is empty, but
+     * only once it is known to be (a page still loading has no rows yet either). */
+    if (mb.count > 0 && mb.cursor >= mb.count) {
+        mb.cursor = mb.count - 1;
+    } else if (mb.count == 0 && mb.status != ST_LOADING) {
+        mb.cursor = FOCUS_FILTERS;
     }
 }
 
@@ -148,6 +190,20 @@ static int ask_download(unsigned int id)
     payload[4] = (unsigned char) id;
     return mu_online_abi_command(CMD_MOD_BROWSER, payload, 5, response, sizeof response, &got) == 0 && got >= 1 &&
            response[0] != 0;
+}
+
+/* A new list: another tab, filter, search or page. */
+static void reload(int first_page)
+{
+    if (first_page) {
+        mb.page = 0;
+    }
+    if (mb.cursor != FOCUS_FILTERS) {
+        mb.cursor = 0;
+    }
+    mb.poll = 0;
+    mb.status = ST_LOADING;
+    mb.count = 0;
 }
 
 /* ---- drawing ---- */
@@ -237,7 +293,10 @@ static void draw(int canvas)
                          pick = { 255, 255, 255, 255 }, good = { 120, 230, 150, 255 }, bad = { 255, 130, 120, 255 };
     const Layout l = layout();
     /* The columns, in the canvas's units at the default text size: they follow the size. */
-    const float col_state = 12.7f * (l.size / 0.021f), col_author = 18.9f * (l.size / 0.021f);
+    const float unit = l.size / 0.021f;
+    const float col_state = 12.7f * unit, col_author = 18.9f * unit;
+    const int filters = mb.cursor == FOCUS_FILTERS;
+    const float list = 3.0f;   /* the first row's line */
     char text[160];
     int i;
     destroy();
@@ -266,41 +325,73 @@ static void draw(int canvas)
     mb.text->default_kerning = 1;
     mb.text->default_alignment = 0;
 
-    snprintf(text, sizeof text, "Mods    %s%s%s    %s%s%s", mb.tab == 0 ? "[" : " ", tab_name[0], mb.tab == 0 ? "]" : " ",
-             mb.tab == 1 ? "[" : " ", tab_name[1], mb.tab == 1 ? "]" : " ");
-    line(&l, 0.0f, 0.0f, &title, text);
+    line(&l, 0.0f, 0.0f, &title, "Mods");
+    for (i = 0; i < TABS; i++) {
+        snprintf(text, sizeof text, i == mb.tab ? "[%s]" : " %s ", tab_name[i]);
+        line(&l, (4.2f + 6.6f * (float) i) * unit, 0.0f, i == mb.tab ? &title : &dim, text);
+    }
+
+    /* The filters: one line, the one the cursor is on in white. The fighter filter narrows the
+     * costumes only, so it is dim on the other tabs. */
+    {
+        const GXColor* c;
+        const char* fighter = mb.fighter < mb.fighter_count ? mb.fighters[mb.fighter] : "All";
+        c = filters && mb.filter == FILTER_FIGHTER ? &pick : mb.tab == 0 ? &ink : &dim;
+        snprintf(text, sizeof text, "%sFighter: %.16s", filters && mb.filter == FILTER_FIGHTER ? ">" : " ",
+                 mb.tab == 0 ? fighter : "-");
+        line(&l, 0.0f, 1.4f, c, text);
+        c = filters && mb.filter == FILTER_SORT ? &pick : &ink;
+        snprintf(text, sizeof text, "%s%s", filters && mb.filter == FILTER_SORT ? ">" : " ", sort_name[mb.sort]);
+        line(&l, 9.6f * unit, 1.4f, c, text);
+        c = filters && mb.filter == FILTER_SEARCH ? &pick : &ink;
+        if (mb.typing) {
+            snprintf(text, sizeof text, ">Search: %s_", mb.draft);
+            c = &good;
+        } else {
+            snprintf(text, sizeof text, "%sSearch: %s", filters && mb.filter == FILTER_SEARCH ? ">" : " ",
+                     mb.search[0] != '\0' ? mb.search : "-");
+        }
+        line(&l, 17.0f * unit, 1.4f, c, text);
+    }
+
     if (mb.status == ST_LOADING) {
-        line(&l, 0.0f, 2.0f, &ink, "Loading...");
+        line(&l, 0.0f, list + 0.5f, &ink, "Loading...");
     } else if (mb.status == ST_ERROR) {
-        line(&l, 0.0f, 2.0f, &bad, mb.message);
+        line(&l, 0.0f, list + 0.5f, &bad, mb.message);
     } else if (mb.count == 0) {
-        line(&l, 0.0f, 2.0f, &ink, "Nothing here.");
+        line(&l, 0.0f, list + 0.5f, &ink, "Nothing found.");
     }
     for (i = 0; i < mb.count && mb.status == ST_READY; i++) {
         const BrowserRow* r = &mb.rows[i];
         const int here = i == mb.cursor;
         snprintf(text, sizeof text, "%s %.26s", here ? ">" : " ", r->title);
-        line(&l, 0.0f, 1.5f + (float) i, here ? &pick : r->state == ROW_UNSUPPORTED ? &dim : &ink, text);
+        line(&l, 0.0f, list + (float) i, here ? &pick : r->state == ROW_UNSUPPORTED ? &dim : &ink, text);
         if (r->state != ROW_NONE) {
-            line(&l, col_state, 1.5f + (float) i,
+            line(&l, col_state, list + (float) i,
                  r->state == ROW_FAILED ? &bad : r->state == ROW_UNSUPPORTED ? &dim : &good, state_text(r));
         } else {
             snprintf(text, sizeof text, "%u", r->downloads);
-            line(&l, col_state, 1.5f + (float) i, &dim, text);
+            line(&l, col_state, list + (float) i, &dim, text);
         }
         snprintf(text, sizeof text, "%.11s", r->author);
-        line(&l, col_author, 1.5f + (float) i, &dim, text);
+        line(&l, col_author, list + (float) i, &dim, text);
     }
     if (mb.status == ST_READY && mb.count > 0) {
-        const BrowserRow* r = &mb.rows[mb.cursor];
-        if (r->note[0] != '\0') {
-            line(&l, 0.0f, 10.0f, r->state == ROW_FAILED ? &bad : &good, r->note);
+        if (mb.cursor >= 0 && mb.rows[mb.cursor].note[0] != '\0') {
+            const BrowserRow* r = &mb.rows[mb.cursor];
+            line(&l, 0.0f, list + 8.5f, r->state == ROW_FAILED ? &bad : r->state == ROW_UNSUPPORTED ? &dim : &good, r->note);
         }
         snprintf(text, sizeof text, "Page %d of %d", mb.page + 1, mb.pages > 0 ? mb.pages : mb.page + 1);
-        line(&l, col_author, 10.0f, &dim, text);
+        line(&l, col_author, list + 8.5f, &dim, text);
     }
-    line(&l, 0.0f, 11.2f, &dim, "A: install    B: close    L R: tab    Left Right: page");
-    line(&l, 0.0f, 12.2f, &dim, "Mods from SSBM Nucleus - ssbmnucleus.net");
+    if (mb.typing) {
+        line(&l, 0.0f, list + 9.7f, &dim, "Up Down: letter   Right: add   Left: erase   A: search   B: cancel");
+    } else if (filters) {
+        line(&l, 0.0f, list + 9.7f, &dim, "Left Right: filter   A: change   X: back   Down: list   B: close");
+    } else {
+        line(&l, 0.0f, list + 9.7f, &dim, "A: install   B: close   L R: tab   Left Right: page   Up: filters");
+    }
+    line(&l, 0.0f, list + 10.7f, &dim, "Mods from SSBM Nucleus - ssbmnucleus.net");
 }
 
 /* ---- the menu's side ---- */
@@ -311,56 +402,108 @@ void mu_mod_browser_forget(void)
     mb.text = NULL;
     mb.box = NULL;
     mb.open = 0;
+    mb.typing = 0;
 }
 
-/* Called by the main menu's first page before its own input, with the frame's buttons
- * (mn_80229624). Returns 1 when the browser is open and took them. */
-int mu_mod_browser_think(int canvas, unsigned int buttons)
+static int letter_index(char c)
 {
-    static unsigned int shown;   /* a digest of what is on screen: redraw only on a change */
-    unsigned int now;
     int i;
-    if (!mb.open) {
-        if (!(buttons & MenuInput_YButton) || canvas < 0) {
-            return 0;
+    for (i = 0; letters[i] != '\0'; i++) {
+        if (letters[i] == c) {
+            return i;
         }
-        mb.open = 1;
-        mb.cursor = 0;
-        mb.poll = 0;
-        mb.status = ST_LOADING;
-        mb.count = 0;
-        shown = 0;
-        lbAudioAx_80024030(1);
-        OSReport("[mod browser] opened\n");
-    } else if (buttons & MenuInput_Back) {
-        mb.open = 0;
-        destroy();
+    }
+    return 0;
+}
+
+/* Typing the search with the stick: the last letter steps through the alphabet. */
+static void typing_input(unsigned int buttons)
+{
+    const int count = (int) sizeof letters - 1;
+    int n = (int) strlen(mb.draft);
+    if (buttons & MenuInput_Back) {
+        mb.typing = 0;
         lbAudioAx_80024030(0);
-        OSReport("[mod browser] closed\n");
-        return 1;
-    } else if (buttons & (MenuInput_LTrigger | MenuInput_RTrigger)) {
-        mb.tab = (mb.tab + ((buttons & MenuInput_RTrigger) ? 1 : TABS - 1)) % TABS;
-        mb.page = mb.cursor = mb.poll = 0;
-        mb.status = ST_LOADING;
-        mb.count = 0;
+    } else if (buttons & (MenuInput_Confirm | MenuInput_StartButton)) {
+        /* No spaces at either end: the site matches the words. */
+        while (n > 0 && mb.draft[n - 1] == ' ') {
+            mb.draft[--n] = '\0';
+        }
+        {
+            const char* from = mb.draft;
+            while (*from == ' ') {
+                from++;
+            }
+            memmove(mb.search, from, strlen(from) + 1);
+        }
+        mb.typing = 0;
+        reload(1);
+        lbAudioAx_80024030(1);
+        OSReport("[mod browser] search: \"%s\"\n", mb.search);
+    } else if (buttons & (MenuInput_Up | MenuInput_Down)) {
+        if (n == 0) {
+            mb.draft[n++] = 'A';
+            mb.draft[n] = '\0';
+        } else {
+            const int step = (buttons & MenuInput_Up) ? 1 : count - 1;
+            mb.draft[n - 1] = letters[(letter_index(mb.draft[n - 1]) + step) % count];
+        }
         lbAudioAx_80024030(2);
-    } else if ((buttons & MenuInput_Right) && mb.status == ST_READY && mb.has_next) {
+    } else if ((buttons & MenuInput_Right) && n < SEARCH_MAX) {
+        mb.draft[n] = n > 0 ? mb.draft[n - 1] : 'A';
+        mb.draft[n + 1] = '\0';
+        lbAudioAx_80024030(2);
+    } else if ((buttons & MenuInput_Left) && n > 0) {
+        mb.draft[n - 1] = '\0';
+        lbAudioAx_80024030(2);
+    }
+}
+
+static void filter_input(unsigned int buttons)
+{
+    const int step = (buttons & MenuInput_XButton) ? -1 : 1;
+    if (buttons & MenuInput_Right) {
+        mb.filter = (mb.filter + 1) % FILTERS;
+        lbAudioAx_80024030(2);
+    } else if (buttons & MenuInput_Left) {
+        mb.filter = (mb.filter + FILTERS - 1) % FILTERS;
+        lbAudioAx_80024030(2);
+    } else if ((buttons & MenuInput_Down) && mb.count > 0) {
+        mb.cursor = 0;
+        lbAudioAx_80024030(2);
+    } else if (buttons & (MenuInput_Confirm | MenuInput_XButton)) {
+        if (mb.filter == FILTER_FIGHTER && mb.tab == 0 && mb.fighter_count > 0) {
+            mb.fighter = (mb.fighter + mb.fighter_count + step) % mb.fighter_count;
+            reload(1);
+        } else if (mb.filter == FILTER_SORT) {
+            mb.sort = (mb.sort + SORTS + step) % SORTS;
+            reload(1);
+        } else if (mb.filter == FILTER_SEARCH && (buttons & MenuInput_Confirm)) {
+            mb.typing = 1;
+            strcpy(mb.draft, mb.search);
+        } else if (mb.filter == FILTER_SEARCH && mb.search[0] != '\0') {
+            mb.search[0] = '\0';   /* X on the search clears it */
+            reload(1);
+        }
+        lbAudioAx_80024030(2);
+    }
+}
+
+static void list_input(unsigned int buttons)
+{
+    if ((buttons & MenuInput_Right) && mb.status == ST_READY && mb.has_next) {
         mb.page++;
-        mb.cursor = mb.poll = 0;
-        mb.status = ST_LOADING;
-        mb.count = 0;
+        reload(0);
         lbAudioAx_80024030(2);
     } else if ((buttons & MenuInput_Left) && mb.page > 0) {
         mb.page--;
-        mb.cursor = mb.poll = 0;
-        mb.status = ST_LOADING;
-        mb.count = 0;
+        reload(0);
         lbAudioAx_80024030(2);
     } else if ((buttons & MenuInput_Down) && mb.count > 0) {
         mb.cursor = (mb.cursor + 1) % mb.count;
         lbAudioAx_80024030(2);
-    } else if ((buttons & MenuInput_Up) && mb.count > 0) {
-        mb.cursor = (mb.cursor + mb.count - 1) % mb.count;
+    } else if (buttons & MenuInput_Up) {
+        mb.cursor = mb.cursor > 0 ? mb.cursor - 1 : FOCUS_FILTERS;
         lbAudioAx_80024030(2);
     } else if ((buttons & MenuInput_Confirm) && mb.status == ST_READY && mb.count > 0) {
         BrowserRow* r = &mb.rows[mb.cursor];
@@ -375,13 +518,59 @@ int mu_mod_browser_think(int canvas, unsigned int buttons)
             lbAudioAx_80024030(3);
         }
     }
+}
+
+/* Called by the main menu's first page before its own input, with the frame's buttons
+ * (mn_80229624). Returns 1 when the browser is open and took them. */
+int mu_mod_browser_think(int canvas, unsigned int buttons)
+{
+    static unsigned int shown;   /* a digest of what is on screen: redraw only on a change */
+    unsigned int now;
+    const char* c;
+    int i;
+    if (!mb.open) {
+        if (!(buttons & MenuInput_YButton) || canvas < 0) {
+            return 0;
+        }
+        mb.open = 1;
+        mb.typing = 0;
+        mb.cursor = 0;
+        reload(1);
+        shown = 0;
+        if (mb.fighter_count == 0) {
+            ask_fighters();
+        }
+        lbAudioAx_80024030(1);
+        OSReport("[mod browser] opened\n");
+    } else if (mb.typing) {
+        typing_input(buttons);
+    } else if (buttons & MenuInput_Back) {
+        mb.open = 0;
+        destroy();
+        lbAudioAx_80024030(0);
+        OSReport("[mod browser] closed\n");
+        return 1;
+    } else if (buttons & (MenuInput_LTrigger | MenuInput_RTrigger)) {
+        mb.tab = (mb.tab + ((buttons & MenuInput_RTrigger) ? 1 : TABS - 1)) % TABS;
+        mb.cursor = 0;   /* a new tab starts on its list, also after an empty one left the cursor on the filters */
+        reload(1);
+        lbAudioAx_80024030(2);
+    } else if (mb.cursor == FOCUS_FILTERS) {
+        filter_input(buttons);
+    } else {
+        list_input(buttons);
+    }
     if (mb.poll-- <= 0) {
         mb.poll = POLL_FRAMES;
         ask_page();
     }
-    now = (unsigned int) (mb.tab * 131 + mb.page * 31 + mb.cursor * 7 + mb.status * 3 + mb.count) + 1u;
+    now = (unsigned int) (mb.tab * 131 + mb.page * 31 + (mb.cursor + 2) * 7 + mb.status * 3 + mb.count + mb.sort * 1009 +
+                          mb.fighter * 2003 + mb.filter * 4001 + mb.typing * 8009) + 1u;
     for (i = 0; i < mb.count; i++) {
         now = now * 33u + mb.rows[i].id + (unsigned int) mb.rows[i].state * 977u;
+    }
+    for (c = mb.typing ? mb.draft : mb.search; *c != '\0'; c++) {
+        now = now * 33u + (unsigned char) *c;
     }
     if (now != shown || mb.text == NULL) {
         shown = now;
