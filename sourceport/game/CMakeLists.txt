@@ -418,6 +418,32 @@ if(MU_AKANEIA_FIGHTERS)
       "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_overlay.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/compat_fields.txt")
   endif()
+  # The id of the layouts fighter code is compiled against (tools/mexft/mexft_abi.py): the game
+  # has it, each plugin has the one it was built with, and the game loads a plugin with its own.
+  if(NOT Python3_EXECUTABLE)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  endif()
+  set(MEXFT_ABI_INPUTS "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugin.h" "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighter.h")
+  if(MEXFT_MANIFESTS)
+    list(APPEND MEXFT_ABI_INPUTS "${CMAKE_CURRENT_BINARY_DIR}/mexft/overlay")
+  else()
+    list(APPEND MEXFT_ABI_INPUTS "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK")
+  endif()
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_abi.py"
+            --out "${CMAKE_CURRENT_BINARY_DIR}/mexft/abi/mexft_abi.h" ${MEXFT_ABI_INPUTS}
+    RESULT_VARIABLE mexft_rc OUTPUT_VARIABLE mexft_log ERROR_VARIABLE mexft_err OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT mexft_rc EQUAL 0)
+    message(FATAL_ERROR "mexft abi: ${mexft_err}")
+  endif()
+  message(STATUS "${mexft_log}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugin.h" "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighter.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_abi.py")
+  set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugins.c" APPEND PROPERTY
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}/mexft/abi")
   foreach(mexft_manifest ${MEXFT_MANIFESTS})
     get_filename_component(mexft_dir "${mexft_manifest}" DIRECTORY)
     get_filename_component(mexft_name "${mexft_dir}" NAME)
@@ -459,6 +485,14 @@ if(MU_AKANEIA_FIGHTERS)
     if(MEXFT_PLUGINS STREQUAL "ALL" OR mexft_name IN_LIST MEXFT_PLUGINS)
       list(APPEND MEXFT_PLUGIN_NAMES ${mexft_name})
       set(MEXFT_PLUGIN_MODULES_${mexft_name})
+      # What MxDt calls the fighter: the manifest's "mex-name" line, else its "name".
+      file(STRINGS "${mexft_manifest}" mexft_mex_name REGEX "^mex-name ")
+      if(NOT mexft_mex_name)
+        file(STRINGS "${mexft_manifest}" mexft_mex_name REGEX "^name ")
+      endif()
+      list(GET mexft_mex_name 0 mexft_mex_name)
+      string(REGEX REPLACE "^(mex-)?name +" "" mexft_mex_name "${mexft_mex_name}")
+      string(STRIP "${mexft_mex_name}" MEXFT_PLUGIN_MEX_NAME_${mexft_name})
     else()
       list(APPEND SHIM_SOURCES "${mexft_out}/mexft_${mexft_name}.c")
       string(APPEND MU_AK_REGISTRY "MU_AK_FIGHTER(mu_ak_mexft_${mexft_name})\n")
@@ -641,17 +675,20 @@ add_custom_command(TARGET melee_game POST_BUILD
   VERBATIM)
 
 # ---- fighter plugins ----
-# Each MEXFT_PLUGINS fighter as fighters/<name>.mufighter beside the library: its modules and its
-# descriptor, linked against this build's addresses (tools/mexft/mexft_plugin.py). A plugin of
-# another build is refused at load, so they are rebuilt whenever the library is.
-if(WIN32 AND MEXFT_PLUGIN_NAMES)
-  set(MEXFT_SYMS "${CMAKE_CURRENT_BINARY_DIR}/melee_game.syms")
-  add_custom_command(OUTPUT "${MEXFT_SYMS}"
+# What the game reads to link a fighter plugin (mexft/mexft_plugins.c): its own symbols by name,
+# beside the library and of the same build.
+if(WIN32)
+  add_custom_command(TARGET melee_game POST_BUILD
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_syms.py"
-            --nm "${CMAKE_NM}" --out "${MEXFT_SYMS}" $<TARGET_FILE_DIR:melee_game>/melee_game.dbg
-    DEPENDS melee_game "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_syms.py" VERBATIM)
+            --nm "${CMAKE_NM}" --library $<TARGET_FILE:melee_game>
+            --out $<TARGET_FILE_DIR:melee_game>/melee_game.syms $<TARGET_FILE_DIR:melee_game>/melee_game.dbg
+    VERBATIM)
+endif()
+# Each MEXFT_PLUGINS fighter as fighters/<name>.mufighter beside the library: its modules and its
+# descriptor as one relocatable object (tools/mexft/mexft_plugin.py). It depends on the layouts
+# it was compiled with (mexft_abi.h), not on a build of the library.
+if(WIN32 AND MEXFT_PLUGIN_NAMES)
   set(MEXFT_PLUGIN_FILES)
-  set(mexft_plugin_base 0x84000000)
   foreach(mexft_name ${MEXFT_PLUGIN_NAMES})
     add_library(mexft_desc_${mexft_name} OBJECT "${CMAKE_CURRENT_BINARY_DIR}/mexft/${mexft_name}/mexft_${mexft_name}.c")
     target_link_libraries(mexft_desc_${mexft_name} PRIVATE game_flags)
@@ -659,16 +696,15 @@ if(WIN32 AND MEXFT_PLUGIN_NAMES)
     set(mexft_plugin_file "${CMAKE_CURRENT_BINARY_DIR}/fighters/${mexft_name}.mufighter")
     add_custom_command(OUTPUT "${mexft_plugin_file}"
       COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_plugin.py"
-              --gcc "${CMAKE_C_COMPILER}" --nm "${CMAKE_NM}" --game-syms "${MEXFT_SYMS}"
-              --game-dll $<TARGET_FILE:melee_game> --header-dir "${CMAKE_CURRENT_SOURCE_DIR}/mexft"
-              --name ${mexft_name} --base ${mexft_plugin_base} --fighter mu_ak_mexft_${mexft_name}
+              --gcc "${CMAKE_C_COMPILER}" --ld "${CMAKE_LINKER}" --objcopy "${CMAKE_OBJCOPY}" --nm "${CMAKE_NM}"
+              --header-dir "${CMAKE_CURRENT_SOURCE_DIR}/mexft" --abi-dir "${CMAKE_CURRENT_BINARY_DIR}/mexft/abi"
+              --name ${mexft_name} --fighter "mu_ak_mexft_${mexft_name}=${MEXFT_PLUGIN_MEX_NAME_${mexft_name}}"
               --out "${mexft_plugin_file}" ${MEXFT_PLUGIN_MODULES_${mexft_name}} $<TARGET_OBJECTS:mexft_desc_${mexft_name}>
-      DEPENDS melee_game "${MEXFT_SYMS}" ${MEXFT_PLUGIN_MODULES_${mexft_name}} $<TARGET_OBJECTS:mexft_desc_${mexft_name}>
+      DEPENDS ${MEXFT_PLUGIN_MODULES_${mexft_name}} $<TARGET_OBJECTS:mexft_desc_${mexft_name}>
               "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_plugin.py" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugin.h"
+              "${CMAKE_CURRENT_BINARY_DIR}/mexft/abi/mexft_abi.h"
       COMMAND_EXPAND_LISTS VERBATIM)
     list(APPEND MEXFT_PLUGIN_FILES "${mexft_plugin_file}")
-    # 1 MB apart: a fighter's code and variables are well under it (the largest is 60 KB of objects).
-    math(EXPR mexft_plugin_base "${mexft_plugin_base} + 0x100000" OUTPUT_FORMAT HEXADECIMAL)
   endforeach()
   add_custom_target(mexft_plugins DEPENDS ${MEXFT_PLUGIN_FILES})
 endif()

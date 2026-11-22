@@ -58088,7 +58088,7 @@ index 3f91bac04..fe4c6a7f8 100644
  /* 0C0098 */ void ft_800C0098(Fighter* fp);
  /* 0C0134 */ void ftCo_800C0134(Fighter* fp);
 diff --git a/src/melee/ft/ftcoll.c b/src/melee/ft/ftcoll.c
-index 695493d..8f93f9e 100644
+index 695493d..834dff1 100644
 --- a/src/melee/ft/ftcoll.c
 +++ b/src/melee/ft/ftcoll.c
 @@ -1,3 +1,10 @@
@@ -58102,17 +58102,28 @@ index 695493d..8f93f9e 100644
  #include "ftcoll.h"
  
  #include <Runtime/platform.h>
-@@ -44,6 +51,9 @@
+@@ -44,6 +51,20 @@
  #include <sysdolphin/baselib/debug.h>
  #include <sysdolphin/baselib/gobj.h>
  #include <sysdolphin/baselib/random.h>
 +#ifdef MU_NATIVE
 +#include <mu_tmce_osd.h>
++
++/* The fighter's dynamics colliders (fp->x1670, fp->x166C of them). Natively an entry holds an
++ * 8-byte pointer, so the console's room for 11 in the fighter holds 9: a fighter with more keeps
++ * its colliders in a set of its own (ftcoll.c mu_ft_colliders). */
++#ifdef MU_NATIVE
++Fighter_x1670_t* mu_ft_colliders(Fighter* fp);
++#define FT_COLLIDERS(fp) mu_ft_colliders(fp)
++#else
++#define FT_COLLIDERS(fp) ((fp)->x1670)
++#endif
++
 +#endif
  
  /// @todo .sdata2 order hack
  #ifdef MUST_MATCH
-@@ -83,106 +93,6 @@ static int dmg_log0_idx;
+@@ -83,106 +104,6 @@ static int dmg_log0_idx;
  static int dmg_log1_idx;
  static s8 ftColl_804D6560[8];
  
@@ -58219,7 +58230,7 @@ index 695493d..8f93f9e 100644
  /// Reset hitbox and phantom collision count?
  void ftColl_800765E0(void)
  {
-@@ -205,18 +115,33 @@ float ftColl_800765F0(Fighter* fp, Fighter_GObj* victim, float arg2)
+@@ -205,18 +126,33 @@ float ftColl_800765F0(Fighter* fp, Fighter_GObj* victim, float arg2)
  static int getEnvDmg(float dmg)
  {
      if (dmg) {
@@ -58258,7 +58269,7 @@ index 695493d..8f93f9e 100644
      if (fp->x221C_b4) {
          fp->dmg.x1834 -= *dmg;
          if (fp->dmg.x1834 < 0) {
-@@ -248,7 +173,12 @@ void ftColl_80076764(int arg0, enum_t arg1, Fighter_GObj* arg2,
+@@ -248,7 +184,12 @@ void ftColl_80076764(int arg0, enum_t arg1, Fighter_GObj* arg2,
          entry->unk_anim0 = arg3;
          entry->hurt1 = hurt;
          entry->pos = fp->cur_pos;
@@ -58271,7 +58282,7 @@ index 695493d..8f93f9e 100644
          ++dmg_log0_idx;
      } else {
          HSD_ASSERTREPORT(0xF9, 0, "damage log over %d!!\n",
-@@ -291,13 +221,6 @@ void ftColl_80076808(Fighter* fp, HitCapsule* hit, int arg2, void* victim,
+@@ -291,13 +232,6 @@ void ftColl_80076808(Fighter* fp, HitCapsule* hit, int arg2, void* victim,
      }
  }
  
@@ -58285,16 +58296,14 @@ index 695493d..8f93f9e 100644
  void ftColl_800768A0(Fighter* fp, HitCapsule* dst)
  {
      size_t i;
-@@ -313,112 +236,34 @@ void ftColl_800768A0(Fighter* fp, HitCapsule* dst)
+@@ -313,112 +247,34 @@ void ftColl_800768A0(Fighter* fp, HitCapsule* dst)
      lbColl_80008440(dst);
  }
  
 -/// @todo Probably the same function as #inlineA1
 -static inline void inlineA0(Fighter* fp0, Fighter* fp1, HitCapsule* hit1,
 -                            Vec3* ef_pos, float dmg)
-+static inline void updateClankDamage(Fighter* fp, HitCapsule* hit, int int_dmg,
-+                                     Vec3* other_pos, bool compare_other_first)
- {
+-{
 -    int int_dmg;
 -
 -    /// @todo <tt>int_dmg = getEnvDmg(dmg);</tt>
@@ -58344,7 +58353,9 @@ index 695493d..8f93f9e 100644
 -
 -static inline bool inlineA1(Fighter* fp0, HitCapsule* hit0, Fighter* fp1,
 -                            HitCapsule* hit1, Vec3* ef_pos, float dmg)
--{
++static inline void updateClankDamage(Fighter* fp, HitCapsule* hit, int int_dmg,
++                                     Vec3* other_pos, bool compare_other_first)
+ {
 -    size_t i;
 -    int int_dmg;
 -
@@ -58409,7 +58420,7 @@ index 695493d..8f93f9e 100644
  
      midpoint.x = 0.5f * (hit0->hurt_coll_pos.x + hit1->hurt_coll_pos.x);
      midpoint.y = 0.5f * (hit0->hurt_coll_pos.y + hit1->hurt_coll_pos.y);
-@@ -427,32 +272,34 @@ bool ftColl_8007699C(Fighter* fp0, HitCapsule* hit0, Fighter* fp1,
+@@ -427,32 +283,34 @@ bool ftColl_8007699C(Fighter* fp0, HitCapsule* hit0, Fighter* fp1,
      {
          float dmg = hit1->damage;
          if ((int) dmg - p_ftCommonData->x3CC < (int) hit0->damage) {
@@ -58453,7 +58464,7 @@ index 695493d..8f93f9e 100644
          if (int_dmg > fp0->dmg.x1924) {
              fp0->dmg.x1924 = int_dmg;
              if (fp0->ground_or_air == GA_Ground) {
-@@ -488,18 +335,24 @@ void ftColl_80076CBC(Fighter* fp0, HitCapsule* hit0, Fighter* fp1)
+@@ -488,18 +346,24 @@ void ftColl_80076CBC(Fighter* fp0, HitCapsule* hit0, Fighter* fp1)
              int tmp_dmg = int_dmg + hit0->x34;
              PAD_STACK(4);
              fp1->x19A0_shieldDamageTaken += tmp_dmg < 0 ? 0 : tmp_dmg;
@@ -58481,7 +58492,7 @@ index 695493d..8f93f9e 100644
      {
          float tmp = fp1->shield_unk0;
          if (fp1->shield_unk0) {
-@@ -635,7 +488,7 @@ bool ftColl_80076ED8(Fighter* fp0, HitCapsule* hit0, Fighter* fp1,
+@@ -635,7 +499,7 @@ bool ftColl_80076ED8(Fighter* fp0, HitCapsule* hit0, Fighter* fp1,
              if ((int) dmg) {
                  int_dmg.v = dmg;
              } else {
@@ -58490,7 +58501,7 @@ index 695493d..8f93f9e 100644
              }
          } else {
              int_dmg.v = 0;
-@@ -666,7 +519,7 @@ bool ftColl_80076ED8(Fighter* fp0, HitCapsule* hit0, Fighter* fp1,
+@@ -666,7 +530,7 @@ bool ftColl_80076ED8(Fighter* fp0, HitCapsule* hit0, Fighter* fp1,
                  if ((int) dmg) {
                      dmg_count.v = dmg;
                  } else {
@@ -58499,7 +58510,7 @@ index 695493d..8f93f9e 100644
                  }
              } else {
                  dmg_count.v = 0;
-@@ -744,6 +597,11 @@ static int hit_effect_ids[] = {
+@@ -744,6 +608,11 @@ static int hit_effect_ids[] = {
      /* [HitElement_Leadead]  */ 0,
  };
  
@@ -58511,7 +58522,7 @@ index 695493d..8f93f9e 100644
  void ftColl_80077464(Item* item, HitCapsule* hit, Fighter* fp)
  {
      s32 damage;
-@@ -850,6 +708,12 @@ void ftColl_80077688(Item* item, HitCapsule* hurt, Fighter* fp, Vec3* pos,
+@@ -850,6 +719,12 @@ void ftColl_80077688(Item* item, HitCapsule* hurt, Fighter* fp, Vec3* pos,
      int dmg;
      int mode;
      PAD_STACK(24);
@@ -58524,7 +58535,7 @@ index 695493d..8f93f9e 100644
  
      if (hurt->x41_b6) {
          mode = 2;
-@@ -863,7 +727,7 @@ void ftColl_80077688(Item* item, HitCapsule* hurt, Fighter* fp, Vec3* pos,
+@@ -863,7 +738,7 @@ void ftColl_80077688(Item* item, HitCapsule* hurt, Fighter* fp, Vec3* pos,
          if ((int) hurt->damage) {
              dmg = hurt->damage;
          } else {
@@ -58533,7 +58544,7 @@ index 695493d..8f93f9e 100644
          }
      } else {
          dmg = 0;
-@@ -947,8 +811,8 @@ void ftColl_80077688(Item* item, HitCapsule* hurt, Fighter* fp, Vec3* pos,
+@@ -947,8 +822,8 @@ void ftColl_80077688(Item* item, HitCapsule* hurt, Fighter* fp, Vec3* pos,
  
      if (ftLib_80086960(item->owner)) {
          Fighter* owner_fp = item->owner->user_data;
@@ -58544,15 +58555,13 @@ index 695493d..8f93f9e 100644
      } else {
          fp->x19BC_shieldDamageTaken3 = 6;
      }
-@@ -973,70 +837,12 @@ void ftColl_80077688(Item* item, HitCapsule* hurt, Fighter* fp, Vec3* pos,
+@@ -973,70 +848,12 @@ void ftColl_80077688(Item* item, HitCapsule* hurt, Fighter* fp, Vec3* pos,
      efSync_Spawn(0x41C, NULL, &hurt->hurt_coll_pos);
  }
  
 -static inline void inlineItemA0(Item* item, Fighter* fp, HitCapsule* hit,
 -                                Vec3* ef_pos, float dmg)
-+static inline void recordItemClank(Item* item, HitCapsule* hit, Fighter* fp,
-+                                   Vec3* effect_pos, float dmg)
- {
+-{
 -    int int_dmg;
 -
 -    if (dmg) {
@@ -58600,7 +58609,9 @@ index 695493d..8f93f9e 100644
 -
 -static inline void inlineItemA1(Item* item, HitCapsule* hit, Fighter* fp,
 -                                Vec3* ef_pos, float dmg)
--{
++static inline void recordItemClank(Item* item, HitCapsule* hit, Fighter* fp,
++                                   Vec3* effect_pos, float dmg)
+ {
 -    int int_dmg;
 +    int int_dmg = getEnvDmgV(dmg);
      int mode;
@@ -58618,7 +58629,7 @@ index 695493d..8f93f9e 100644
      if (hit->x41_b5) {
          mode = 4;
      } else {
-@@ -1046,28 +852,19 @@ static inline void inlineItemA1(Item* item, HitCapsule* hit, Fighter* fp,
+@@ -1046,28 +863,19 @@ static inline void inlineItemA1(Item* item, HitCapsule* hit, Fighter* fp,
      it_8026FAC4(item, hit, mode, fp, 0);
  
      if (int_dmg > item->xC48) {
@@ -58649,7 +58660,7 @@ index 695493d..8f93f9e 100644
                  dir = -1.0f;
              } else {
                  dir = 1.0f;
-@@ -1076,14 +873,14 @@ static inline void inlineItemA1(Item* item, HitCapsule* hit, Fighter* fp,
+@@ -1076,14 +884,14 @@ static inline void inlineItemA1(Item* item, HitCapsule* hit, Fighter* fp,
          item->xCB8_outDamageDirection = dir;
      }
  
@@ -58666,7 +58677,7 @@ index 695493d..8f93f9e 100644
  
      midpoint.x = (hit1->hurt_coll_pos.x + hit2->hurt_coll_pos.x) * 0.5f;
      midpoint.y = (hit1->hurt_coll_pos.y + hit2->hurt_coll_pos.y) * 0.5f;
-@@ -1092,14 +889,17 @@ void ftColl_80077970(Item* item, HitCapsule* hit1, Fighter* fp,
+@@ -1092,14 +900,17 @@ void ftColl_80077970(Item* item, HitCapsule* hit1, Fighter* fp,
      {
          float dmg = hit2->damage;
          if ((int) dmg - p_ftCommonData->x3CC < (int) hit1->damage) {
@@ -58686,7 +58697,7 @@ index 695493d..8f93f9e 100644
          }
      }
  }
-@@ -1115,7 +915,7 @@ bool ftColl_80077C60(Item* item, HitCapsule* hit, Fighter* fp,
+@@ -1115,7 +926,7 @@ bool ftColl_80077C60(Item* item, HitCapsule* hit, Fighter* fp,
              mode = 0;
          }
          it_8026FAC4(item, hit, mode, fp, 0);
@@ -58695,7 +58706,7 @@ index 695493d..8f93f9e 100644
              switch (item->kind) {
              case It_Kind_Star:
                  hit->state = HitCapsule_Disabled;
-@@ -1137,7 +937,7 @@ bool ftColl_80077C60(Item* item, HitCapsule* hit, Fighter* fp,
+@@ -1137,7 +948,7 @@ bool ftColl_80077C60(Item* item, HitCapsule* hit, Fighter* fp,
              default:
                  break;
              }
@@ -58704,7 +58715,7 @@ index 695493d..8f93f9e 100644
          }
          return false;
      }
-@@ -1277,7 +1077,7 @@ bool ftColl_80077C60(Item* item, HitCapsule* hit, Fighter* fp,
+@@ -1277,7 +1088,7 @@ bool ftColl_80077C60(Item* item, HitCapsule* hit, Fighter* fp,
                      if ((int) scaled_dmg) {
                          dmg_count = scaled_dmg;
                      } else {
@@ -58713,7 +58724,7 @@ index 695493d..8f93f9e 100644
                      }
                  } else {
                      dmg_count = 0;
-@@ -1343,7 +1143,7 @@ bool ftColl_80077C60(Item* item, HitCapsule* hit, Fighter* fp,
+@@ -1343,7 +1154,7 @@ bool ftColl_80077C60(Item* item, HitCapsule* hit, Fighter* fp,
  
  static inline int getUnkVal(Fighter* fp, int i)
  {
@@ -58722,7 +58733,7 @@ index 695493d..8f93f9e 100644
  }
  
  void ftColl_80078384(Fighter* fp, FighterHurtCapsule* arg1, HitCapsule* arg2)
-@@ -1426,9 +1226,9 @@ void ftColl_8007861C(Fighter_GObj* arg0, Fighter_GObj* gobj, int arg2,
+@@ -1426,9 +1237,9 @@ void ftColl_8007861C(Fighter_GObj* arg0, Fighter_GObj* gobj, int arg2,
  
      if (attacker != NULL) {
          victim->dmg.x18C0 = attacker == victim ? 0 : attacker->x8_spawnNum;
@@ -58734,7 +58745,7 @@ index 695493d..8f93f9e 100644
      } else {
          victim->dmg.x18C0 = 0;
          victim->dmg.x18C8 = -1;
-@@ -1463,7 +1263,7 @@ void ftColl_80078754(Fighter_GObj* arg0, Fighter_GObj* arg1, bool arg2)
+@@ -1463,7 +1274,7 @@ void ftColl_80078754(Fighter_GObj* arg0, Fighter_GObj* arg1, bool arg2)
      fp1 = arg1->user_data;
  
      ftColl_8007861C(arg0, arg1, 1, fp0->kind, fp0->x2070.x2070_int,
@@ -58743,7 +58754,7 @@ index 695493d..8f93f9e 100644
  
      fp1->dmg.x18c4_source_ply = 6;
      fp1->dmg.x18C8 = -1;
-@@ -1477,19 +1277,19 @@ void ftColl_800787B4(Item_GObj* arg0, Fighter_GObj* arg1, int arg2)
+@@ -1477,19 +1288,19 @@ void ftColl_800787B4(Item_GObj* arg0, Fighter_GObj* arg1, int arg2)
      PAD_STACK(8);
  
      if (ip->kind == It_Kind_BombHei) {
@@ -58767,7 +58778,7 @@ index 695493d..8f93f9e 100644
      }
  }
  
-@@ -1498,58 +1298,52 @@ void ftColl_800788D4(Fighter_GObj* gobj)
+@@ -1498,58 +1309,52 @@ void ftColl_800788D4(Fighter_GObj* gobj)
      ftColl_8007861C(0, gobj, 0, -10, 0, 0, 0, 0, 0);
  }
  
@@ -58846,7 +58857,7 @@ index 695493d..8f93f9e 100644
      if (grab_dist < 0) {
          grab_dist = -grab_dist;
      }
-@@ -1586,7 +1380,7 @@ void ftColl_80078A2C(Fighter_GObj* this_gobj)
+@@ -1586,7 +1391,7 @@ void ftColl_80078A2C(Fighter_GObj* this_gobj)
                    victim_fp->x1988 == 0 && victim_fp->x198C == 0 &&
                    !victim_fp->x221D_b6 &&
                    !(victim_fp->x1A6A & this_fp->x1A68) &&
@@ -58855,7 +58866,7 @@ index 695493d..8f93f9e 100644
              {
                  for (i = 0; i < 4; i++) {
                      this_hit = HitCapsuleGetPtr(this_fp, i);
-@@ -1613,10 +1407,8 @@ void ftColl_80078A2C(Fighter_GObj* this_gobj)
+@@ -1613,10 +1418,8 @@ void ftColl_80078A2C(Fighter_GObj* this_gobj)
                                          if (ft_80084CE4(this_fp, victim_fp) ==
                                              false)
                                          {
@@ -58868,7 +58879,7 @@ index 695493d..8f93f9e 100644
                                          }
                                          goto next_gobj;
                                      }
-@@ -1637,57 +1429,52 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1637,57 +1440,52 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
      Fighter* this_fp;
      HSD_GObj* victim_gobj;
      bool is_same_gobj;
@@ -58946,7 +58957,7 @@ index 695493d..8f93f9e 100644
                                       i < (sizeof(this_fp->x914) /
                                            sizeof(HitCapsule));
                                       i++)
-@@ -1714,7 +1501,7 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1714,7 +1512,7 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                                                             this_hit) == 0))))
                                      {
                                          ftColl_804D6560[i] = 1;
@@ -58955,7 +58966,7 @@ index 695493d..8f93f9e 100644
                                      } else {
                                          ftColl_804D6560[i] = 0;
                                      }
-@@ -1726,33 +1513,29 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1726,33 +1524,29 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                              {
  /// @todo Cast forces regswap
  #ifdef MUST_MATCH
@@ -59001,7 +59012,7 @@ index 695493d..8f93f9e 100644
                                          (this_gobj !=
                                           victim_fp->victim_gobj) &&
                                          ((int) this_fp->ground_or_air ==
-@@ -1760,40 +1543,39 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1760,40 +1554,39 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                                          ((int) victim_fp->ground_or_air ==
                                           GA_Ground) &&
                                          !((u8) this_fp->x221B_b5) &&
@@ -59053,7 +59064,7 @@ index 695493d..8f93f9e 100644
                                              goto block_66;
                                          }
                                      } else {
-@@ -1817,13 +1599,13 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1817,13 +1610,13 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                                                  }
                                              }
                                              if (((u8) this_fp->x221B_b4) &&
@@ -59069,7 +59080,7 @@ index 695493d..8f93f9e 100644
                                                       &this_fp->shield_hit,
                                                       ftCommon_8007F804(
                                                           this_fp),
-@@ -1833,11 +1615,11 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1833,11 +1626,11 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                                                       this_fp->cur_pos.z) !=
                                                   false))
                                              {
@@ -59083,7 +59094,7 @@ index 695493d..8f93f9e 100644
                                                                      this_fp);
                                                  } else {
                                                      victim_fp->x221C_b5 = true;
-@@ -1860,7 +1642,7 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1860,7 +1653,7 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                                                       n++)
                                                  {
                                                      if (lbColl_8000805C(
@@ -59092,7 +59103,7 @@ index 695493d..8f93f9e 100644
                                                              &this_fp
                                                                   ->hurt_capsules
                                                                       [n]
-@@ -1875,14 +1657,13 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1875,14 +1668,13 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                                                              this_fp->cur_pos
                                                                  .z) != false)
                                                      {
@@ -59109,7 +59120,7 @@ index 695493d..8f93f9e 100644
                                                                      this_fp,
                                                                      (HitCapsule*) &this_fp
                                                                          ->hurt_capsules
-@@ -1907,8 +1688,7 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1907,8 +1699,7 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                                                                      ft_PlaySFX(
                                                                          this_fp,
                                                                          ftColl_803C0C40
@@ -59119,7 +59130,7 @@ index 695493d..8f93f9e 100644
                                                                          0x7FU,
                                                                          0x40U);
                                                                      var_r0_2 =
-@@ -1920,32 +1700,32 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1920,32 +1711,32 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                                                                  if (var_r0_2 ==
                                                                      0)
                                                                  {
@@ -59160,7 +59171,7 @@ index 695493d..8f93f9e 100644
                                                                      }
                                                                  }
                                                              }
-@@ -1955,7 +1735,7 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1955,7 +1746,7 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                                                                  this_gobj;
                                                          }
  
@@ -59169,7 +59180,7 @@ index 695493d..8f93f9e 100644
                                                           * >=
                                                           * p_ftCommonData->x7A8)
                                                           */
-@@ -1987,15 +1767,16 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
+@@ -1987,15 +1778,16 @@ void ftColl_80078C70(Fighter_GObj* this_gobj)
                      }
                  }
              }
@@ -59191,7 +59202,7 @@ index 695493d..8f93f9e 100644
  void ftColl_8007925C(Fighter_GObj* gobj)
  { // clang-format off
      u32 i, j, n, m;
-@@ -2004,14 +1785,14 @@ void ftColl_8007925C(Fighter_GObj* gobj)
+@@ -2004,14 +1796,14 @@ void ftColl_8007925C(Fighter_GObj* gobj)
      int hit_count;
      HitCapsule* this_hit;
      Item* item;
@@ -59208,7 +59219,7 @@ index 695493d..8f93f9e 100644
  
      fp = gobj->user_data;
  
-@@ -2038,48 +1819,39 @@ void ftColl_8007925C(Fighter_GObj* gobj)
+@@ -2038,48 +1830,39 @@ void ftColl_8007925C(Fighter_GObj* gobj)
          if (!fp->x221B_b5) {
              hit_count = 0;
  
@@ -59283,7 +59294,7 @@ index 695493d..8f93f9e 100644
          for (j = 0; j < 4; j++) {
              struct ItemHitbox* item_hitbox = &item->x5D4_hitboxes[j];
              hurt = &item_hitbox->hit;
-@@ -2114,81 +1886,61 @@ void ftColl_8007925C(Fighter_GObj* gobj)
+@@ -2114,81 +1897,61 @@ void ftColl_8007925C(Fighter_GObj* gobj)
  
              var_r22 = ((u8) hurt->x43_b2 != false) ? true : false;
  
@@ -59404,7 +59415,7 @@ index 695493d..8f93f9e 100644
                  for (m = 0; m < (sizeof(fp->x914) / sizeof(HitCapsule)); m++) {
                      if ((u8) ftColl_804D6560[m] == 0) {
                          continue;
-@@ -2208,7 +1960,7 @@ void ftColl_8007925C(Fighter_GObj* gobj)
+@@ -2208,7 +1971,7 @@ void ftColl_8007925C(Fighter_GObj* gobj)
                                  item->scl, fp->x34_scale.y))
                          {
                              item->xDCE_flag.b6 = true;
@@ -59413,7 +59424,7 @@ index 695493d..8f93f9e 100644
                              item->toucher = gobj;
                              break;
                          }
-@@ -2222,63 +1974,53 @@ void ftColl_8007925C(Fighter_GObj* gobj)
+@@ -2222,63 +1985,53 @@ void ftColl_8007925C(Fighter_GObj* gobj)
                          if (lbColl_80007AFC(hurt, temp_hit,
                                  item->scl, fp->x34_scale.y))
                          {
@@ -59461,11 +59472,11 @@ index 695493d..8f93f9e 100644
 -                    var_r3 = false;
                  }
 -            }
--
+ 
 -            if ((u8) fp->x221B_b4 && !(u8) hurt->x42_b4) {
 -                var_r3 = false;
 -            }
- 
+-
 -            if (var_r3 == 0) {
 -                goto catch_elem_path;
 -            }
@@ -59507,7 +59518,7 @@ index 695493d..8f93f9e 100644
              if ( hurt->element == HitElement_Inert) {
                  for (m = 0; m < fp->hurt_capsules_len; m++) {
                      if (lbColl_80008248(hurt,
-@@ -2340,12 +2082,12 @@ void ftColl_8007925C(Fighter_GObj* gobj)
+@@ -2340,12 +2093,12 @@ void ftColl_8007925C(Fighter_GObj* gobj)
                              (u32) hurt->sfx_severity == 2)
                          {
                              fp->x215C = lbColl_80005BB0(hurt,
@@ -59524,7 +59535,7 @@ index 695493d..8f93f9e 100644
                          }
                          break;
                      }
-@@ -2354,17 +2096,14 @@ void ftColl_8007925C(Fighter_GObj* gobj)
+@@ -2354,17 +2107,14 @@ void ftColl_8007925C(Fighter_GObj* gobj)
          }
      }
  } // clang-format on
@@ -59544,7 +59555,7 @@ index 695493d..8f93f9e 100644
          }
          return ftd->x6D4;
      }
-@@ -2373,7 +2112,7 @@ static inline s32 ftColl_GetDamageCount(Fighter* fp, ftCommonData* ftd)
+@@ -2373,7 +2123,7 @@ static inline s32 ftColl_GetDamageCount(Fighter* fp, ftCommonData* ftd)
  
  /// Shared knockback formula shell. @p inner is the per-branch scaling term.
  /// @remarks Must stay one nested expression; step assignments change the
@@ -59553,7 +59564,7 @@ index 695493d..8f93f9e 100644
  #define KNOCKBACK(defense, attack, arg3, one, ftd, hit, w, inner)             \
      ((defense) *                                                              \
       ((attack) *                                                              \
-@@ -2422,69 +2161,10 @@ float ftColl_80079AB0(Fighter* fp, HitCapsule* hit, u32 unk_count, float arg3,
+@@ -2422,69 +2172,10 @@ float ftColl_80079AB0(Fighter* fp, HitCapsule* hit, u32 unk_count, float arg3,
  float ftColl_80079C70(Fighter* fp, Fighter* attacker, HitCapsule* hit,
                        int unk_count)
  {
@@ -59627,7 +59638,7 @@ index 695493d..8f93f9e 100644
  }
  
  float ftColl_80079EA8(Fighter* fp, HitCapsule* hit, u32 unk_count)
-@@ -2527,10 +2207,31 @@ float ftColl_80079EA8(Fighter* fp, HitCapsule* hit, u32 unk_count)
+@@ -2527,10 +2218,31 @@ float ftColl_80079EA8(Fighter* fp, HitCapsule* hit, u32 unk_count)
      return result;
  }
  
@@ -59663,7 +59674,7 @@ index 695493d..8f93f9e 100644
  void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
                       int arg4)
  {
-@@ -2542,11 +2243,14 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
+@@ -2542,11 +2254,14 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
          /* 0x10 */ Vec3 pos;
          /* 0x1C */ u32 element;
          /* 0x20 */ int sfx_severity;
@@ -59679,7 +59690,7 @@ index 695493d..8f93f9e 100644
      float angle;
      float dir;
      struct {
-@@ -2563,14 +2267,13 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
+@@ -2563,14 +2278,13 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
      int best_idx;
      DmgLogEntry* best_entry;
      int sfx_severity;
@@ -59695,7 +59706,7 @@ index 695493d..8f93f9e 100644
  
      if (idx == 0) {
          return;
-@@ -2582,235 +2285,56 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
+@@ -2582,235 +2296,56 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
      best_kb.v = -1.0F;
  
      for (i = 0, entry = entries; i < idx; entry++, i++) {
@@ -59767,9 +59778,7 @@ index 695493d..8f93f9e 100644
 -            } else {
 -                attack = 1.0F;
 -            }
-+            HSD_GObj* owner = item->owner;
-+            float attack;
- 
+-
 -            kb = co->weight;
 -            defense = Player_GetDefenseRatio(fp->player_id);
 -            stage = gm_8016B248();
@@ -59778,7 +59787,9 @@ index 695493d..8f93f9e 100644
 -            w = kb;
 -            w *= ftd->xF4;
 -            unk_count = entry->size_of_xC;
--
++            HSD_GObj* owner = item->owner;
++            float attack;
+ 
 -            if (hit->x28 != 0) {
 -                float decay = ftd->xF8;
 -                float x118 = ftd->x118;
@@ -59953,7 +59964,7 @@ index 695493d..8f93f9e 100644
          default:
              break;
          }
-@@ -2910,9 +2434,23 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
+@@ -2910,9 +2445,23 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
      out->kb = best_kb.v;
      out->pos = best_entry->pos;
      out->element = element;
@@ -59977,7 +59988,7 @@ index 695493d..8f93f9e 100644
  
      switch (best_entry->x0) {
      case 1: {
-@@ -2934,8 +2472,8 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
+@@ -2934,8 +2483,8 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
          tail_owner_gobj = ip->owner;
  
          if (ip->kind == It_Kind_BombHei) {
@@ -59988,7 +59999,7 @@ index 695493d..8f93f9e 100644
              pl_80041B08(player_id, (UNK_T) (uintptr_t) b4, (u16) ip->x1C);
          }
  
-@@ -2966,9 +2504,6 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
+@@ -2966,9 +2515,6 @@ void ftColl_8007A06C(Fighter_GObj* gobj, void* dmg_ptr, void* log, size_t idx,
          fp->x1960_vibrateMult = p_ftCommonData->x1A4;
      }
  }
@@ -59998,7 +60009,7 @@ index 695493d..8f93f9e 100644
  
  void ftColl_8007AB48(Fighter_GObj* gobj)
  {
-@@ -3029,6 +2564,12 @@ void ftColl_8007AD18(Fighter* fp, HitCapsule* arg1)
+@@ -3029,6 +2575,12 @@ void ftColl_8007AD18(Fighter* fp, HitCapsule* arg1)
  {
      Vec3 sp10;
      f32 temp_f1;
@@ -60011,7 +60022,16 @@ index 695493d..8f93f9e 100644
  
      switch (arg1->state) {
      case HitCapsule_Enabled:
-@@ -3155,6 +2696,11 @@ void ftColl_8007B128(Fighter_GObj* fighter_gobj, int bone_id,
+@@ -3104,7 +2656,7 @@ void ftColl_8007AF60(Fighter_GObj* gobj)
+     int i;
+ 
+     for (i = 0; i < (unsigned) fp->x166C; i++) {
+-        Fighter_x1670_t* temp_r4 = &fp->x1670[i];
++        Fighter_x1670_t* temp_r4 = &FT_COLLIDERS(fp)[i];
+         lb_8000B1CC(temp_r4->jobj, &temp_r4->v1, &temp_r4->x18);
+     }
+ }
+@@ -3155,6 +2707,11 @@ void ftColl_8007B128(Fighter_GObj* fighter_gobj, int bone_id,
  {
      Fighter* fp = GET_FIGHTER(fighter_gobj);
      int i;
@@ -60023,13 +60043,13 @@ index 695493d..8f93f9e 100644
      for (i = 0; i < fp->hurt_capsules_len; i++) {
          FighterHurtCapsule* hurt = &fp->hurt_capsules[i];
          int bone_idx = hurt->capsule.bone_idx;
-@@ -3165,8 +2711,22 @@ void ftColl_8007B128(Fighter_GObj* fighter_gobj, int bone_id,
+@@ -3165,8 +2722,22 @@ void ftColl_8007B128(Fighter_GObj* fighter_gobj, int bone_id,
              }
              return;
          }
 +#if MU_ROGUE  /* rogueMelee */
-     }
- 
++    }
++
 +    if (MU_BMR_InBorrowedMove(fp)) {
 +        /* The source fighter can have anatomy the recipient simply lacks. */
 +        return;
@@ -60040,13 +60060,13 @@ index 695493d..8f93f9e 100644
 +    if (MU_BMM_InBorrowedMove(fp)) {
 +        /* The source fighter can have anatomy the borrower simply lacks. */
 +        return;
-+    }
-+
+     }
+ 
 +#endif
      HSD_ASSERTREPORT(0x888, 0,
                       "in ftCollisionSetHitStatus illegal parts!\n");
  }
-@@ -3181,7 +2741,17 @@ void ftColl_8007B1B8(Fighter_GObj* gobj, ShieldDesc* shield, HSD_GObjEvent cb)
+@@ -3181,7 +2752,17 @@ void ftColl_8007B1B8(Fighter_GObj* gobj, ShieldDesc* shield, HSD_GObjEvent cb)
      fp->x221B_b3 = false;
      fp->x221B_b4 = false;
      fp->shield_hit_cb = cb;
@@ -60064,7 +60084,7 @@ index 695493d..8f93f9e 100644
      fp->shield_hit.size = shield->radius;
      fp->shield_hit.offset = shield->pos;
  }
-@@ -3197,17 +2767,45 @@ void ftColl_CreateReflectHit(Fighter_GObj* gobj, ReflectDesc* reflect,
+@@ -3197,26 +2778,111 @@ void ftColl_CreateReflectHit(Fighter_GObj* gobj, ReflectDesc* reflect,
      fp->ReflectAttr.x1A34_damageMul = reflect->x18_damage_mul;
      fp->ReflectAttr.x1A38_speedMul = reflect->x1C_speed_mul;
      fp->x2218_b5 = reflect->x20_behavior;
@@ -60110,7 +60130,64 @@ index 695493d..8f93f9e 100644
      fp->absorb_hit.size = absorb->x10_size;
      fp->absorb_hit.offset = absorb->x4_offset;
  }
-@@ -3215,8 +2813,8 @@ void ftColl_CreateAbsorbHit(Fighter_GObj* gobj, AbsorbDesc* absorb)
+ 
++#ifdef MU_NATIVE
++/* A fighter file may list 11 dynamics colliders (the assert in ftColl_8007B320), which is what the
++ * console's array in the fighter holds. Natively the array holds 9, so a fighter with more (an
++ * added fighter's: Duck Hunt has 11) keeps all of its colliders here instead, in a set claimed
++ * when the fighter is made. A set belongs to a fighter by its address. At most 12 fighters live
++ * at once (six players, two each) and a new claim takes the set claimed longest ago, so a set
++ * taken over is always a fighter's that is gone. The sets are statics of the image, so a
++ * rollback restores them with the fighters. */
++enum { MU_FT_COLLIDER_SETS = 16, MU_FT_COLLIDER_MAX = 11 };
++static struct {
++    Fighter* fp;
++    Fighter_x1670_t entries[MU_FT_COLLIDER_MAX];
++} mu_ft_collider_sets[MU_FT_COLLIDER_SETS];
++static int mu_ft_collider_next;
++
++static int mu_ft_collider_room(void)
++{
++    return (int) ((__builtin_offsetof(Fighter, x1828) - __builtin_offsetof(Fighter, x1670)) /
++                  sizeof(Fighter_x1670_t));
++}
++
++Fighter_x1670_t* mu_ft_colliders(Fighter* fp)
++{
++    int i;
++    if (fp->x166C <= mu_ft_collider_room()) {
++        return fp->x1670;
++    }
++    for (i = 0; i < MU_FT_COLLIDER_SETS; i++) {
++        if (mu_ft_collider_sets[i].fp == fp) {
++            return mu_ft_collider_sets[i].entries;
++        }
++    }
++    return fp->x1670; /* not reached: mu_ft_colliders_claim ran when the count was set */
++}
++
++/* Called with fp->x166C just set from the fighter file. */
++static void mu_ft_colliders_claim(Fighter* fp)
++{
++    int i;
++    if (fp->x166C > MU_FT_COLLIDER_MAX) {
++        fp->x166C = MU_FT_COLLIDER_MAX;
++    }
++    for (i = 0; i < MU_FT_COLLIDER_SETS; i++) {
++        if (mu_ft_collider_sets[i].fp == fp) {
++            if (fp->x166C <= mu_ft_collider_room()) {
++                mu_ft_collider_sets[i].fp = NULL; /* a new fighter at an old one's address */
++            }
++            return;
++        }
++    }
++    if (fp->x166C > mu_ft_collider_room()) {
++        mu_ft_collider_sets[mu_ft_collider_next].fp = fp;
++        mu_ft_collider_next = (mu_ft_collider_next + 1) % MU_FT_COLLIDER_SETS;
++    }
++}
++#endif
++
  void ftColl_8007B320(Fighter_GObj* gobj)
  {
      Fighter* fp = gobj->user_data;
@@ -60121,7 +60198,7 @@ index 695493d..8f93f9e 100644
      u32 i;
      PAD_STACK(8);
  
-@@ -3227,14 +2825,14 @@ void ftColl_8007B320(Fighter_GObj* gobj)
+@@ -3227,14 +2893,14 @@ void ftColl_8007B320(Fighter_GObj* gobj)
      fp->hurt_capsules_len = x30->count;
      for (i = 0; i < (u32) x30->count; i++) {
          FighterHurtCapsule* hurt = &fp->hurt_capsules[i];
@@ -60139,29 +60216,18 @@ index 695493d..8f93f9e 100644
          hurt->capsule.scale = init->scale;
      }
  
-@@ -3243,12 +2841,27 @@ void ftColl_8007B320(Fighter_GObj* gobj)
+@@ -3243,12 +2909,15 @@ void ftColl_8007B320(Fighter_GObj* gobj)
      }
  
      fp->x166C = dyn->x4;
 -    for (i = 0; i < (u32) dyn->x4; i++) {
+-        Fighter_x1670_t* dst = &fp->x1670[i];
+-        struct ftData_x38* init = &dyn->x8[i];
 +#ifdef MU_NATIVE
-+    /* Natively an entry holds an 8-byte pointer, so the console's room for 11 holds fewer, and a
-+     * fighter file with more (an added fighter's: Duck Hunt has them) would write into the damage
-+     * fields after the array. These only keep the dynamic bones (hair, capes) out of the body
-+     * (lb_8001044C), so the ones past the room are left out. */
-+    {
-+        const int room = (int) ((__builtin_offsetof(Fighter, x1828) - __builtin_offsetof(Fighter, x1670)) /
-+                                sizeof(Fighter_x1670_t));
-+        if (fp->x166C > room) {
-+            OSReport("[ft] kind %d: %d dynamics colliders, room for %d natively; the rest are left out\n",
-+                     fp->kind, fp->x166C, room);
-+            fp->x166C = room;
-+        }
-+    }
++    mu_ft_colliders_claim(fp);
 +#endif
 +    for (i = 0; i < (u32) fp->x166C; i++) {
-         Fighter_x1670_t* dst = &fp->x1670[i];
--        struct ftData_x38* init = &dyn->x8[i];
++        Fighter_x1670_t* dst = &FT_COLLIDERS(fp)[i];
 +        ftData_x38* init = &DP(dyn->x8)[i];
          dst->x24 = init->x0;
          dst->jobj = fp->parts[init->x0].joint;
@@ -60170,7 +60236,7 @@ index 695493d..8f93f9e 100644
          dst->v2 = init->x10;
      }
  }
-@@ -3256,19 +2869,19 @@ void ftColl_8007B320(Fighter_GObj* gobj)
+@@ -3256,19 +2925,19 @@ void ftColl_8007B320(Fighter_GObj* gobj)
  void ftColl_8007B4E0(Fighter_GObj* gobj)
  {
      Fighter* fp = GET_FIGHTER(gobj);
@@ -60194,7 +60260,7 @@ index 695493d..8f93f9e 100644
          hurt->capsule.scale = init->scale;
          hurt->capsule.skip_update_pos = false;
      }
-@@ -3283,8 +2896,8 @@ void ftColl_HurtboxInit(Fighter* fp, FighterHurtCapsule* hurt,
+@@ -3283,8 +2952,8 @@ void ftColl_HurtboxInit(Fighter* fp, FighterHurtCapsule* hurt,
      hurt->is_grabbable = init->is_grabbable;
      hurt->capsule.state = HurtCapsule_Enabled;
      hurt->capsule.bone = fp->parts[hurt->capsule.bone_idx].joint;
@@ -60205,7 +60271,7 @@ index 695493d..8f93f9e 100644
      hurt->capsule.scale = init->scale;
      fp->x221A_b6 = true;
  }
-@@ -3292,6 +2905,9 @@ void ftColl_HurtboxInit(Fighter* fp, FighterHurtCapsule* hurt,
+@@ -3292,6 +2961,9 @@ void ftColl_HurtboxInit(Fighter* fp, FighterHurtCapsule* hurt,
  void ftColl_8007B62C(Fighter_GObj* gobj, enum_t arg1)
  {
      Fighter* fp = GET_FIGHTER(gobj);
@@ -60215,7 +60281,7 @@ index 695493d..8f93f9e 100644
      fp->x1988 = arg1;
      switch (arg1) {
      case 0:
-@@ -3393,7 +3009,7 @@ void ftColl_8007B8CC(Fighter* fp, Fighter_GObj* grabber_gobj)
+@@ -3393,7 +3065,7 @@ void ftColl_8007B8CC(Fighter* fp, Fighter_GObj* grabber_gobj)
      Fighter* grabber_fp = GET_FIGHTER(grabber_gobj);
      fp->x1064_thrownHitbox.owner = grabber_gobj;
      fp->x119C_teamUnk = grabber_fp->team;
@@ -60224,7 +60290,7 @@ index 695493d..8f93f9e 100644
  }
  
  void ftColl_8007B8E8(Fighter_GObj* gobj)
-@@ -3473,7 +3089,8 @@ void ftColl_8007BAC0(Fighter_GObj* gobj)
+@@ -3473,7 +3145,8 @@ void ftColl_8007BAC0(Fighter_GObj* gobj)
      int i;
      Ground_GObj* ground;
      Fighter* fp;
@@ -60234,7 +60300,7 @@ index 695493d..8f93f9e 100644
      u32 type;
      struct ftDeviceUnk3* arr;
      PAD_STACK(8);
-@@ -3539,16 +3156,29 @@ float ftColl_8007BBCC(UNUSED Fighter_GObj* gobj)
+@@ -3539,16 +3212,29 @@ float ftColl_8007BBCC(UNUSED Fighter_GObj* gobj)
      return dmg;
  }
  
@@ -60270,7 +60336,7 @@ index 695493d..8f93f9e 100644
      PAD_STACK(16);
  
      fp->target_item_gobj = 0;
-@@ -3569,23 +3199,17 @@ void ftColl_8007BC90(Fighter_GObj* gobj)
+@@ -3569,23 +3255,17 @@ void ftColl_8007BC90(Fighter_GObj* gobj)
              continue;
          }
  
@@ -60300,7 +60366,7 @@ index 695493d..8f93f9e 100644
                      continue;
                  }
                  if (ip->ground_or_air != GA_Ground) {
-@@ -3593,32 +3217,17 @@ void ftColl_8007BC90(Fighter_GObj* gobj)
+@@ -3593,32 +3273,17 @@ void ftColl_8007BC90(Fighter_GObj* gobj)
                  }
              }
  
@@ -60337,7 +60403,7 @@ index 695493d..8f93f9e 100644
                          goto next_item;
                      }
                  }
-@@ -3627,139 +3236,25 @@ void ftColl_8007BC90(Fighter_GObj* gobj)
+@@ -3627,139 +3292,25 @@ void ftColl_8007BC90(Fighter_GObj* gobj)
      next_item:;
      }
  }
@@ -62582,7 +62648,7 @@ index 2b0f190f4..22a6c7b46 100644
  
  #endif
 diff --git a/src/melee/ft/ftdrawcommon.c b/src/melee/ft/ftdrawcommon.c
-index cd8f9169e..b2eabf633 100644
+index cd8f916..2b26c05 100644
 --- a/src/melee/ft/ftdrawcommon.c
 +++ b/src/melee/ft/ftdrawcommon.c
 @@ -1,3 +1,6 @@
@@ -62592,18 +62658,29 @@ index cd8f9169e..b2eabf633 100644
  #include "ftdrawcommon.h"
  
  #include <Runtime/platform.h>
-@@ -22,6 +25,10 @@
+@@ -22,6 +25,21 @@
  #include <sysdolphin/baselib/cobj.h>
  #include <sysdolphin/baselib/gobj.h>
  #include <sysdolphin/baselib/state.h>
 +#ifdef MU_NATIVE
 +#include <mu_tmce_codes.h>
 +#include <mu_hp.h>
++
++/* The fighter's dynamics colliders (fp->x1670, fp->x166C of them). Natively an entry holds an
++ * 8-byte pointer, so the console's room for 11 in the fighter holds 9: a fighter with more keeps
++ * its colliders in a set of its own (ftcoll.c mu_ft_colliders). */
++#ifdef MU_NATIVE
++Fighter_x1670_t* mu_ft_colliders(Fighter* fp);
++#define FT_COLLIDERS(fp) mu_ft_colliders(fp)
++#else
++#define FT_COLLIDERS(fp) ((fp)->x1670)
++#endif
++
 +#endif
  
  static U8Vec4 ftDrawCommon_804D3A88 = { 0xFF, 0xFF, 0xFF, 0x80 };
  static U8Vec4 ftDrawCommon_804D3A8C = { 0x80, 0x80, 0xFF, 0x80 };
-@@ -75,6 +82,17 @@ MtxPtr ftDrawCommon_8008051C(HSD_GObj* arg1, MtxPtr arg2)
+@@ -75,6 +93,17 @@ MtxPtr ftDrawCommon_8008051C(HSD_GObj* arg1, MtxPtr arg2)
      return NULL;
  }
  
@@ -62621,7 +62698,7 @@ index cd8f9169e..b2eabf633 100644
  static const GXColor ftDrawCommon_804D836C = { 0xFF, 0xFF, 0xFF, 0xFE };
  static const GXColor ftDrawCommon_804D8370 = { 0xFF, 0xFF, 0xFF, 0xFF };
  
-@@ -98,13 +116,55 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
+@@ -98,13 +127,55 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
  
      fighter = GET_FIGHTER(gobj);
      do_invalidate = false;
@@ -62677,7 +62754,7 @@ index cd8f9169e..b2eabf633 100644
          if (fighter->x221D_b6) {
              for (i = 0; i < (unsigned) fighter->hurt_capsules_len; i++) {
                  if (lbColl_8000A584(&fighter->hurt_capsules[i].capsule, 1,
-@@ -117,6 +177,12 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
+@@ -117,6 +188,12 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
          } else {
              fighter_2 = fighter->x1988;
              if (fighter_2 == 0 && fighter->x198C == 0) {
@@ -62690,7 +62767,7 @@ index cd8f9169e..b2eabf633 100644
                  for (i = 0; i < (unsigned) fighter->hurt_capsules_len; i++) {
                      if (lbColl_8000A244(&fighter->hurt_capsules[i].capsule,
                                          arg1, ftCommon_8007F804(fighter),
-@@ -125,6 +191,11 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
+@@ -125,6 +202,11 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
                          do_invalidate = true;
                      }
                  }
@@ -62702,7 +62779,16 @@ index cd8f9169e..b2eabf633 100644
              } else {
                  if (fighter->x198C == 2 || fighter_2 == 2) {
                      phi_r24 = 2;
-@@ -187,21 +258,23 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
+@@ -162,7 +244,7 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
+     }
+     if (fighter->x21FC_flag.b5 != 0) {
+         for (i = 0; i < (unsigned) fighter->x166C; i++) {
+-            if (lbColl_8000A460(&fighter->x1670[i], arg1)) {
++            if (lbColl_8000A460(&FT_COLLIDERS(fighter)[i], arg1)) {
+                 do_invalidate = true;
+             }
+         }
+@@ -187,21 +269,23 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
      }
      if (fighter->x21FC_flag.b2 != 0) {
          itPickup* temp_r24 = &fighter->x294_itPickup;
@@ -62730,7 +62816,7 @@ index cd8f9169e..b2eabf633 100644
                                   arg1, fighter->facing_dir))
          {
              do_invalidate = true;
-@@ -231,6 +304,29 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
+@@ -231,6 +315,29 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
      }
  
      if (!fighter->invisible && !fighter->x221E_b5 && arg2) {
@@ -62760,7 +62846,7 @@ index cd8f9169e..b2eabf633 100644
          ftParts_800750C8(fighter, 1, 0);
          ftParts_800750C8(fighter, 4, 0);
          if (fighter->is_metal || fighter->x2226_b5 || fighter->x2227_b3) {
-@@ -240,6 +336,7 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
+@@ -240,6 +347,7 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
              ftParts_800750C8(fighter, 2, 0);
              ftParts_800750C8(fighter, 0, 1);
          }
@@ -62768,7 +62854,7 @@ index cd8f9169e..b2eabf633 100644
          ftCo_8009F5AC(fighter);
          fighter->x2223_b2 = false;
          fighter->x2227_b7 = true;
-@@ -247,9 +344,22 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
+@@ -247,9 +355,22 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
  
          mtx = ftDrawCommon_8008051C_inline(gobj, &sp54, &v, sp18, sp78);
  
@@ -62791,7 +62877,7 @@ index cd8f9169e..b2eabf633 100644
          }
          ftCo_800C8AF0(fighter);
          ftCo_8009F7F8(fighter);
-@@ -261,7 +371,7 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
+@@ -261,7 +382,7 @@ void ftDrawCommon_800805C8(HSD_GObj* gobj, s32 arg1, bool arg2)
      ftCo_800C2600(gobj, arg1);
  }
  
@@ -62800,7 +62886,7 @@ index cd8f9169e..b2eabf633 100644
  {
      Mtx sp70;
      Mtx sp18;
-@@ -293,9 +403,22 @@ void ftDrawCommon_80080C28(HSD_GObj* gobj, int flag_index)
+@@ -293,9 +414,22 @@ void ftDrawCommon_80080C28(HSD_GObj* gobj, int flag_index)
              vmtx = ftDrawCommon_8008051C_inline(gobj, &v1, &v2, sp18, sp70);
  
              jobj = GET_JOBJ(gobj);
@@ -62823,7 +62909,7 @@ index cd8f9169e..b2eabf633 100644
              }
              ftCo_800C8AF0(fighter);
              ftCo_8009F7F8(fighter);
-@@ -368,6 +491,17 @@ static inline void ftDrawCommon_80080E18_inline2(HSD_GObj* gobj, Fighter* old)
+@@ -368,6 +502,17 @@ static inline void ftDrawCommon_80080E18_inline2(HSD_GObj* gobj, Fighter* old)
      Vec3* pos;
  
      MtxPtr matrix = HSD_CObjGetInvViewingMtxPtr(Camera_800310B8());
@@ -62841,7 +62927,7 @@ index cd8f9169e..b2eabf633 100644
      /// @todo this seems to be using the wrong common attributes
      PSMTXMultVec(matrix, (Vec3*) &old->mv.co.walk.fast_anim_frame,
                   &fp->cur_pos);
-@@ -376,11 +510,111 @@ static inline void ftDrawCommon_80080E18_inline2(HSD_GObj* gobj, Fighter* old)
+@@ -376,11 +521,111 @@ static inline void ftDrawCommon_80080E18_inline2(HSD_GObj* gobj, Fighter* old)
      HSD_JObjSetTranslate(jobj, pos);
  }
  
@@ -62956,7 +63042,7 @@ index cd8f9169e..b2eabf633 100644
          switch (Camera_80031060()) {
          case 1:
              if (fp->x2220_b7) {
-@@ -397,7 +631,15 @@ void ftDrawCommon_80080E18(HSD_GObj* gobj, int arg1)
+@@ -397,7 +642,15 @@ void ftDrawCommon_80080E18(HSD_GObj* gobj, int arg1)
              ftDrawCommon_800805C8(gobj, arg1,
                                    fp->x5AC.xC[4] != NULL ? false : true);
          }
@@ -62972,7 +63058,7 @@ index cd8f9169e..b2eabf633 100644
  }
  
  void ftDrawCommon_80081118(void)
-@@ -412,10 +654,22 @@ void ftDrawCommon_80081118(void)
+@@ -412,10 +665,22 @@ void ftDrawCommon_80081118(void)
  void ftDrawCommon_80081140(void)
  {
      HSD_GObj* gobj = HSD_GObjPLinkHead[HSD_GOBJ_PLINK_FIGHTER];
@@ -63011,22 +63097,33 @@ index 640a32499..c602a06c0 100644
  /* 081140 */ void ftDrawCommon_80081140(void);
  /* 081168 */ void ftDrawCommon_80081168(void);
 diff --git a/src/melee/ft/ftdynamics.c b/src/melee/ft/ftdynamics.c
-index b31a2f58a..a695d08f5 100644
+index b31a2f5..13c4a0e 100644
 --- a/src/melee/ft/ftdynamics.c
 +++ b/src/melee/ft/ftdynamics.c
-@@ -15,6 +15,11 @@
+@@ -15,6 +15,22 @@
  #include <melee/lb/lb_00F9.h>
  #include <sysdolphin/baselib/debug.h>
  #include <sysdolphin/baselib/jobj.h>
 +#ifdef MU_NATIVE
 +#include <stddef.h>
++
++/* The fighter's dynamics colliders (fp->x1670, fp->x166C of them). Natively an entry holds an
++ * 8-byte pointer, so the console's room for 11 in the fighter holds 9: a fighter with more keeps
++ * its colliders in a set of its own (ftcoll.c mu_ft_colliders). */
++#ifdef MU_NATIVE
++Fighter_x1670_t* mu_ft_colliders(Fighter* fp);
++#define FT_COLLIDERS(fp) mu_ft_colliders(fp)
++#else
++#define FT_COLLIDERS(fp) ((fp)->x1670)
++#endif
++
 +/* lb_8001044C reads fp->x1670 as struct lb_Collider (lb_00F9.c): keep the two layouts together. */
 +_Static_assert(offsetof(Fighter_x1670_t, x18) == 0x1C && sizeof(Fighter_x1670_t) == 0x30, "Fighter_x1670_t vs lb_Collider");
 +#endif
  
  /* 09CB40 */ static void ftCo_8009CB40(Fighter* fp, ssize_t bone_idx, bool,
                                         FigaTree*);
-@@ -36,7 +41,7 @@ static inline void ftCo_8009CB40_inline(struct DynamicsData* data)
+@@ -36,7 +52,7 @@ static inline void ftCo_8009CB40_inline(struct DynamicsData* data)
  
  void ftCo_8009CB40(Fighter* fp, ssize_t bone_idx, bool arg2, FigaTree* arg3)
  {
@@ -63035,7 +63132,7 @@ index b31a2f58a..a695d08f5 100644
      PAD_STACK(8);
      if (dyn->dynamicsNum != 0) {
          s32 bone_id;
-@@ -45,7 +50,7 @@ void ftCo_8009CB40(Fighter* fp, ssize_t bone_idx, bool arg2, FigaTree* arg3)
+@@ -45,7 +61,7 @@ void ftCo_8009CB40(Fighter* fp, ssize_t bone_idx, bool arg2, FigaTree* arg3)
          s32 var_r29;
          struct DynamicsData* data;
          s32 inverse_flag;
@@ -63044,7 +63141,7 @@ index b31a2f58a..a695d08f5 100644
          flag = arg2 == 0 ? 0 : 1;
          var_r30 = fp->parts[bone_id].joint;
          var_r29 = 0;
-@@ -85,20 +90,20 @@ void ftCo_8009CB40(Fighter* fp, ssize_t bone_idx, bool arg2, FigaTree* arg3)
+@@ -85,20 +101,20 @@ void ftCo_8009CB40(Fighter* fp, ssize_t bone_idx, bool arg2, FigaTree* arg3)
  void ftCo_8009CF84(Fighter* fp)
  {
      ftData* data = fp->ft_data;
@@ -63069,7 +63166,7 @@ index b31a2f58a..a695d08f5 100644
                          &fp->dynamic_bone_sets[i].dyn_desc);
          }
      }
-@@ -108,8 +113,8 @@ void ftCo_8009CF84(Fighter* fp)
+@@ -108,8 +124,8 @@ void ftCo_8009CF84(Fighter* fp)
  static inline void ftCo_SetupKirbyHatBone(Fighter* fp, KirbyHatStruct* hat,
                                            int dyn_idx, ssize_t i)
  {
@@ -63080,7 +63177,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_JObj* cur = fp->u.kb.hat.jobj;
      ssize_t j;
      for (j = 0; j < (signed) article->bone_id; j++) {
-@@ -125,14 +130,14 @@ static inline void ftCo_SetupKirbyHatBone(Fighter* fp, KirbyHatStruct* hat,
+@@ -125,14 +141,14 @@ static inline void ftCo_SetupKirbyHatBone(Fighter* fp, KirbyHatStruct* hat,
      lb_8000FD48(cur, &fp->dynamic_bone_sets[i].dyn_desc,
                  article->dyn_desc.count);
      fp->dynamic_bone_sets[i].bone_id = 0;
@@ -63097,7 +63194,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_ASSERTREPORT(135, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
-@@ -146,7 +151,7 @@ void ftCo_8009D074(Fighter* fp)
+@@ -146,7 +162,7 @@ void ftCo_8009D074(Fighter* fp)
  void ftCo_8009D18C(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Zelda];
@@ -63106,7 +63203,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_ASSERTREPORT(167, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
-@@ -160,7 +165,7 @@ void ftCo_8009D18C(Fighter* fp)
+@@ -160,7 +176,7 @@ void ftCo_8009D18C(Fighter* fp)
  void ftCo_8009D2A4(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Nana];
@@ -63115,7 +63212,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_ASSERTREPORT(199, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
-@@ -174,7 +179,7 @@ void ftCo_8009D2A4(Fighter* fp)
+@@ -174,7 +190,7 @@ void ftCo_8009D2A4(Fighter* fp)
  void ftCo_8009D3BC(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Falco];
@@ -63124,7 +63221,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_ASSERTREPORT(232, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
-@@ -188,7 +193,7 @@ void ftCo_8009D3BC(Fighter* fp)
+@@ -188,7 +204,7 @@ void ftCo_8009D3BC(Fighter* fp)
  void ftCo_8009D4D4(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Kirby];
@@ -63133,7 +63230,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_ASSERTREPORT(265, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
-@@ -202,7 +207,7 @@ void ftCo_8009D4D4(Fighter* fp)
+@@ -202,7 +218,7 @@ void ftCo_8009D4D4(Fighter* fp)
  void ftCo_8009D5EC(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Mars];
@@ -63142,7 +63239,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_ASSERTREPORT(298, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
-@@ -216,7 +221,7 @@ void ftCo_8009D5EC(Fighter* fp)
+@@ -216,7 +232,7 @@ void ftCo_8009D5EC(Fighter* fp)
  void ftCo_8009D704(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Link];
@@ -63151,7 +63248,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_ASSERTREPORT(331, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
-@@ -231,21 +236,21 @@ void ftCo_8009D81C(Fighter* fp)
+@@ -231,21 +247,21 @@ void ftCo_8009D81C(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Yoshi];
      PAD_STACK(2 * 4);
@@ -63177,7 +63274,7 @@ index b31a2f58a..a695d08f5 100644
                  &fp->dynamic_bone_sets[i].dyn_desc);
          }
      }
-@@ -254,7 +259,7 @@ void ftCo_8009D81C(Fighter* fp)
+@@ -254,7 +270,7 @@ void ftCo_8009D81C(Fighter* fp)
  void ftCo_8009D920(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Luigi];
@@ -63186,7 +63283,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_ASSERTREPORT(388, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
-@@ -268,7 +273,7 @@ void ftCo_8009D920(Fighter* fp)
+@@ -268,7 +284,7 @@ void ftCo_8009D920(Fighter* fp)
  void ftCo_8009DA38(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Ganon];
@@ -63195,7 +63292,7 @@ index b31a2f58a..a695d08f5 100644
      HSD_ASSERTREPORT(421, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
-@@ -283,35 +288,58 @@ void ftCo_8009DB50(Fighter* fp)
+@@ -283,35 +299,58 @@ void ftCo_8009DB50(Fighter* fp)
  {
      KirbyHatStruct* hat = ft_80459B88.hats[Ft_Kind_Purin];
      PAD_STACK(2 * 4);
@@ -63260,7 +63357,7 @@ index b31a2f58a..a695d08f5 100644
          idx = 1;
      } else {
          return;
-@@ -320,17 +348,28 @@ void ftCo_8009DC54(Fighter* fp)
+@@ -320,17 +359,28 @@ void ftCo_8009DC54(Fighter* fp)
      HSD_ASSERTREPORT(490, fp->dynamics_num < Ft_Dynamics_NumMax,
                       "fighter dynamics num over!\n");
      {
@@ -63297,7 +63394,7 @@ index b31a2f58a..a695d08f5 100644
                   j++)
              {
                  if (cur->child != NULL) {
-@@ -342,21 +381,37 @@ void ftCo_8009DC54(Fighter* fp)
+@@ -342,21 +392,37 @@ void ftCo_8009DC54(Fighter* fp)
                  }
                  cur = cur->next;
              }
@@ -63340,7 +63437,31 @@ index b31a2f58a..a695d08f5 100644
  void ftCo_8009DD94(Fighter_GObj* gobj, bool arg1)
  {
      Fighter* fp = GET_FIGHTER(gobj);
-@@ -429,6 +484,11 @@ void ftCo_8009DD94(Fighter_GObj* gobj, bool arg1)
+@@ -396,19 +462,19 @@ void ftCo_8009DD94(Fighter_GObj* gobj, bool arg1)
+         ftCo_8009E614(fp);
+         if (fp->kind == Ft_Kind_Peach) {
+             for (i = 0; i < dynamics_num - 1; i++, dyn++) {
+-                lb_8001044C(&dyn->dyn_desc, &fp->x1670, fp->x166C,
++                lb_8001044C(&dyn->dyn_desc, (void*) FT_COLLIDERS(fp), fp->x166C,
+                             fp->cur_pos.y, arg1, dyn->bone_id, 3, ret_B0);
+             }
+-            lb_8001044C(&dyn->dyn_desc, &fp->x1670, fp->x166C, fp->cur_pos.y,
++            lb_8001044C(&dyn->dyn_desc, (void*) FT_COLLIDERS(fp), fp->x166C, fp->cur_pos.y,
+                         arg1, dyn->bone_id, 0, ret_B0);
+         } else if (fp->kind == Ft_Kind_Mewtwo) {
+             for (i = 0; i < dynamics_num; i++, dyn++) {
+-                lb_8001044C(&dyn->dyn_desc, &fp->x1670, fp->x166C,
++                lb_8001044C(&dyn->dyn_desc, (void*) FT_COLLIDERS(fp), fp->x166C,
+                             fp->cur_pos.y, arg1, dyn->bone_id, 8, ret_B0);
+             }
+         } else {
+             for (i = 0; i < dynamics_num; i++, dyn++) {
+-                lb_8001044C(&dyn->dyn_desc, &fp->x1670, fp->x166C,
++                lb_8001044C(&dyn->dyn_desc, (void*) FT_COLLIDERS(fp), fp->x166C,
+                             fp->cur_pos.y, arg1, dyn->bone_id, 0, ret_B0);
+             }
+         }
+@@ -429,6 +495,11 @@ void ftCo_8009DD94(Fighter_GObj* gobj, bool arg1)
              dyn++;
          }
      }
@@ -63352,7 +63473,25 @@ index b31a2f58a..a695d08f5 100644
  }
  
  void ftCo_8009E0A8(Fighter_GObj* gobj)
-@@ -529,13 +589,14 @@ void ftCo_8009E4A8(Fighter* fp)
+@@ -485,8 +556,16 @@ HSD_JObj* ftCo_8009E1D4(HSD_JObj* arg0, HSD_JObj* arg1, HSD_JObj* arg2)
+ enum_t ftCo_8009E318(Fighter_GObj* gobj, enum Fighter_Part arg1, f32 arg2)
+ {
+     Fighter* fp = GET_FIGHTER(gobj);
+-    HSD_JObj* part_jobj = fp->parts[arg1].joint;
++    HSD_JObj* part_jobj;
+     ssize_t i;
++#ifdef MU_NATIVE
++    /* A script that names a part the fighter does not have (an m-ex fighter's special fall):
++     * the console reads whatever follows the parts and matches no bone; here that read faults. */
++    if ((unsigned int) arg1 >= sizeof fp->parts / sizeof fp->parts[0]) {
++        return -1;
++    }
++#endif
++    part_jobj = fp->parts[arg1].joint;
+     for (i = 0; i < fp->dynamics_num; i++) {
+         ssize_t j;
+         struct DynamicsData* cur;
+@@ -529,13 +608,14 @@ void ftCo_8009E4A8(Fighter* fp)
      int i;
  
      if (fp->x594_b4) {
@@ -63370,7 +63509,7 @@ index b31a2f58a..a695d08f5 100644
                          fp->x590, frame, speed);
                  }
              }
-@@ -545,7 +606,7 @@ void ftCo_8009E4A8(Fighter* fp)
+@@ -545,7 +625,7 @@ void ftCo_8009E4A8(Fighter* fp)
              ftCo_8009CB40(fp, i, 0, NULL);
              if (fp->x590 != NULL) {
                  ftAnim_8006EED4(
@@ -63379,7 +63518,7 @@ index b31a2f58a..a695d08f5 100644
                      fp->x590, frame, speed);
              }
          }
-@@ -569,7 +630,7 @@ void ftCo_8009E614(Fighter* fp)
+@@ -569,7 +649,7 @@ void ftCo_8009E614(Fighter* fp)
              cur_anim_frame = fp->cur_anim_frame;
              frame_speed_mul = fp->frame_speed_mul;
              if (fp->x594_b4 || fp->x594_b3) {
@@ -63388,7 +63527,7 @@ index b31a2f58a..a695d08f5 100644
                      ftCo_8009CB40(fp, i, 1, NULL);
                  }
                  if (fp->x590 != 0) {
-@@ -639,17 +700,17 @@ void ftCo_8009E7B4(Fighter* fp, u8 (*arg1)[2])
+@@ -639,17 +719,17 @@ void ftCo_8009E7B4(Fighter* fp, u8 (*arg1)[2])
                  }
              } else {
                  if (fp->x594_b4) {
@@ -63410,7 +63549,7 @@ index b31a2f58a..a695d08f5 100644
                      if (tree == NULL) {
                          for (i = 0; i < fp->dynamics_num; i++) {
                              ftCo_8009CB40(fp, i, 0, NULL);
-@@ -658,11 +719,11 @@ void ftCo_8009E7B4(Fighter* fp, u8 (*arg1)[2])
+@@ -658,11 +738,11 @@ void ftCo_8009E7B4(Fighter* fp, u8 (*arg1)[2])
                      }
                      {
                          s32 j;

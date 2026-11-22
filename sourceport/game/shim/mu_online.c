@@ -485,6 +485,16 @@ static u32 compute_checksum(void)
             /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026) */
             if (gmSquad_Live()) acc ^= (u32) fp->kind;
 #endif
+#ifdef MU_AKANEIA_FIGHTERS
+            /* A fighter whose code is a plugin (mexft/mexft_plugins.c): the two games must run
+             * the same file, and one that differs shows as a mismatch on the first frame compared
+             * instead of as a slow drift. 0 for every other fighter. */
+            if (MU_AK_KIND(fp->kind)) {
+                unsigned int mexft_plugin_digest(const void* descriptor);
+                const struct MuAkFighter* mu_ak_fighter(int kind);
+                acc ^= mexft_plugin_digest(mu_ak_fighter(fp->kind));
+            }
+#endif
             acc ^= (u32) fp->motion_id;
             acc ^= float_bits(fp->cur_pos.x);
             acc ^= float_bits(fp->cur_pos.y);

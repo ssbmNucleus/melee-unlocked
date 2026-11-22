@@ -912,7 +912,7 @@ static void clear_slots(void)
     ak_article_count = 0;
 }
 
-static const MuAkFighter* find_fighter(const char* file)
+static const MuAkFighter* find_fighter(const char* file, const char* mex_name)
 {
     int i;
     for (i = 0; mu_ak_registry[i] != NULL; i++) {
@@ -923,8 +923,8 @@ static const MuAkFighter* find_fighter(const char* file)
 #ifdef MU_AKANEIA_FIGHTERS
     {
         /* Not built in: a fighter plugin may carry it (mexft/mexft_plugins.c). */
-        const void* mexft_plugin_fighter(const char* file);
-        return (const MuAkFighter*) mexft_plugin_fighter(file);
+        const void* mexft_plugin_fighter(const char* file, const char* mex_name);
+        return (const MuAkFighter*) mexft_plugin_fighter(file, mex_name);
     }
 #else
     return NULL;
@@ -990,7 +990,7 @@ void mu_ak_apply(void)
             continue;   /* an empty m-ex slot */
         }
         ak_mex[slot] = (signed char) mex;
-        ft = find_fighter(file);
+        ft = find_fighter(file, mu_mex_fighter_name(mu_mex_external_of_internal(mex)));
         ak_fighter[slot] = ft;
         if (ft == NULL) {
             /* No descriptor for this file: the slot keeps no table entry, no character kind

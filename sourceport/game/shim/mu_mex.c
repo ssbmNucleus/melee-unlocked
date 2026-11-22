@@ -221,7 +221,8 @@ static int mex_same_costume_file(const char* a, const char* b)
  * table. A build can replace a fighter's costumes without adding any: MexCLI's import-costumes
  * followed by remove-costumes (PokéMelee, SSBM Nucleus) names them PlNsNrMod.dat,
  * PlNsNrMod_001.dat and so on and drops PlNsNr.dat and PlNsYe.dat from the disc, with as many
- * costumes as retail or fewer. Read before the kind is committed, while the retail table is up. */
+ * costumes as retail or fewer. A build that only removes costumes (the retail names, fewer of
+ * them) counts as well. Read before the kind is committed, while the retail table is up. */
 static int mex_costumes_renamed(int kind, int count)
 {
     const Fighter_CostumeStrings* retail = ftData_803C2360[kind];
@@ -229,6 +230,11 @@ static int mex_costumes_renamed(int kind, int count)
     int c;
     if (count <= 0 || retail == NULL) {
         return 0;
+    }
+    if (count < retail_count) {
+        /* Fewer than retail, even under the retail names: the build removed the others, and
+         * the retail table would still offer them (their files may be gone from the disc). */
+        return 1;
     }
     for (c = 0; c < count && c < retail_count; c++) {
         const char* mine = mex_costume_strings[kind][c].dat_filename;
