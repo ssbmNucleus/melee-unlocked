@@ -1,0 +1,11 @@
+# Fields newer m-ex MexTK names that MU's native MexTK (tmce/MexTK, an older naming) has under
+# another name or type. mexft_overlay.py copies those headers for the mexft modules and adds each
+# newer name as another member at the same native offset, beside the member named here.
+#
+#   header      existing member   newer declaration     why
+item.h          hitlag_frames     float hitlag_remaining  # m-ex c9f25da; decomp Item.xCBC_hitlagFrames (f32)
+item.h          xcc0              float hitlag_requested  # m-ex c9f25da; decomp Item.xCC0 is an f32 (MU's MexTK says int)
+# Fields MU's native headers do not name at all, placed by offset from a member they do name
+# (member+N, N in native bytes); the type is the decomp's native one.
+obj.h           userdata+8        void (*destructor_function)(void *)  # HSD_GObj.user_data_remove_func (console +0x30)
+fighter.h       is_offscreen+1    unsigned char : 3; unsigned char x2220_b3 : 1  # console 0x2220 mask 0x10, the decomp's x2220_b3 (no reaction)

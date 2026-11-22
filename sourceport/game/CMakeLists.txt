@@ -379,6 +379,83 @@ if(MU_AKANEIA_FIGHTERS)
       string(APPEND MU_AK_REGISTRY "MU_AK_FIGHTER(${ak_symbol})\n")
     endforeach()
   endforeach()
+  # m-ex fighters compiled from their MexTK C (mexft/): each mexft/<fighter>/ holds the port's own
+  # C, unchanged, and mexft.txt (its name and the fighter file MxDt names). The C is prepared here
+  # (tools/mexft/mexft_prepare.py: its raw console addresses named, its exports found) and built
+  # below as a module of its own, like TM-CE's; the descriptor generated next to it joins the
+  # registry. Edits to the C or the manifest re-run the preparation.
+  set(MEXFT_MODULES)
+  file(GLOB MEXFT_MANIFESTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/mexft/*/mexft.txt")
+  if(MEXFT_MANIFESTS AND NOT Python3_EXECUTABLE)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  endif()
+  set(MEXFT_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_prepare.py")
+  if(MEXFT_MANIFESTS)
+    # m-ex's runtime calls (MEX_GetFtItemID...), native, on the registry's services.
+    list(APPEND SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_runtime.c")
+    # The MexTK headers the fighters build against: tmce/MexTK plus newer m-ex member names.
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_overlay.py"
+              --tmce "${CMAKE_CURRENT_SOURCE_DIR}/tmce"
+              --compat "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/compat_fields.txt"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/mexft/overlay"
+      RESULT_VARIABLE mexft_rc OUTPUT_VARIABLE mexft_log ERROR_VARIABLE mexft_err
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT mexft_rc EQUAL 0)
+      message(FATAL_ERROR "mexft overlay: ${mexft_err}")
+    endif()
+    message(STATUS "${mexft_log}")
+    file(GLOB_RECURSE mexft_overlay_inputs "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK/*.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tmce/native/*.h")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${mexft_overlay_inputs}
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_overlay.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/compat_fields.txt")
+  endif()
+  foreach(mexft_manifest ${MEXFT_MANIFESTS})
+    get_filename_component(mexft_dir "${mexft_manifest}" DIRECTORY)
+    get_filename_component(mexft_name "${mexft_dir}" NAME)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mexft_manifest}")
+    # A glob, so that adding a native.edits file reconfigures too.
+    file(GLOB mexft_edits CONFIGURE_DEPENDS "${mexft_dir}/native.edits")
+    if(mexft_edits)
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${mexft_edits})
+    endif()
+    # "hold <reason>" in the manifest: code that needs a hand edit first; the fighter stays locked.
+    file(STRINGS "${mexft_manifest}" mexft_hold REGEX "^hold ")
+    if(mexft_hold)
+      message(STATUS "mexft ${mexft_name}: held, stays locked (${mexft_hold})")
+      continue()
+    endif()
+    file(GLOB_RECURSE mexft_sources CONFIGURE_DEPENDS "${mexft_dir}/*.c")
+    set(mexft_out "${CMAKE_CURRENT_BINARY_DIR}/mexft/${mexft_name}")
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" "${MEXFT_TOOL}" --manifest "${mexft_manifest}" --name ${mexft_name}
+              --out "${mexft_out}" --symbols "${D}/config/GALE01/symbols.txt"
+              --functions "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/ftFunction.txt"
+              --functions "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK/ftFunction.txt"
+              --item-functions "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/itFunction.txt"
+              --item-functions "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK/itFunction.txt"
+              --shim "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h"
+              --adapter "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h"
+              --mextk "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK/include"
+              --mex-link "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/m-ex/melee.link"
+              --mex-include "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/m-ex/include" ${mexft_sources}
+      RESULT_VARIABLE mexft_rc OUTPUT_VARIABLE mexft_log ERROR_VARIABLE mexft_err
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT mexft_rc EQUAL 0)
+      message(FATAL_ERROR "mexft/${mexft_name}: ${mexft_err}")
+    endif()
+    message(STATUS "${mexft_log}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mexft_manifest}" ${mexft_sources}
+      "${MEXFT_TOOL}" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/m-ex/melee.link")
+    list(APPEND SHIM_SOURCES "${mexft_out}/mexft_${mexft_name}.c")
+    string(APPEND MU_AK_REGISTRY "MU_AK_FIGHTER(mu_ak_mexft_${mexft_name})\n")
+    file(STRINGS "${mexft_out}/modules.txt" mexft_modules)
+    foreach(mexft_module ${mexft_modules})
+      list(APPEND MEXFT_MODULES "${mexft_name}/${mexft_module}")
+    endforeach()
+  endforeach()
   file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mu_ak/mu_ak_registry.inc" CONTENT "${MU_AK_REGISTRY}")
   set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighters.c" APPEND PROPERTY
     COMPILE_DEFINITIONS MU_AK_REGISTRY_GENERATED)
@@ -498,6 +575,18 @@ tmce_module(eventMenu "${TMCE}/MexTK/tmFunction.txt" SOURCES
 tmce_module(labCSS "${TMCE}/MexTK/cssFunction.txt" SOURCES "${TMCE}/src/lab_css.c")
 foreach(ev lab lcancel ledgedash wavedash powershield dthrowknee edgeguard fc sweetspot laserland eggs techchase slalom)
   tmce_module(${ev} "${TMCE}/MexTK/evFunction.txt" SOURCES "${TMCE}/src/${ev}.c")
+endforeach()
+# The m-ex fighters prepared from their MexTK C (mexft/, above with the registry): the fighter's
+# own code and each of its articles, a module each.
+foreach(mexft_entry ${MEXFT_MODULES})
+  get_filename_component(mexft_module "${mexft_entry}" NAME)
+  set(mexft_dir "${CMAKE_CURRENT_BINARY_DIR}/mexft/${mexft_entry}")
+  file(GLOB mexft_prepared "${mexft_dir}/src/*.c")
+  tmce_module(${mexft_module} "${mexft_dir}/exports.txt" SOURCES ${mexft_prepared})
+  # Callback slots whose MexTK type changed between m-ex versions (an IASA kept as int or void):
+  # the same function pointer either way, so GCC 14's error is only a warning here.
+  target_compile_options(tmce_${mexft_module}_objs PRIVATE -Wno-error=incompatible-pointer-types)
+  target_include_directories(tmce_${mexft_module}_objs PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/mexft/overlay")
 endforeach()
 set_source_files_properties(${TMCE_OBJECTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
