@@ -96,5 +96,13 @@ uint32_t mu_snapshot_ranges(MuStateRegion* out, uint32_t capacity)
     for (i = 0; out != NULL && i < count && i < capacity; i++) {
         out[i] = ranges[i];
     }
+#ifdef MU_AKANEIA_FIGHTERS
+    /* The fighter plugins' variables (mexft/mexft_plugins.c): game state like the image's own. */
+    if (!heap_only) {
+        unsigned int mexft_plugin_ranges(void* out, unsigned int capacity);
+        count += mexft_plugin_ranges(out != NULL && capacity > count ? out + count : NULL,
+                                     capacity > count ? capacity - count : 0);
+    }
+#endif
     return count;
 }

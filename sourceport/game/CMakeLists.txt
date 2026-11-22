@@ -385,6 +385,13 @@ if(MU_AKANEIA_FIGHTERS)
   # below as a module of its own, like TM-CE's; the descriptor generated next to it joins the
   # registry. Edits to the C or the manifest re-run the preparation.
   set(MEXFT_MODULES)
+  # Fighter plugins (mexft/mexft_plugin.h): the game loads a fighter's code at startup from a file
+  # of its own. The loader is always built. MEXFT_PLUGINS names the mexft fighters built as
+  # plugins (target mexft_plugins, into fighters/ beside the library) instead of linked in:
+  # a list of folder names, or ALL.
+  list(APPEND SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugins.c")
+  set(MEXFT_PLUGINS "" CACHE STRING "mexft fighters built as plugins instead of linked in (names, or ALL)")
+  set(MEXFT_PLUGIN_NAMES)
   file(GLOB MEXFT_MANIFESTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/mexft/*/mexft.txt")
   if(MEXFT_MANIFESTS AND NOT Python3_EXECUTABLE)
     find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -449,8 +456,13 @@ if(MU_AKANEIA_FIGHTERS)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mexft_manifest}" ${mexft_sources}
       "${MEXFT_TOOL}" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/m-ex/melee.link")
-    list(APPEND SHIM_SOURCES "${mexft_out}/mexft_${mexft_name}.c")
-    string(APPEND MU_AK_REGISTRY "MU_AK_FIGHTER(mu_ak_mexft_${mexft_name})\n")
+    if(MEXFT_PLUGINS STREQUAL "ALL" OR mexft_name IN_LIST MEXFT_PLUGINS)
+      list(APPEND MEXFT_PLUGIN_NAMES ${mexft_name})
+      set(MEXFT_PLUGIN_MODULES_${mexft_name})
+    else()
+      list(APPEND SHIM_SOURCES "${mexft_out}/mexft_${mexft_name}.c")
+      string(APPEND MU_AK_REGISTRY "MU_AK_FIGHTER(mu_ak_mexft_${mexft_name})\n")
+    endif()
     file(STRINGS "${mexft_out}/modules.txt" mexft_modules)
     foreach(mexft_module ${mexft_modules})
       list(APPEND MEXFT_MODULES "${mexft_name}/${mexft_module}")
@@ -587,6 +599,11 @@ foreach(mexft_entry ${MEXFT_MODULES})
   # the same function pointer either way, so GCC 14's error is only a warning here.
   target_compile_options(tmce_${mexft_module}_objs PRIVATE -Wno-error=incompatible-pointer-types)
   target_include_directories(tmce_${mexft_module}_objs PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/mexft/overlay")
+  get_filename_component(mexft_fighter "${mexft_entry}" DIRECTORY)
+  if(mexft_fighter IN_LIST MEXFT_PLUGIN_NAMES)
+    list(REMOVE_ITEM TMCE_OBJECTS "${CMAKE_CURRENT_BINARY_DIR}/tmce_${mexft_module}.o")
+    list(APPEND MEXFT_PLUGIN_MODULES_${mexft_fighter} "${CMAKE_CURRENT_BINARY_DIR}/tmce_${mexft_module}.o")
+  endif()
 endforeach()
 set_source_files_properties(${TMCE_OBJECTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
 
@@ -602,7 +619,8 @@ target_link_libraries(melee_game PRIVATE game_flags)
 target_link_options(melee_game PRIVATE ${LOW_IMAGE_LINK_OPTIONS}
   "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/melee_game.map")
 if(WIN32)
-  target_link_options(melee_game PRIVATE -Wl,--image-base,0x82800000)
+  # The build id names this exact image: a fighter plugin is linked against its addresses.
+  target_link_options(melee_game PRIVATE -Wl,--image-base,0x82800000 -Wl,--build-id)
 else()
   target_link_libraries(melee_game PRIVATE m)
   set(MU_ELF_LAYOUT "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/game-linux-layout.ld")
@@ -621,6 +639,39 @@ add_custom_command(TARGET melee_game POST_BUILD
           "${CMAKE_CURRENT_BINARY_DIR}/melee_game.map" 82800000 $<TARGET_FILE_DIR:melee_game>/melee_game.snapexcl
           $<TARGET_FILE:melee_game>
   VERBATIM)
+
+# ---- fighter plugins ----
+# Each MEXFT_PLUGINS fighter as fighters/<name>.mufighter beside the library: its modules and its
+# descriptor, linked against this build's addresses (tools/mexft/mexft_plugin.py). A plugin of
+# another build is refused at load, so they are rebuilt whenever the library is.
+if(WIN32 AND MEXFT_PLUGIN_NAMES)
+  set(MEXFT_SYMS "${CMAKE_CURRENT_BINARY_DIR}/melee_game.syms")
+  add_custom_command(OUTPUT "${MEXFT_SYMS}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_syms.py"
+            --nm "${CMAKE_NM}" --out "${MEXFT_SYMS}" $<TARGET_FILE_DIR:melee_game>/melee_game.dbg
+    DEPENDS melee_game "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_syms.py" VERBATIM)
+  set(MEXFT_PLUGIN_FILES)
+  set(mexft_plugin_base 0x84000000)
+  foreach(mexft_name ${MEXFT_PLUGIN_NAMES})
+    add_library(mexft_desc_${mexft_name} OBJECT "${CMAKE_CURRENT_BINARY_DIR}/mexft/${mexft_name}/mexft_${mexft_name}.c")
+    target_link_libraries(mexft_desc_${mexft_name} PRIVATE game_flags)
+    set_target_properties(mexft_desc_${mexft_name} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+    set(mexft_plugin_file "${CMAKE_CURRENT_BINARY_DIR}/fighters/${mexft_name}.mufighter")
+    add_custom_command(OUTPUT "${mexft_plugin_file}"
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_plugin.py"
+              --gcc "${CMAKE_C_COMPILER}" --nm "${CMAKE_NM}" --game-syms "${MEXFT_SYMS}"
+              --game-dll $<TARGET_FILE:melee_game> --header-dir "${CMAKE_CURRENT_SOURCE_DIR}/mexft"
+              --name ${mexft_name} --base ${mexft_plugin_base} --fighter mu_ak_mexft_${mexft_name}
+              --out "${mexft_plugin_file}" ${MEXFT_PLUGIN_MODULES_${mexft_name}} $<TARGET_OBJECTS:mexft_desc_${mexft_name}>
+      DEPENDS melee_game "${MEXFT_SYMS}" ${MEXFT_PLUGIN_MODULES_${mexft_name}} $<TARGET_OBJECTS:mexft_desc_${mexft_name}>
+              "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_plugin.py" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugin.h"
+      COMMAND_EXPAND_LISTS VERBATIM)
+    list(APPEND MEXFT_PLUGIN_FILES "${mexft_plugin_file}")
+    # 1 MB apart: a fighter's code and variables are well under it (the largest is 60 KB of objects).
+    math(EXPR mexft_plugin_base "${mexft_plugin_base} + 0x100000" OUTPUT_FORMAT HEXADECIMAL)
+  endforeach()
+  add_custom_target(mexft_plugins DEPENDS ${MEXFT_PLUGIN_FILES})
+endif()
 
 # ---- parity library ----
 # Native routines that are meant to agree bit for bit with the translated game, offered to the MSVC

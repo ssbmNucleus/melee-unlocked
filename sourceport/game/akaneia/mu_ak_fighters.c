@@ -920,7 +920,15 @@ static const MuAkFighter* find_fighter(const char* file)
             return mu_ak_registry[i];
         }
     }
+#ifdef MU_AKANEIA_FIGHTERS
+    {
+        /* Not built in: a fighter plugin may carry it (mexft/mexft_plugins.c). */
+        const void* mexft_plugin_fighter(const char* file);
+        return (const MuAkFighter*) mexft_plugin_fighter(file);
+    }
+#else
     return NULL;
+#endif
 }
 
 static void fill_fighter(int slot, const MuAkFighter* ft)
