@@ -1,0 +1,320 @@
+--- a/eggs.c
++++ b/eggs.c
+@@ -12,6 +12,27 @@
+ static int canvas;
+ static Text *hud_score_text, *hud_best_text;
+ 
++/* Item lifetime is shorter than the exercise. A stage can destroy the egg without running
++ * our damage callback. Establish membership from the live item list before dereferencing
++ * the saved address, then verify that the live object still owns egg item data. */
++static GOBJ *Egg_LiveGObj(void)
++{
++#ifdef MU_NATIVE
++    GOBJ *live;
++    if (egg_gobj != 0) {
++        for (live = (*stc_gobj_lookup)[MATCHPLINK_ITEM]; live != 0; live = live->next) {
++            if (live == egg_gobj) {
++                ItemData *data = live->userdata;
++                if (data != 0 && data->kind == ITEM_EGG) return live;
++                break;
++            }
++        }
++        egg_gobj = 0;
++    }
++#endif
++    return egg_gobj;
++}
++
+ void Exit(GOBJ *menu) 
+ {
+     stc_match->state = 3;
+@@ -60,9 +81,11 @@
+ 
+ void Egg_OnChangeSize(GOBJ *menu, int value)
+ {
+-    if (egg_gobj != 0)
+-    {
+-        Item_Destroy(egg_gobj);
++    GOBJ *old_egg = Egg_LiveGObj();
++    if (old_egg != 0)
++    {
++        egg_gobj = 0;
++        Item_Destroy(old_egg);
+         egg_gobj = Egg_Spawn();
+     }
+ }
+@@ -131,14 +154,18 @@
+ 
+ int Egg_OnTakeDamage(GOBJ *gobj)
+ {
+-    // gfx and sfx
+-    ItemData *egg_data = egg_gobj->userdata;
++    // Only the currently owned live egg may update this exercise's score.
++    GOBJ *live_egg = Egg_LiveGObj();
++    ItemData *egg_data;
++    if (live_egg == 0 || live_egg != gobj) return 0;
++    egg_data = live_egg->userdata;
+     accumulated_damage += egg_data->dmg.recent;
+     if (accumulated_damage >= Options_Main[OPT_DAMAGETHRESHOLD].val){
+-        Effect_SpawnSync(1232, gobj, egg_data->pos);
++        Effect_SpawnSync(1232, gobj, &egg_data->pos);
+         Item_PlayOnDestroySFXAgain(egg_data, 244, 127, 64);
+         
+         // manage old and new egg
++        egg_gobj = 0;
+         Egg_Destroy(gobj);
+         egg_gobj = Egg_Spawn();
+         egg_counter++;
+@@ -148,6 +175,13 @@
+ 
+ void Event_Init(GOBJ *gobj)
+ {
++#ifdef MU_NATIVE
++    /* Every exercise owns a new egg, even if the old scene reused a GObj address. */
++    egg_gobj = 0;
++    accumulated_damage = 0;
++    /* The console loads the event fresh each time; here the count would carry over. */
++    egg_counter = 0;
++#endif
+     // initialize egg camera subject
+     cam = CameraSubject_Alloc();
+     cam->boundleft_proj = -10;
+@@ -211,7 +245,10 @@
+     }
+ 
+     GOBJ *hmn = Fighter_GetGObj(0);
+-    FighterData *hmn_data = hmn->userdata;
++    FighterData *hmn_data;
++    if (hmn == 0 || hmn->userdata == 0) return;
++    hmn_data = hmn->userdata;
++    Egg_LiveGObj();
+ 
+     // wait for first frame of player control to spawn first egg
+     if (egg_gobj == 0 && hmn_data->flags.input_enable)
+--- a/events.c
++++ b/events.c
+@@ -1857,7 +1857,9 @@
+         // print line
+         int y_base = (line_num - 1) * (-MSGTEXT_YOFFSET / 2);
+         int y_delta = i * MSGTEXT_YOFFSET;
+-        Text_AddSubtext(msg_text, 0, y_base + y_delta, msg_line);
++        // The line is already formatted: passed as the format again, a "%" in it (the L-cancel rate
++        // "L-Cancel 85%") was read as a conversion and dropped by the PC's formatter.
++        Text_AddSubtext(msg_text, 0, y_base + y_delta, "%s", msg_line);
+     }
+ 
+     // Add to queue
+@@ -2353,7 +2355,7 @@
+ 
+         // print line
+         int y_delta = i * MSGTEXT_YOFFSET;
+-        Text_AddSubtext(tip_text, 0, y_delta, msg_line);
++        Text_AddSubtext(tip_text, 0, y_delta, "%s", msg_line);   // already formatted (a "%" in a tip was dropped)
+     }
+ 
+     return 1; // tip created
+--- a/events.h
++++ b/events.h
+@@ -201,6 +201,19 @@
+ // It just writes to the gx_pipe anyways.
+ //
+ // EXPECTS PREMULTIPLIED COLORS
++#ifdef MU_NATIVE
++#include <mu_gxpipe.h>
++/* Natively the pipe is a buffer the host's FIFO decoder drains (mu_gxpipe.h). */
++static inline void GFX_AddVtx(f32 x, f32 y, f32 z, GXColor color) {
++    GXW_f32(x);
++    GXW_f32(y);
++    GXW_f32(z);
++    GXW_u8(color.r);
++    GXW_u8(color.g);
++    GXW_u8(color.b);
++    GXW_u8(color.a);
++}
++#else
+ static inline void GFX_AddVtx(f32 x, f32 y, f32 z, GXColor color) {
+     gx_pipe->d.F32 = x;
+     gx_pipe->d.F32 = y;
+@@ -210,6 +223,7 @@
+     gx_pipe->d.U8 = color.b;
+     gx_pipe->d.U8 = color.a;
+ }
++#endif
+ 
+ void HUD_DrawRects(Rect *rects, GXColor *colors, int count);
+ void HUD_DrawTris(Tri *tris, GXColor *colors, int count);
+--- a/lab.c
++++ b/lab.c
+@@ -2670,26 +2670,31 @@
+             
+             // SDI DISPLAY ---------------------------------------------------
+             
++            /* The second index is the fighter of the pair (0 here: these are the main
++             * fighters), as DIDraw_GX and DIDraw_Reset read it. Indexed by the port, ports
++             * 2 and 3 wrote past the two-entry arrays, and a later HSD_Free took a stray
++             * pointer (a crash in OSFreeToHeap). */
++            const int sub = 0;
+             SDIDraw *sdidraw = &sdidraws[ply];
+ 
+             if (IsHitlagVictim(fighter))
+             { 
+                 int hitlag_left = fighter_data->dmg.hitlag_frames;
+-                int hitlag_passed = sdidraw->num[ply];
++                int hitlag_passed = sdidraw->num[sub];
+                 int total_hitlag = hitlag_left + hitlag_passed;
+ 
+                 // realloc if undersized.
+-                if (total_hitlag > sdidraw->cap[ply]) {
++                if (total_hitlag > sdidraw->cap[sub]) {
+                     Vec2 *vertices = calloc(sizeof(Vec2) * total_hitlag);
+-                    if (sdidraw->vertices[ply]) {
+-                        memcpy(vertices, sdidraw->vertices[ply], sdidraw->num[ply] * sizeof(Vec2));
+-                        HSD_Free(sdidraw->vertices[ply]);
++                    if (sdidraw->vertices[sub]) {
++                        memcpy(vertices, sdidraw->vertices[sub], sdidraw->num[sub] * sizeof(Vec2));
++                        HSD_Free(sdidraw->vertices[sub]);
+                     }
+-                    sdidraw->vertices[ply] = vertices;
+-                    sdidraw->cap[ply] = total_hitlag;
++                    sdidraw->vertices[sub] = vertices;
++                    sdidraw->cap[sub] = total_hitlag;
+                 }
+                 
+-                sdidraw->vertices[ply][hitlag_passed] = (Vec2) {
++                sdidraw->vertices[sub][hitlag_passed] = (Vec2) {
+                     .X = fighter_data->phys.pos.X,
+                     .Y = fighter_data->phys.pos.Y,
+                 };
+@@ -2697,16 +2702,16 @@
+                 // only actually draw if there was SDI
+                 if (
+                     hitlag_passed == 0
+-                    || sdidraw->vertices[ply][hitlag_passed].X != sdidraw->vertices[ply][hitlag_passed-1].X
+-                    || sdidraw->vertices[ply][hitlag_passed].Y != sdidraw->vertices[ply][hitlag_passed-1].Y
++                    || sdidraw->vertices[sub][hitlag_passed].X != sdidraw->vertices[sub][hitlag_passed-1].X
++                    || sdidraw->vertices[sub][hitlag_passed].Y != sdidraw->vertices[sub][hitlag_passed-1].Y
+                 ) {
+-                    sdidraw->num[ply]++;
++                    sdidraw->num[sub]++;
+                 }
+             }
+             else if (fighter_data->flags.hitstun == 0)
+             {
+                 // don't show after histun ends
+-                sdidraw->num[ply] = 0;
++                sdidraw->num[sub] = 0;
+             }
+             
+             // DI DISPLAY ---------------------------------------------------
+@@ -2717,11 +2722,11 @@
+             if (fighter_data->flags.hitstun == 1)
+             {
+                 // free old
+-                if (didraw->vertices[ply] != 0)
++                if (didraw->vertices[sub] != 0)
+                 {
+-                    HSD_Free(didraw->vertices[ply]);
+-                    didraw->num[ply] = 0;
+-                    didraw->vertices[ply] = 0;
++                    HSD_Free(didraw->vertices[sub]);
++                    didraw->num[sub] = 0;
++                    didraw->vertices[sub] = 0;
+                 }
+ 
+                 // get player's inputs
+@@ -3028,21 +3033,21 @@
+                 }
+ 
+                 // alloc draw struct
+-                didraw->num[ply] = vertices_num + 2; // +2 for ASDI vertices
++                didraw->num[sub] = vertices_num + 2; // +2 for ASDI vertices
+                 // alloc vertices
+-                didraw->vertices[ply] = calloc(sizeof(Vec2) * (vertices_num + 2));
++                didraw->vertices[sub] = calloc(sizeof(Vec2) * (vertices_num + 2));
+ 
+                 // save ASDI first
+-                didraw->vertices[ply][0].X = fighter_data->coll_data.topN_Curr.X;
+-                didraw->vertices[ply][0].Y = fighter_data->coll_data.topN_Curr.Y + fighter_data->coll_data.ecbCurr_left.Y;
+-                didraw->vertices[ply][1].X = fighter_data->coll_data.topN_Curr.X + asdi_orig.X;
+-                didraw->vertices[ply][1].Y = fighter_data->coll_data.topN_Curr.Y + fighter_data->coll_data.ecbCurr_left.Y + asdi_orig.Y;
++                didraw->vertices[sub][0].X = fighter_data->coll_data.topN_Curr.X;
++                didraw->vertices[sub][0].Y = fighter_data->coll_data.topN_Curr.Y + fighter_data->coll_data.ecbCurr_left.Y;
++                didraw->vertices[sub][1].X = fighter_data->coll_data.topN_Curr.X + asdi_orig.X;
++                didraw->vertices[sub][1].Y = fighter_data->coll_data.topN_Curr.Y + fighter_data->coll_data.ecbCurr_left.Y + asdi_orig.Y;
+ 
+                 // save this info to the draw struct
+                 for (int i = 0; i < vertices_num; i++)
+                 {
+-                    didraw->vertices[ply][i + 2].X = DICollData[i].pos.X;
+-                    didraw->vertices[ply][i + 2].Y = DICollData[i].pos.Y + ((DICollData[i].ECBLeftY + DICollData[i].ECBTopY) / 2);
++                    didraw->vertices[sub][i + 2].X = DICollData[i].pos.X;
++                    didraw->vertices[sub][i + 2].Y = DICollData[i].pos.Y + ((DICollData[i].ECBLeftY + DICollData[i].ECBTopY) / 2);
+                 }
+ 
+                 // free the collision info
+@@ -3051,11 +3056,11 @@
+             // if not in hitstun, zero out didraw
+             else if (fighter_data->flags.hitstun == 0)
+             {
+-                if (didraw->vertices[ply] != 0)
++                if (didraw->vertices[sub] != 0)
+                 {
+-                    HSD_Free(didraw->vertices[ply]);
+-                    didraw->num[ply] = 0;
+-                    didraw->vertices[ply] = 0;
++                    HSD_Free(didraw->vertices[sub]);
++                    didraw->num[sub] = 0;
++                    didraw->vertices[sub] = 0;
+                 }
+             }
+         }
+--- a/lab_css.c
++++ b/lab_css.c
+@@ -59,9 +59,15 @@
+     // alloc image (needs to be 32 byte aligned)
+     import_data.snap.image = calloc(GXGetTexBufferSize(RESIZE_WIDTH, RESIZE_HEIGHT, 4, 0, 0)); // allocate 128 entries
+ 
++#ifdef MU_NATIVE
++    // natively the event menu's GetEventDesc is linked in, not found through the console's function table
++    extern EventDesc *tmce_eventMenu_GetEventDesc(int page, int event);
++    event_desc = tmce_eventMenu_GetEventDesc(1, 0);
++#else
+     // HUGE HACK ALERT -- manually gets function offset of TM_GetEventDesc
+     EventDesc *(*GetEventDesc)(int page, int event) = RTOC_PTR(TM_FUNC + (1 * 4));
+     event_desc = GetEventDesc(1, 0);
++#endif
+     event_desc->stage = -1;
+     *onload_fileno = -1;
+ 
+--- a/lcancel.c
++++ b/lcancel.c
+@@ -762,9 +762,11 @@
+ #endif
+     };
+ 
+-    // replace collision callback
++    // Give this barrel its own callback table. The item's pointer names the table every barrel
++    // in the game shares, so copying into it left these callbacks on barrels in every later
++    // mode, where the event they belong to is gone (a crash in Classic after this event).
+     ItemData *barrel_data = barrel_gobj->userdata;
+-    memcpy(barrel_data->it_func, item_callbacks, sizeof(item_callbacks));
++    barrel_data->it_func = (void *)item_callbacks;
+     barrel_data->camera_subject->kind = 0;
+ 
+     // update last barrel pos
+--- a/slalom.c
++++ b/slalom.c
+@@ -294,6 +294,13 @@
+ void Event_Init(GOBJ *gobj) {
+     // use wavedash pole as slalom pole
+     assets = Archive_GetPublicAddress(event_vars->event_archive, "wavedash");
++#ifdef MU_NATIVE
++    /* The console loads the event fresh each time; here the last run's poles would stay "active"
++       (freed with the old scene), so no new pole was ever placed. */
++    active_pole_gobj = 0;
++    next_pole_gobj = 0;
++    pole_counter = 0;
++#endif
+ 
+     int canvas = Text_CreateCanvas(2, 0, 0, 0, 0, GXLINK_HUD, 81, 19);
+ 

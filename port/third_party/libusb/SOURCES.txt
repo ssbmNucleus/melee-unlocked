@@ -1,0 +1,28 @@
+libusb 1.0.30 (https://github.com/libusb/libusb/releases/download/v1.0.30/libusb-1.0.30.tar.bz2,
+sha256 fea36f34f9156400209595e300840767ab1a385ede1dc7ee893015aea9c6dbaf, the digest GitHub publishes for
+that release asset). The tarball's signature (libusb-1.0.30.tar.bz2.asc) checks out against the release
+key C68187379B23DE9EFC46651E2C80FF56C6830A0E (Tormod Volden), from KEYS in tag v1.0.30.
+License: LGPL-2.1-or-later (COPYING); AUTHORS kept with it.
+
+Only the files the Windows build reads, all byte-identical to the same paths in the tarball:
+- the 11 sources port/CMakeLists.txt compiles into port_libusb: libusb/{core,descriptor,hotplug,io,
+  strerror,sync}.c and libusb/os/{events_windows,threads_windows,windows_common,windows_usbdk,
+  windows_winusb}.c
+- the headers they include on Windows: libusb/{libusb,libusbi,version,version_nano}.h and
+  libusb/os/{events_windows,threads_windows,windows_common,windows_usbdk,windows_winusb}.h
+- msvc/config.h, upstream's own MSVC configuration (nothing project-specific).
+The other backends, the autotools, Xcode and MSVC project files, CI files, docs, tests and examples
+are not here. Linux builds against the system libusb (pkg-config libusb-1.0), and macOS does not use
+libusb. Windows hotplug (new in 1.0.30, libusb/os/windows_hotplug.c) is opt-in upstream and is not
+built here, as in upstream's default configurations. Enabling it means adding that file, its header,
+and LIBUSB_WINDOWS_HOTPLUG.
+
+Used by the GameCube adapter and Switch Pro start-up (port/runtime/host/gc_adapter.cpp, switch_pro.cpp).
+
+To check (Git Bash or another POSIX shell, from the repository root). It prints the hash, then
+nothing if every file here matches the tarball:
+  r=$PWD/port/third_party/libusb; t=$(mktemp -d)
+  curl -sSLo "$t/l.tar.bz2" https://github.com/libusb/libusb/releases/download/v1.0.30/libusb-1.0.30.tar.bz2
+  sha256sum "$t/l.tar.bz2"; tar xjf "$t/l.tar.bz2" -C "$t"
+  (cd "$r" && find . -type f ! -name SOURCES.txt) | while read -r f; do
+    diff -q --strip-trailing-cr "$t/libusb-1.0.30/$f" "$r/$f" >/dev/null || echo "differs: $f"; done

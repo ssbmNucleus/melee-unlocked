@@ -1,0 +1,161 @@
+// Linux renderer factory: the OpenGL GX renderer (port/linux/renderer_gl.cpp) with the settings
+// panel drawn over each presented frame, as the Windows renderers do.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "gx_backend.h"
+#include "pc_settings.h"
+#include "pc_settings_shared.h"
+#include "host.h"
+#include "window.h"
+#include "renderer_gl.h"
+#include "gx_vulkan.h"
+#include "exi_slippi.h"
+#include "gx_shader.h"
+#ifdef __APPLE__
+#define GL_SILENCE_DEPRECATION
+#include <OpenGL/gl3.h>
+#else
+#include <GL/glew.h>
+#endif
+#include <SDL.h>
+#ifndef __APPLE__
+#include <SDL_vulkan.h>
+#endif
+#include <algorithm>
+#include <memory>
+#include <string>
+#include <cctype>
+
+namespace gx {
+
+// The GL renderer reads its options through a pointer, so they live beside it for its lifetime.
+namespace {
+struct LinuxPresentation {
+  RenderOptions options;
+  std::unique_ptr<PcSettingsUIGL> settings;
+};
+std::unique_ptr<LinuxPresentation> g_presentation;
+
+// Dolphin's "Auto (Window Size)": the integer EFB scale that covers the window, as the Windows
+// renderers pick it; a fixed choice from the settings is used as is.
+int linux_scale(const RenderOptions& options, int client_h) {
+  // Supersampling renders at 2x, 3x or 4x the chosen scale and the present pass averages it down, as the
+  // Windows renderers do (up to the 6x the GL renderer supports).
+  const int ssaa = std::clamp(options.ssaa, 1, 4);
+  if (options.efb_scale > 0) return std::clamp(options.efb_scale * ssaa, 1, 6);
+  return std::clamp((client_h + EFB_HEIGHT - 1) / EFB_HEIGHT * ssaa, 1, 6);
+}
+}  // namespace
+
+bool d3d11_available() { return false; }
+
+Backend* create_render_backend(void* hwnd, int client_w, int client_h, const RenderOptions& options) {
+  auto* window = static_cast<SDL_Window*>(hwnd);
+#ifndef __APPLE__
+  // Vulkan (PC settings > Graphics backend): the same renderer as on Windows, with its own settings
+  // panel. main.cpp made this a Vulkan window; if Vulkan does not start, the game cannot fall back to
+  // OpenGL on it, so it stops with the reason (set the backend back to OpenGL in melee_settings.txt).
+  if (options.api == RenderApi::Vulkan) {
+    VulkanWindow vw;
+    vw.window = window;
+    vw.drawable_size = [window](int* w, int* h) {
+      SDL_Vulkan_GetDrawableSize(window, w, h);
+    };
+    vw.instance_extensions = [window] {
+      unsigned n = 0;
+      SDL_Vulkan_GetInstanceExtensions(window, &n, nullptr);
+      std::vector<const char*> names(n);
+      SDL_Vulkan_GetInstanceExtensions(window, &n, names.data());
+      return names;
+    };
+    vw.create_surface = [window](void* instance, void* surface) {
+      return SDL_Vulkan_CreateSurface(window, static_cast<VkInstance>(instance), static_cast<VkSurfaceKHR*>(surface)) == SDL_TRUE;
+    };
+    RenderOptions vulkan_options = options;
+    vulkan_options.dlss_mode = 0;
+    if (Backend* backend = create_vulkan_backend(vw, client_w, client_h, vulkan_options)) return record_started_backend(backend, "Vulkan");
+    if (options.prewarm_only) return nullptr;
+    host::die("Vulkan did not start on this system (see melee_port.log). Choose OpenGL: delete the line \"backend vulkan\" from melee_settings.txt.");
+  }
+#endif
+  g_presentation = std::make_unique<LinuxPresentation>();
+  g_presentation->options = options;
+  RenderOptions& opts = g_presentation->options;
+  const int scale = linux_scale(opts, client_h);
+  std::unique_ptr<Backend> renderer;
+  try {
+    renderer = linux_renderer::create(window, opts.shader_cache.empty() ? "shadercache" : opts.shader_cache, scale, opts.vsync, opts.prewarm_only);
+  } catch (const std::exception& e) {
+    if (opts.prewarm_only) { host::log("opengl: %s", e.what()); return nullptr; }
+    // No OpenGL 4.5 context at all (a 0.9.95 report: "GLXBadFBConfig"): an older GPU or driver. Say what
+    // is missing instead of a crash report.
+    if (std::string(e.what()).find("OpenGL context") != std::string::npos) {
+      host::log("opengl: no OpenGL 4.5 context (%s); the game needs OpenGL 4.5 on Linux", e.what());
+      host::log_flush();
+      if (!host::options.no_gc_adapter && !host::g_no_dialogs)   // hidden/headless/boxed/--no-dialogs: never wait on a dialog
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Nucleus Unlocked",
+            "Nucleus Unlocked cannot start OpenGL 4.5 on this graphics card or driver.\n\n"
+            "Update the graphics driver (Mesa on most systems) and start the game again. Graphics cards older "
+            "than about 2012 cannot run it.", window);
+      host::end_process(1);
+    }
+    host::die("OpenGL renderer: %s", e.what());
+  }
+  // The driver in the log: a Linux graphics crash report is unreadable without knowing whose driver it
+  // was (the renderer's own line goes to the terminal only, which a report does not include).
+  const auto gl_text = [](GLenum name) { const GLubyte* s = glGetString(name); return s ? reinterpret_cast<const char*>(s) : "?"; };
+  host::log("opengl: %s | %s | %s", gl_text(GL_VENDOR), gl_text(GL_RENDERER), gl_text(GL_VERSION));
+  // Mesa's software rasterisers draw on the processor: the game runs, its music plays, and the
+  // picture crawls at a few frames a second. Say so once, instead of leaving a player to guess.
+  {
+    const std::string gl_renderer = gl_text(GL_RENDERER);
+    std::string lower = gl_renderer;
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char ch) { return (char)std::tolower(ch); });
+    if (lower.find("llvmpipe") != std::string::npos || lower.find("softpipe") != std::string::npos ||
+        lower.find("software rasterizer") != std::string::npos || lower.find("swrast") != std::string::npos) {
+      host::log("opengl: WARNING software rendering (%s): no graphics driver for the GPU is in use", gl_renderer.c_str());
+      if (!host::options.no_gc_adapter && !host::g_no_dialogs)   // hidden/headless/--no-dialogs: never wait on a dialog
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Nucleus Unlocked",
+            ("OpenGL is running in software on your processor (" + gl_renderer + "), so the game will run very slowly.\n\n"
+             "Install or enable the graphics driver for your GPU (on Linux Mint: Driver Manager), then restart the game.").c_str(),
+            window);
+    }
+  }
+  host::log("opengl: internal resolution EFB x%d (window %dx%d)", scale, client_w, client_h);
+  if (opts.pc_settings) g_presentation->settings = std::make_unique<PcSettingsUIGL>(hwnd, opts);
+  linux_renderer::Hooks hooks;
+  hooks.options = &opts;
+  hooks.frame_begin = [](const Frame& frame) {
+    auto& p = *g_presentation;
+#ifdef __APPLE__
+    p.options.fullscreen = host::window_is_fullscreen();
+#endif
+    // As the Windows renderers: the Slippi widescreen code, Fountain of Dreams reflections and
+    // True widescreen follow the settings every frame (they are game changes, not drawing).
+    static bool widescreen_sent = false, fod_sent = false;
+    if (p.options.widescreen != widescreen_sent) { widescreen_sent = p.options.widescreen; slippi::request_widescreen(widescreen_sent); }
+    if (p.options.fod_reflections != fod_sent) { fod_sent = p.options.fod_reflections; slippi::request_fod_reflections(fod_sent); }
+    {
+      int cw = 0, ch = 0;
+      host::window_client_size(&cw, &ch);
+      set_true_widescreen(p.options.true_widescreen && !p.options.widescreen, true_widescreen_aspect(p.options, cw, ch));
+    }
+    if (!p.settings) return;
+    int w = 0, h = 0;
+    host::window_client_size(&w, &h);
+    settings_set_game_aspect(presented_aspect(p.options, w, h, false));
+    settings_set_hud_snapshot(frame);
+    if (p.settings->begin(p.options)) {
+      host::window_set_fullscreen(p.options.fullscreen);
+      SDL_GL_SetSwapInterval(p.options.vsync ? 1 : 0);
+    }
+  };
+  hooks.before_swap = [](int, int) {
+    auto& p = *g_presentation;
+    if (p.settings) p.settings->draw();
+  };
+  hooks.after_swap = [](uint64_t frame) { host::window_presented(frame); };
+  linux_renderer::set_hooks(*renderer, std::move(hooks));
+  return record_started_backend(renderer.release(), "OpenGL");
+}
+
+}  // namespace gx

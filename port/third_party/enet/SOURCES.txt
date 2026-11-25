@@ -1,0 +1,51 @@
+ENet 1.3.13 (http://enet.bespin.org/download/enet-1.3.13.tar.gz, sha256
+e36072021faa28731b08c15b1c3b5b91b911baf5f6abcc7fe4a6d425abada35c). Its source files are the same
+bytes as tag v1.3.13 of https://github.com/lsalzman/enet (commit f7c46f03fd8d883ac2811948aa71c7623069d070).
+Only the library: *.c, include/enet/*.h and LICENSE (MIT). Used by Slippi netplay (port/runtime/hle)
+and the peer connector (port/runtime/mu_net).
+
+Held at 1.3.13 on purpose. Slippi's Dolphin ships ENet 1.3.13, and this client talks to stock Slippi
+clients and the Slippi matchmaking server. The packet format is the same in later 1.3.x releases.
+What changed after 1.3.13 is how the sender schedules packets (reliable windows, throttle, RTT,
+default MTU). Do not update without testing against stock Slippi.
+
+This folder is upstream 1.3.13 plus melee-unlocked.patch, which only adds receive-side checks:
+- protocol.c: each command's payload length is checked against the bytes left in the datagram
+  before the read pointer moves (upstream moves the pointer first, then compares pointers). The
+  header size, including the checksum, is checked before anything reads it. Empty or truncated
+  datagrams are counted and shown to the intercept, but not parsed. offsetof replaces the
+  null-pointer offset trick.
+- win32.c, unix.c (enet_socket_receive): a truncated datagram returns ENET_SOCKET_RECEIVE_TRUNCATED
+  and an empty one ENET_SOCKET_RECEIVE_EMPTY (both defined in enet.h), with the sender's address
+  filled in. Upstream returns -1 for truncated datagrams, which makes enet_host_service fail.
+  It returns 0 for empty ones, which ends that receive pass.
+- unix.h, unix.c: socket descriptors at or above FD_SETSIZE are refused, instead of writing past
+  the fd_set.
+- peer.c, protocol.c, enet.h: receive-side fixes from later upstream releases, listed below.
+Nothing on the send side changes, so what goes out on the wire is unchanged.
+
+Backported from upstream (receive side only; the release is still 1.3.13 otherwise):
+- 1.3.16, 259e5db and e55d226 ("queuing fix"): enet_peer_queue_incoming_command dispatches the
+  channel's unreliable queue, which could free the command it had just queued and then return it.
+  The fragment handlers wrote into that freed command. The dispatch functions and
+  enet_peer_remove_incoming_commands now take the command just queued and leave it in place.
+  enet_peer_dispatch_incoming_reliable_commands and enet_peer_dispatch_incoming_unreliable_commands
+  gain that third argument (NULL from everywhere else), as upstream.
+- 1.3.18, d7e5470 and 657eaf9: a reliable or unreliable fragment with no data, or a fragmented
+  packet whose totalLength is smaller than its fragmentCount, is refused. Such a packet could be
+  marked complete with none of its bytes written, so it was delivered holding uninitialised memory.
+  ENet's own sender never sends either (every fragment carries at least one byte).
+These were written to match the upstream commits named, without the upstream files at hand.
+Compare them with those commits when this folder is next updated.
+
+To check (Git Bash or another POSIX shell, from the repository root). It prints only the hash,
+then nothing if the folder is upstream plus the patch. --strip-trailing-cr is there because a Windows
+checkout has CRLF line endings; the repository stores LF.
+  r=$PWD/port/third_party/enet; t=$(mktemp -d)
+  curl -sSLo "$t/enet.tar.gz" http://enet.bespin.org/download/enet-1.3.13.tar.gz
+  sha256sum "$t/enet.tar.gz"
+  tar xzf "$t/enet.tar.gz" -C "$t" && cd "$t/enet-1.3.13" && patch -s -p1 < "$r/melee-unlocked.patch"
+  (cd "$r" && find . -type f ! -name SOURCES.txt ! -name melee-unlocked.patch) | while read -r f; do
+    diff -q --strip-trailing-cr "$f" "$r/$f" >/dev/null || echo "differs: $f"; done; cd - >/dev/null
+To regenerate the patch after a deliberate change, diff the pristine files against this folder
+(git diff --no-index --no-prefix a b, with a = pristine and b = this folder, minus these two files).

@@ -1,0 +1,70 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+#include "gx_core.h"
+#include "render_options.h"
+#include "settings_store.h"   // load_pc_settings, save_pc_settings, consume_lag_test_launch
+#include <memory>
+struct ID3D12Device;
+struct ID3D12CommandQueue;
+struct ID3D12GraphicsCommandList;
+struct ID3D11Device;
+struct ID3D11DeviceContext;
+namespace gx {
+// Current letterboxed gameplay viewport aspect, used to keep overlays out of the black bars.
+void settings_set_game_aspect(float aspect);
+// Copy the same simulation frame's HUD anchors used by the presented image.
+void settings_set_hud_snapshot(const Frame& frame);
+// True once after a texture pack is switched on or off, so the backend can drop the textures it
+// uploaded under the old set. Reading it clears it.
+bool settings_textures_dirty();
+// The standalone settings window (--settings-window), the one place the settings panel draws.
+void settings_fill_window(bool on);
+// True in the standalone settings window: the panel is the window and is always open there.
+bool settings_fills_window();
+// Standalone settings window on a scaled display: its monitor's DPI over 96 (2 at 200 percent). The
+// panel is laid out in 96 DPI units and drawn this much larger, with its text rasterised at the
+// final size. Stays 1 in the game window, which is never asked to scale this way.
+void settings_set_window_scale(float scale);
+// The tab the panel opens on the first time it is drawn (0 Video to 7 Mods), for --settings-tab.
+// Negative, the default, leaves the saved behaviour.
+void settings_set_initial_tab(int tab);
+// True once after the panel asks to close. The standalone window has nothing to return to, so that
+// is its cue to exit. Reading it clears it.
+bool settings_close_requested();
+class PcSettingsUI {
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+public:
+  // rtv_format: the swap chain's DXGI_FORMAT (28 R8G8B8A8_UNORM; 24 R10G10B10A2_UNORM while HDR10
+  // output is on).
+  PcSettingsUI(void* window, ID3D12Device* device, ID3D12CommandQueue* queue, const RenderOptions& options,
+               int rtv_format = 28);
+  // HDR10 output: the panel's colours are PQ-encoded at this paper white (nits); 0 = SDR.
+  static void set_hdr_paper_white(float nits);
+  ~PcSettingsUI();
+  bool begin(RenderOptions& options); // returns true when render configuration changed
+  void draw(ID3D12GraphicsCommandList* list);
+};
+// The same panel on the D3D11 backend (its own small ImGui renderer; the panel body is shared).
+class PcSettingsUID3D11 {
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+public:
+  PcSettingsUID3D11(void* window, ID3D11Device* device, ID3D11DeviceContext* context, const RenderOptions& options);
+  ~PcSettingsUID3D11();
+  bool begin(RenderOptions& options);
+  void draw();   // into whatever render target the caller has bound
+};
+#ifndef _WIN32
+// Linux: the same panel drawn with OpenGL into the default framebuffer (pc_settings_gl.cpp).
+class PcSettingsUIGL {
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+public:
+  PcSettingsUIGL(void* window, const RenderOptions& options);
+  ~PcSettingsUIGL();
+  bool begin(RenderOptions& options);
+  void draw();
+};
+#endif
+}

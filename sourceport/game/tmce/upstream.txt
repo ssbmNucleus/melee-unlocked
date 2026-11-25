@@ -1,0 +1,17 @@
+# Training Mode CE upstream: the commit the native build compiles. The game's build fetches it
+# (that commit alone) and tools/tmce/prepare_src.py makes the native source from it: its src/
+# files, tools/tmce/native_edits.py, tools/tmce/native_fixes.patch. tools/tmce/gen_mextk.py reads
+# its MexTK/ headers.
+#
+# src-sha256 is the hash of the src/ files the build takes. asm-sha256 is the hash of the whole
+# ASM/ folder: TM-CE's assembly patches, which the native hooks port by hand. A new commit whose
+# ASM/ differs fails the build until its changes are ported and the new hash is recorded here.
+# dats-sha256 is the hash of the dats/ files the game loads from TM/ beside it (the event menu's,
+# the Lab's, its character select's, the wavedash drill's): the build writes them from the commit
+# (prepare_src.py --dats) only when they match. They are build outputs, never committed.
+# `python tools/tmce/prepare_src.py --upstream <dir> --hashes` prints the values.
+url https://github.com/AlexanderHarrison/TrainingMode-CommunityEdition
+commit dda765bc5770c88e482c463e42da8f11cdb830a8
+src-sha256 3da6f137e639898fa6095c419cdfa85cf5723a5b450e38d0a04f950f4dd9a16c
+asm-sha256 2eac730cdfcf24511ecbd44c62e1810a7bdaee553decb3e5c4467bb824c4e462
+dats-sha256 2a50e80a4c9487983ac80bc50ff1d424ca00f032d51b91ce32549cf84eb3b533

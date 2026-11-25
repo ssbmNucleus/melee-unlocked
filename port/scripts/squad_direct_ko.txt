@@ -1,0 +1,240 @@
+# Squad Strike in Direct, rollback check (tools/online_quad.py with MELEE_TEST_ONLINE_SQUAD on both slots).
+# P1 is this process's local controller on both peers; run with MELEE_TEST_SCRIPT_PAD_FRAMES=1 so stalls
+# do not advance the script. Before the match: online_bot.txt's lines (the harness skips the menus anyway).
+# Each 1200-frame loop: 600 frames of fighting (early_inputs_bot.txt's pattern twice, a change of input
+# every 6 to 12 frames) and 600 frames running right off the stage, the stick alternating between two
+# full-right values every 4 frames (Melee clamps both to 1.0): each change is a misprediction on the other
+# side, so rollbacks keep crossing the KO, respawn and squad swap frames. About one KO a side a loop.
+@match
+@loop 1200
+0
+8 sx=80
+16 sx=-80
+24 sx=80
+30 sx=80 A
+36 sx=80
+44 X
+47
+52 sx=0 A
+58
+66 sx=-80
+72 sx=-80 B
+78 sx=-80
+86 sy=-80
+92 sy=-80 A
+98
+106 L
+114
+120 sx=80 Y
+123 sx=80
+130 sx=80 B
+136 sx=80
+144 sx=-80
+150 cx=80
+152
+158 sx=-80
+164 Z
+167
+174 sx=0 sy=80
+180 sy=80 A
+186
+194 sx=-80
+200 sx=-80 sy=-80
+206 sx=-80 sy=-80 A
+212 sx=-80
+220 r=120
+228
+234 sx=80 X
+237 sx=80
+240
+248 sx=80
+256 sx=-80
+264 sx=80
+270 sx=80 A
+276 sx=80
+284 X
+287
+292 sx=0 A
+298
+306 sx=-80
+312 sx=-80 B
+318 sx=-80
+326 sy=-80
+332 sy=-80 A
+338
+346 L
+354
+360 sx=80 Y
+363 sx=80
+370 sx=80 B
+376 sx=80
+384 sx=-80
+390 cx=80
+392
+398 sx=-80
+404 Z
+407
+414 sx=0 sy=80
+420 sy=80 A
+426
+434 sx=-80
+440 sx=-80 sy=-80
+446 sx=-80 sy=-80 A
+452 sx=-80
+460 r=120
+468
+474 sx=80 X
+477 sx=80
+480
+540 L
+560
+600 sx=100
+604 sx=110
+608 sx=100
+612 sx=110
+616 sx=100
+620 sx=110
+624 sx=100
+628 sx=110
+632 sx=100
+636 sx=110
+640 sx=100
+644 sx=110
+648 sx=100
+652 sx=110
+656 sx=100
+660 sx=110
+664 sx=100
+668 sx=110
+672 sx=100
+676 sx=110
+680 sx=100
+684 sx=110
+688 sx=100
+692 sx=110
+696 sx=100
+700 sx=110
+704 sx=100
+708 sx=110
+712 sx=100
+716 sx=110
+720 sx=100
+724 sx=110
+728 sx=100
+732 sx=110
+736 sx=100
+740 sx=110
+744 sx=100
+748 sx=110
+752 sx=100
+756 sx=110
+760 sx=100
+764 sx=110
+768 sx=100
+772 sx=110
+776 sx=100
+780 sx=110
+784 sx=100
+788 sx=110
+792 sx=100
+796 sx=110
+800 sx=100
+804 sx=110
+808 sx=100
+812 sx=110
+816 sx=100
+820 sx=110
+824 sx=100
+828 sx=110
+832 sx=100
+836 sx=110
+840 sx=100
+844 sx=110
+848 sx=100
+852 sx=110
+856 sx=100
+860 sx=110
+864 sx=100
+868 sx=110
+872 sx=100
+876 sx=110
+880 sx=100
+884 sx=110
+888 sx=100
+892 sx=110
+896 sx=100
+900 sx=110
+904 sx=100
+908 sx=110
+912 sx=100
+916 sx=110
+920 sx=100
+924 sx=110
+928 sx=100
+932 sx=110
+936 sx=100
+940 sx=110
+944 sx=100
+948 sx=110
+952 sx=100
+956 sx=110
+960 sx=100
+964 sx=110
+968 sx=100
+972 sx=110
+976 sx=100
+980 sx=110
+984 sx=100
+988 sx=110
+992 sx=100
+996 sx=110
+1000 sx=100
+1004 sx=110
+1008 sx=100
+1012 sx=110
+1016 sx=100
+1020 sx=110
+1024 sx=100
+1028 sx=110
+1032 sx=100
+1036 sx=110
+1040 sx=100
+1044 sx=110
+1048 sx=100
+1052 sx=110
+1056 sx=100
+1060 sx=110
+1064 sx=100
+1068 sx=110
+1072 sx=100
+1076 sx=110
+1080 sx=100
+1084 sx=110
+1088 sx=100
+1092 sx=110
+1096 sx=100
+1100 sx=110
+1104 sx=100
+1108 sx=110
+1112 sx=100
+1116 sx=110
+1120 sx=100
+1124 sx=110
+1128 sx=100
+1132 sx=110
+1136 sx=100
+1140 sx=110
+1144 sx=100
+1148 sx=110
+1152 sx=100
+1156 sx=110
+1160 sx=100
+1164 sx=110
+1168 sx=100
+1172 sx=110
+1176 sx=100
+1180 sx=110
+1184 sx=100
+1188 sx=110
+1192 sx=100
+1196 sx=110

@@ -1,0 +1,17 @@
+Monocypher 4.0.3 (https://github.com/LoupVaillant/Monocypher, tag 4.0.3, commit
+ab2b16dd619ad5f6979a4fbe69cfa324a6fcc35f, 15 June 2026, the latest release). Taken from the git tag,
+not the release tarball: all five files are byte-identical to the tag. The release tarball
+(monocypher-4.0.3.tar.gz, sha256 8cc9bc341a66249016db9bd70e9142d8d0aef9945973744b1ac05dbc55d8ee66,
+the digest GitHub publishes) differs in two ways only. Its first line reads "Monocypher version 4.0.3"
+where the git copy has "__git__", and its LICENCE.md lacks the closing note about tests/externals.
+Files: src/monocypher.{c,h}, src/optional/monocypher-ed25519.{c,h} and LICENCE.md (BSD-2-Clause or
+CC0). Unchanged. 4.0.3 includes the fix for the EdDSA/Ed25519 signing timing leak.
+Used by the peer session layer
+(port/runtime/mu_net: peer identity, session security, rollback session, result outbox).
+
+To check (Git Bash or another POSIX shell, from the repository root). It prints nothing if the folder
+matches the tag:
+  r=$PWD/port/third_party/monocypher; t=$(mktemp -d)
+  git clone -q https://github.com/LoupVaillant/Monocypher.git "$t/m" && cd "$t/m" && git checkout -q ab2b16dd619ad5f6979a4fbe69cfa324a6fcc35f
+  for f in src/monocypher.c src/monocypher.h src/optional/monocypher-ed25519.c src/optional/monocypher-ed25519.h LICENCE.md; do
+    diff -q --strip-trailing-cr "$f" "$r/${f##*/}" >/dev/null || echo "differs: $f"; done; cd - >/dev/null

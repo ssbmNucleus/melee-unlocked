@@ -1,0 +1,35 @@
+stb_image.h v2.34 and stb_image_write.h v1.18 by Sean Barrett (http://nothings.org/stb),
+vendored unmodified. Used by the custom texture pack loader (port/runtime/gx/texture_pack.cpp)
+to decode replacement PNGs and to write dumped textures.
+
+Both files are taken from https://github.com/nothings/stb at commit
+1da9ade1e66195252114f5da497f244704a6c58d (2026-11-19, "bump stb_image version number"), the
+commit that sets stb_image.h to v2.34. Git blob ids: stb_image.h
+9e65b834cfd7e34d9f8f8bd81d1c5e6eae128fc7, stb_image_write.h
+aa1d629ba37316e4b9d07c8c096ab5cfc3c4cecd.
+
+The upstream files are dual licensed; the full text of both options is reproduced at the
+bottom of each header. Melee Unlocked uses them under the MIT option:
+
+ALTERNATIVE A - MIT License
+Copyright (c) 2017 Sean Barrett
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+and associated documentation files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+ALTERNATIVE B - Public Domain (www.unlicense.org)
+This is free and unencumbered software released into the public domain. Anyone is free to copy,
+modify, publish, use, compile, sell, or distribute this software, either in source code form or
+as a compiled binary, for any purpose, commercial or non-commercial, and by any means.
