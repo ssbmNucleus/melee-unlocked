@@ -1,0 +1,4746 @@
+// D3D12 backend: replays captured GX frames into an EFB render target and presents XFB copies.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#define NOMINMAX
+#include "gx_cache_prune.h"
+#include "d3d_recipes.h"
+#include "test_env.h"
+#include <windows.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <d3dcompiler.h>
+#include <wrl/client.h>
+#include <algorithm>
+#include <chrono>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <fstream>
+#include <string>
+#include <filesystem>
+#include <unordered_map>
+#include <unordered_set>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
+#include <vector>
+#include "dxgi_paced_mode.h"
+#include "fullscreen_state.h"
+#include "vrr_detect.h"
+#include "pacing_diagnostics_win.h"
+#include "temporal_history.h"
+#include "vblank_clock.h"
+#include "gx_d3d12.h"
+#include "gx_adapter.h"
+#include "gx_backend.h"   // solver_pair_counter, for the "gpu:" diagnostic line
+#include "pipeline_cache_store.h"
+#include "prewarm_variants.h"
+#include "gpu_readings.h"
+#ifdef MELEE_NO_SLIPPI
+#include "netplay_state.h"   // the same names, answered from the neutral netplay state
+#else
+#include "exi_slippi.h"
+#endif
+#include "gx_shader.h"
+#include "crt_shader.h"
+#include "present_shader.h"
+#include "user_shader.h"
+#include "gx_texture.h"
+#include "gx_streamline.h"
+#include <system_error>
+#include "gx_fsr.h"
+#include "flicker_scan.h"
+#include "texture_pack.h"
+#include "gx_retro.h"
+#include "video_background.h"
+#include "video_background_learning.h"
+#include "host.h"
+#include "sim_work.h"
+#include "window.h"   // fullscreen toggling lives on the window, not the settings panel
+#include "gecko_data.h"
+#ifdef GX_PC_SETTINGS
+#include "pc_settings.h"
+#endif
+
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "d3dcompiler.lib")
+
+using Microsoft::WRL::ComPtr;
+
+namespace gx {
+// VRAM meter (see vram_usage): written by the renderer, read by the settings overlay.
+// g_vram_budget is Windows' current allowance for this process (DXGI_QUERY_VIDEO_MEMORY_INFO::Budget):
+// it moves with whatever else is asking the GPU for memory (a browser, an overlay, another game) and
+// is usually a bit under the card's real size, which reads as "missing" VRAM to someone who knows
+// their card's number. g_vram_total is the adapter's own installed size instead, captured once.
+std::atomic<float> g_vram_used{0.0f}, g_vram_budget{0.0f}, g_vram_total{0.0f};
+namespace { std::atomic<bool> g_hdr_display{false}; }
+bool hdr_display_available() { return g_hdr_display.load(std::memory_order_relaxed); }
+bool vram_usage(float* used_gb, float* total_gb) {
+  *used_gb = g_vram_used.load(std::memory_order_relaxed); *total_gb = g_vram_total.load(std::memory_order_relaxed);
+  if (*total_gb <= 0.0f) return gpu_readings::vram(used_gb, total_gb);   // the Vulkan renderer publishes its own
+  return true;
+}
+
+// GPU time actually spent in the DLAA/DLSS pass, in milliseconds, each frame it ran (see
+// D3D12Backend::read_gpu_timers). 0 when it has not run yet. For the settings panel: what a
+// setting is actually costing, not the total render latency alone.
+std::atomic<float> g_dlaa_pass_ms{0.0f};
+void gpu_pass_cost(float* dlaa_ms) {
+  *dlaa_ms = g_dlaa_pass_ms.load(std::memory_order_relaxed);
+}
+
+
+namespace {
+
+#ifndef GX_SRV_HEAP_SIZE
+#define GX_SRV_HEAP_SIZE 65536
+#endif
+#ifndef GX_SAMPLER_HEAP_SIZE
+#define GX_SAMPLER_HEAP_SIZE 2048
+#endif
+#ifndef GX_CONSTANT_PAGE_SIZE
+#define GX_CONSTANT_PAGE_SIZE (32 << 20)
+#endif
+
+// execute_draw section costs (seconds) and draw count since the last profile line.
+double g_prof[20]; uint64_t g_prof_frames = 0; uint64_t g_prof_draws = 0, g_pso_hits = 0, g_pso_lookups = 0, g_pso_creates = 0, g_pso_skips = 0;
+struct Stopwatch {
+  static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+  double t = now(); double lap() { double n = now(), d = n - t; t = n; return d; }
+};
+
+// The device every check() below belongs to, so a lost device can say why it was lost.
+ID3D12Device* g_check_device = nullptr;
+// When Windows or the driver takes the device away, every later call fails with the same
+// "device removed" code, which names neither the cause nor the call that broke it. The device
+// keeps the real reason: hung (the GPU stopped answering), reset (another program or a driver
+// restart), driver error, or removed (driver update, GPU unplugged or switched).
+const char* device_lost_reason(HRESULT reason) {
+  switch ((unsigned)reason) {
+    case 0x887A0006u: return "the GPU stopped answering";
+    case 0x887A0007u: return "the graphics driver was reset";
+    case 0x887A0020u: return "the graphics driver reported an internal error";
+    case 0x887A0005u: return "the GPU or its driver was removed or updated";
+    case 0x887A0001u: return "the driver rejected a call the game made";
+    default: return "no reason given";
+  }
+}
+// A GPU whose highest Direct3D level is 11 (Intel HD 4600 and others of its age) runs Direct3D 12
+// through an old driver path; a 0.8.98 report lost the device there at the second scene. When that
+// happens the settings file is switched to Direct3D 11, so the next start uses it.
+bool g_check_level11 = false;
+std::string g_check_settings_path;
+bool switch_settings_to_d3d11() {
+  std::error_code ec;
+  const std::filesystem::path path = std::filesystem::u8path(g_check_settings_path);
+  if (g_check_settings_path.empty()) return false;
+  // A player who never saved settings has no file yet (two 0.9.18 reports lost the device again on
+  // the next start because of that): create it, with the folder.
+  if (!std::filesystem::is_regular_file(path, ec) && path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), ec);
+  std::ofstream out(path, std::ios::binary | std::ios::app);   // a later key wins when the file is read
+  if (!out) return false;
+  out << "\nbackend d3d11\n";
+  return (bool)out.flush();
+}
+void check(HRESULT hr, const char* what) {
+  if (!FAILED(hr)) return;
+  const unsigned code = (unsigned)hr;
+  if ((code == 0x887A0005u || code == 0x887A0006u || code == 0x887A0007u || code == 0x887A0020u) && g_check_device) {
+    ::gx::cache_store::freeze();   // nothing from a lost device replaces the saved caches
+    const HRESULT reason = g_check_device->GetDeviceRemovedReason();
+    // The driver reset or the display changed (a 0.9.220 report: an RTX 5090's driver let go during a
+    // desktop mode change): the game starts again by itself, on Direct3D 11 if it happens again soon,
+    // instead of stopping with a crash report. Only repeated losses are reported.
+    {
+      static std::atomic<bool> once{false};
+      if (!once.exchange(true)) {
+        char why[160];
+        std::snprintf(why, sizeof why, "D3D12 %s %08X, %s", what, code, device_lost_reason(reason));
+        // A GPU whose highest level is Direct3D 11 goes to Direct3D 11 at once (see g_check_level11).
+        if (g_check_level11) switch_settings_to_d3d11();
+        host::restart_after_device_loss(why, switch_settings_to_d3d11);
+      }
+    }
+    const char* next = "If this happens again, set Settings > Video > Graphics backend to Direct3D 11.";
+    if (g_check_level11 && switch_settings_to_d3d11())
+      next = "This GPU is old for Direct3D 12: the game starts on Direct3D 11 from now on (Settings > Video > Graphics backend).";
+    host::die("D3D12: %s failed (%08X): the graphics device was lost, %s (%08X). %s", what, code, device_lost_reason(reason), (unsigned)reason, next);
+  }
+  if (code == 0x8007000Eu)   // E_OUTOFMEMORY: the machine, not the GPU (a 0.8.99 laptop with 0.9 of 5.8 GB VRAM in use)
+    host::die("D3D12: %s failed (8007000E): Windows had no memory left for the graphics device. Close other programs "
+              "or restart Windows, then start the game again.", what);
+  host::die("D3D12: %s failed (%08X)", what, code);
+}
+template <class T> const IID& IID_PPV_ARGS_Helper_IID() { return __uuidof(T); }
+
+// DXGI's own factory creation faulted at startup on one system (a 0.8.84 report, dxgi.dll+0x2EB9F)
+// right after CreateDXGIFactory1 had worked there. These hold no C++ objects, so structured
+// exception handling can catch the fault. MELEE_TEST_DXGI_FAULT=1 faults CreateDXGIFactory2,
+// =2 also the device check in d3d12_usable (the game then starts on Direct3D 11).
+int dxgi_test_fault() { const char* v = host::test_env::getenv("MELEE_TEST_DXGI_FAULT"); return v ? std::atoi(v) : 0; }
+HRESULT guarded_factory2(bool through_streamline, IDXGIFactory4** out) {
+  __try {
+    if (dxgi_test_fault() >= 1) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+    if (through_streamline) return (HRESULT)streamline::create_dxgi_factory2(0, &IID_PPV_ARGS_Helper_IID<IDXGIFactory4>(), (void**)out);
+    return CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void**)out);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    *out = nullptr;
+    return E_ABORT;
+  }
+}
+HRESULT guarded_factory1(IDXGIFactory4** out) {
+  __try {
+    return CreateDXGIFactory1(__uuidof(IDXGIFactory4), (void**)out);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    *out = nullptr;
+    return E_ABORT;
+  }
+}
+HRESULT create_factory(bool through_streamline, IDXGIFactory4** out) {
+  const HRESULT hr = guarded_factory2(through_streamline, out);
+  if (hr != E_ABORT) return hr;
+  host::log("d3d12: CreateDXGIFactory2 faulted; using CreateDXGIFactory1 instead");
+  return guarded_factory1(out);
+}
+// Null out: only asks whether the adapter can make a device (S_FALSE = yes), nothing is created.
+HRESULT guarded_device_check(IDXGIAdapter1* adapter, D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0) {
+  __try {
+    if (dxgi_test_fault() >= 2) RaiseException(EXCEPTION_ACCESS_VIOLATION, 0, 0, nullptr);
+    return D3D12CreateDevice(adapter, level, __uuidof(ID3D12Device), nullptr);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return E_ABORT;
+  }
+}
+// The adapter has no room for a new resource (E_OUTOFMEMORY, or the older "out of video memory"
+// code some drivers still return). Only these are worth freeing textures and trying again for.
+bool out_of_video_memory(HRESULT hr) { return hr == E_OUTOFMEMORY || hr == (HRESULT)0x8876017CL; }
+// Video memory an RGBA8 texture takes, near enough for deciding how much to free.
+uint64_t texture_bytes(uint32_t w, uint32_t h, uint32_t levels) {
+  const uint64_t base = (uint64_t)w * h * 4;
+  return levels > 1 ? base + base / 3 : base;
+}
+
+struct PsoKey {
+  uint64_t vs, ps;
+  uint32_t blend, zmode, cull, topology, pixel_format, mvec;
+  bool operator==(const PsoKey& o) const {
+    return vs == o.vs && ps == o.ps && blend == o.blend && zmode == o.zmode &&
+        cull == o.cull && topology == o.topology && pixel_format == o.pixel_format && mvec == o.mvec;
+  }
+};
+struct PsoKeyHash { size_t operator()(const PsoKey& k) const {
+  const uint64_t fields[] = {k.vs, k.ps, k.blend, k.zmode, k.cull, k.topology, k.pixel_format, k.mvec};
+  return (size_t)hash_bytes(fields, sizeof fields);
+} };
+
+struct TextureEntry {
+  ComPtr<ID3D12Resource> resource;
+  uint32_t width = 0, height = 0, levels = 1;
+  uint64_t last_used = 0;
+  uint64_t replacement_bytes = 0;   // what a pack replacement charged to the replacement budget
+};
+
+using TextureSetKey = std::array<ID3D12Resource*, 8>;
+struct TextureSetHash {
+  size_t operator()(const TextureSetKey& k) const { return (size_t)hash_bytes(k.data(), sizeof(ID3D12Resource*) * k.size()); }
+};
+
+struct SamplerSetKey {
+  uint32_t mode0[8], mode1[8];
+  bool operator==(const SamplerSetKey& o) const { return memcmp(this, &o, sizeof *this) == 0; }
+};
+struct SamplerSetHash { size_t operator()(const SamplerSetKey& k) const { return (size_t)hash_bytes(&k, sizeof k); } };
+
+// Upload pages remain alive until the frame fence completes. Grow instead of
+// dropping draws or exposing an incompletely uploaded texture when a page fills.
+class Ring {
+  struct Page {
+    ComPtr<ID3D12Resource> buffer;
+    uint8_t* cpu = nullptr;
+    size_t size = 0, offset = 0;
+  };
+  ID3D12Device* device_ = nullptr;
+  size_t page_size_ = 0, current_ = 0, slot_ = 0;
+  std::vector<Page> slots_[3];      // one page set per frame in flight
+  std::vector<Page>& pages() { return slots_[slot_]; }
+  // Asked to free video memory when an overflow page does not fit; true when a retry is worthwhile.
+  bool (*free_memory_)(void* user, uint64_t bytes) = nullptr;
+  void* free_memory_user_ = nullptr;
+  HRESULT create_page(size_t size, Page* p) {
+    *p = Page{}; p->size = size;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = size; rd.Height = 1;
+    rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&p->buffer));
+    if (SUCCEEDED(hr)) hr = p->buffer->Map(0, nullptr, (void**)&p->cpu);
+    if (FAILED(hr)) { p->buffer.Reset(); p->cpu = nullptr; }
+    return hr;
+  }
+  Page make_page(size_t size) {
+    Page p;
+    check(create_page(size, &p), "upload page");
+    return p;
+  }
+ public:
+  void init(ID3D12Device* dev, size_t size) {
+    device_ = dev; page_size_ = size;
+    for (auto& set : slots_) set.push_back(make_page(size));
+  }
+  void on_out_of_memory(bool (*free_memory)(void*, uint64_t), void* user) { free_memory_ = free_memory; free_memory_user_ = user; }
+  // Selects the page set of frame slot `slot` (whose previous GPU work has completed).
+  void reset(size_t slot) {
+    slot_ = slot; current_ = 0;
+    for (auto& p : pages()) p.offset = 0;
+    // Retire exceptional overflow pages now that this slot's fence has passed.
+    if (pages().size() > 1) pages().resize(1);
+  }
+  bool alloc(size_t bytes, size_t align, uint8_t** cpu, D3D12_GPU_VIRTUAL_ADDRESS* gpu) {
+    size_t off = (pages()[current_].offset + align - 1) & ~(align - 1);
+    if (off > pages()[current_].size || bytes > pages()[current_].size - off) {
+      // An overflow page that does not fit in video memory is not fatal: free what can be freed and
+      // try once more, then report failure so the caller drops this one draw or upload.
+      const size_t size = std::max(page_size_, (bytes + align - 1) & ~(align - 1));
+      Page page;
+      HRESULT hr = create_page(size, &page);
+      if (out_of_video_memory(hr) && free_memory_ && free_memory_(free_memory_user_, size)) hr = create_page(size, &page);
+      if (out_of_video_memory(hr)) return false;
+      check(hr, "upload page");
+      ++current_;
+      pages().push_back(std::move(page));
+      off = 0;
+    }
+    auto& p = pages()[current_];
+    *cpu = p.cpu + off; *gpu = p.buffer->GetGPUVirtualAddress() + off;
+    p.offset = off + bytes;
+    return true;
+  }
+  ID3D12Resource* resource() { return pages()[current_].buffer.Get(); }
+};
+
+static std::atomic<uint64_t> next_backend_id{1};
+class D3D12Backend : public Backend {
+ public:
+  D3D12Backend(HWND hwnd, int w, int h, const D3D12Options& o) : hwnd_(hwnd), opts_(o), client_w_(w), client_h_(h) { recipes_unsaved_ = o.prewarm_only; init(); start_pso_workers(); start_cache_saver(); prewarm_pipelines();
+    // The recipe list is whole now (a list saved halfway through the prewarm would drop recipes):
+    // the merged list goes to the cache root if the file there lacks some, and again whenever new
+    // pipelines arrive.
+    recipes_ready_ = true; cache_saver_.mark_dirty();
+    // A safe point: the prewarm's pipelines and the merged recipe list go to disk now, on the
+    // saver's thread, not only on a timed save or at exit (nothing is written when nothing changed).
+    cache_saver_.request_flush("prewarm");
+    log_pipeline_stats("startup", cache_saver_.saved_bytes());
+    prewarm_upscalers();
+    host::loading_close();
+#ifdef GX_PC_SETTINGS
+    if (opts_.pc_settings) settings_ui_ = std::make_unique<PcSettingsUI>(hwnd, device_.Get(), queue_.Get(), opts_);
+#endif
+    set_hud_scales(opts_.stock_hud_scale, opts_.damage_hud_scale, gecko::option_pal_stock_icons);
+    set_low_poly_fighters(opts_.low_poly_fighters != 0);
+    set_fod_reflections(opts_.fod_reflections);
+    set_css_background_free(opts_.css_background_free);
+    set_player_tags_always(opts_.player_tags_always != 0);
+    set_arcade_display(ArcadeSource::Settings, arcade_settings_bits(opts_)); set_shield_colors(opts_.shield_color, opts_.shield_color_online);
+  }
+  PrewarmStats prewarm_stats() const override {
+    return {"d3d12", pipeline_recipes_.size(), pipelines_loaded_.load(), pipelines_compiled_.load()};
+  }
+  ~D3D12Backend() override { if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: backend shutdown / gpu wait");
+    fg_presenter_wait(); fg_presenter_stop();
+    wait_gpu(); if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: gpu idle / settings destroy");
+    user_shader::d3d12_release();   // the GPU is idle: the preset's resources can go before the device
+    if (swapchain_) swapchain_->SetFullscreenState(FALSE, nullptr); texpack::report();
+#ifdef GX_PC_SETTINGS
+    settings_ui_.reset();
+#endif
+    if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: settings destroyed / workers stop");
+    stop_pso_workers(); if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: workers stopped");
+    integrate_compiled_psos(); flush_captures(); if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: captures flushed");
+    cache_saver_.stop(); log_pipeline_stats("session", cache_saver_.saved_bytes());
+    if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: pipeline cache saved");
+    if (fence_event_) CloseHandle(fence_event_); if (present_timer_) CloseHandle(present_timer_);
+    if (frame_latency_waitable_) CloseHandle(frame_latency_waitable_);
+    last_poses_.clear();
+    mvec_.Reset(); hud_mask_.Reset(); dlss_out_.Reset();
+    if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: render resources reset");
+    fsr::shutdown(); if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: FSR stopped");
+    streamline::shutdown_for_process_exit();
+    if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: Streamline left for process exit");
+    if (std::getenv("MELEE_UI_DIAG")) host::log("ui diag: backend destroyed"); }
+  bool supports_game_reset() const override { return true; }
+  void reset_game_state() override {
+    wait_gpu();
+    textures_.clear(); drop_efb_copies(); pending_hd_.clear(); texture_retry_frame_.clear();
+    texture_sets_.clear(); sampler_sets_.clear(); srv_cursor_ = 0; sampler_slots_used_ = 0;
+    for (auto& video : video_textures_) for (auto& slot : video) slot = {};
+    last_poses_.clear(); dlss_reset_ = true; fsr_reset_ = true;
+    create_efb();
+  }
+  const D3D12Options& options() const { return opts_; }
+  const RenderOptions* presentation_options() const override { return &opts_; }
+  void presentation_stats(uint32_t* frames, uint32_t* pipelines, uint32_t* textures) const override {
+    if (frames) *frames = frames_presented();
+    if (pipelines) *pipelines = pipeline_count();
+    if (textures) *textures = texture_count();
+  }
+  std::string profile_line() const override { return d3d12_profile_line(); }
+  void set_present_deadline(double deadline) override { present_deadline_ = deadline; }
+  bool reflex_pacing(double cap_hz) override {
+    if (opts_.reflex_mode <= 0 || !streamline::reflex_available()) return false;
+    reflex_limit_us_ = cap_hz > 0 ? (uint32_t)std::lround(1e6 / cap_hz) : 0;
+    return true;
+  }
+  void reflex_sleep() override {
+    apply_reflex(std::max(opts_.reflex_mode, fg_applied_ > 0 ? 1 : 0));
+    reflex_token_ = streamline::reflex_sleep((uint32_t)frame_counter_ + 1);   // submit_frame counts this frame next
+  }
+  double presentation_wait_seconds() const override { return present_wait_; }
+  bool display_lag(double& seconds, uint64_t& serial) const override {
+    if (!display_lag_serial_) return false;
+    seconds = display_lag_; serial = display_lag_serial_;
+    return true;
+  }
+  void note_shown_moment(double moment) override { pending_moment_ = moment; }
+  // DXGI's own count of what reached the screen: presents shown, vertical refreshes that went by,
+  // and refreshes that showed the previous frame again. Frame statistics are only reported while
+  // the swap chain owns the display (exclusive or independent flip); while Windows composes the
+  // window with the desktop the call fails, and that is itself worth knowing for a stutter report.
+  std::string display_timing_line() override {
+    if (!swapchain_) return "no swap chain";
+    BOOL exclusive = FALSE;
+    swapchain_->GetFullscreenState(&exclusive, nullptr);
+    const char* mode = exclusive ? "exclusive fullscreen" : "windowed or borderless";
+    DXGI_FRAME_STATISTICS st{};
+    const HRESULT hr = swapchain_->GetFrameStatistics(&st);
+    char line[256];
+    if (FAILED(hr)) {
+      have_frame_stats_ = false;
+      if (hr == DXGI_ERROR_FRAME_STATISTICS_DISJOINT)
+        std::snprintf(line, sizeof line, "%s, display statistics reset (mode or output changed)", mode);
+      else
+        std::snprintf(line, sizeof line, "%s, no display statistics (0x%08X), usually because Windows composes the window with the desktop", mode, (unsigned)hr);
+      return line;
+    }
+    if (!have_frame_stats_) { have_frame_stats_ = true; last_frame_stats_ = st;
+      std::snprintf(line, sizeof line, "%s, the display owns the frames (statistics start)", mode); return line; }
+    const UINT shown = st.PresentCount - last_frame_stats_.PresentCount;
+    const UINT refreshes = st.SyncRefreshCount - last_frame_stats_.SyncRefreshCount;
+    last_frame_stats_ = st;
+    // More frames than refreshes with V-Sync on: the driver overrides V-Sync (NVIDIA control panel
+    // "Vertical sync: Off" or Fast), so the picture tears whatever the game asks for. Log only.
+    const bool vsync_overridden = opts_.vsync && refreshes > 0 && shown > refreshes + refreshes / 20 + 2;
+    std::snprintf(line, sizeof line, "%s, the display owns the frames: %u frames shown over %u refreshes (%u refreshes repeated a frame)%s",
+                  mode, shown, refreshes, refreshes > shown ? refreshes - shown : 0u,
+                  vsync_overridden ? "; V-Sync is on but the driver shows more frames than refreshes (overridden in the driver)" : "");
+    return line;
+  }
+  bool have_frame_stats_ = false;
+  DXGI_FRAME_STATISTICS last_frame_stats_{};
+  int variable_refresh() const override { return vrr_.state(); }
+  int frame_generation_multiplier() const override { return fg_multiplier_.load(std::memory_order_relaxed); }
+  bool display_counts_readable() const override { return vrr_readable_; }
+  void set_display_refresh(double hz, bool tear_free) override { vrr_nominal_hz_ = hz; tear_free_ = tear_free; }
+  bool vblank_next(double after, double nominal_hz, double* when, double* period, std::string* why) override {
+    if ((frames_presented_ & 127) == 0 || !vblank_tracked_) { vblank_.track(swapchain_.Get()); vblank_tracked_ = true; }
+    return vblank_.next_after(after, nominal_hz, when, period, why);
+  }
+  VBlankClock vblank_;
+  bool vblank_tracked_ = false;
+  pacing_diag::WindowsRecorder pacing_diagnostics_;
+  void update_variable_refresh();
+  vrr::Detector vrr_;
+  bool tear_free_ = false, vrr_readable_ = false;
+  double vrr_nominal_hz_ = 0;
+  void submit_frame(const Frame& frame) override { submit_frame(frame, nullptr); }
+  void submit_frame(const Frame& frame, const DrawMatrices* overrides) override;
+  // EFB copies are about to be freed. texture_sets_ is keyed by resource pointer, so its entries for
+  // them must go too: a new texture allocated at a freed address would otherwise match a descriptor
+  // table that still points at the freed one, and the GPU reads released memory (the crash on
+  // changing internal resolution mid-match).
+  void drop_efb_copies() { efb_copies_.clear(); texture_sets_.clear(); }
+  void resize(int w, int h) override {
+    pause_frame_generation_for_resize();
+    wait_gpu(); client_w_ = w; client_h_ = h; create_swapchain_targets(true);
+    // Auto scale follows the window like Dolphin's "Auto (Window Size)" integral mode: the EFB is
+    // re-created at the new multiplier and scaled EFB-copy textures are dropped (their size changed).
+    if (opts_.efb_scale == 0 && pick_scale() != scale_) { host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); }
+  }
+  int scale() const { return scale_; }
+  void set_skip_present(bool skip) override { skip_present_ = skip; }
+  bool skip_present_ = false;
+  void set_submit_cancel(const std::function<bool()>* cancel) override { submit_cancel_ = cancel; }
+  bool submit_cancelled() const override { return submit_cancelled_; }
+  double submit_cancel_time() const override { return submit_cancel_time_; }
+  double submit_cancel_time_ = 0.0;
+  const std::function<bool()>* submit_cancel_ = nullptr;
+  bool submit_cancelled_ = false;
+  bool occluded_ = false;   // Present said DXGI_STATUS_OCCLUDED: minimized or alt-tabbed out of fullscreen
+  uint32_t frames_presented() const { return frames_presented_; }
+  uint32_t pipeline_count() const { return (uint32_t)psos_.size(); }
+  uint32_t texture_count() const { return (uint32_t)textures_.size(); }
+
+ private:
+  void pause_frame_generation_for_resize();
+  const uint64_t backend_id_ = next_backend_id.fetch_add(1);
+#ifdef GX_PC_SETTINGS
+  std::unique_ptr<PcSettingsUI> settings_ui_;
+#endif
+  // DLSS: motion-vector target at EFB resolution, upscaled output at the letterboxed window size,
+  // previous presented pose per draw identity for motion vectors, per-frame jitter.
+  bool dlss_active_ = false;
+  // DLAA renders and outputs at the same size, so it anti-aliases the EFB in place and the ordinary
+  // present blit letterboxes the result, instead of DLSS producing a window-sized image.
+  bool dlss_in_place_ = false;
+  int dlss_mode_active_ = 0;
+  bool widescreen_sent_ = false;
+  bool fod_reflections_sent_ = false;
+  int dlss_failures_ = 0;
+  int anisotropy_applied_ = 0, ssaa_applied_ = 0;
+  // Custom texture packs. An HD pack can hold far more pixels than this machine has video memory,
+  // and textures_ is trimmed only once a second (see trim_textures), so replacements stop once they
+  // have spent their share of the adapter and the rest of the game keeps its native textures
+  // instead of running the GPU dry.
+  uint64_t replacement_bytes_ = 0, replacement_budget_ = 512ull * 1024 * 1024;
+  // Video memory held by game textures. textures_ keeps every distinct texture the game has shown,
+  // which on a small adapter (integrated graphics sharing 2 GB) eventually filled it and the next
+  // texture could not be created, and on a large one simply grew for the whole session. Three
+  // defences: trim_textures evicts the least recently drawn textures above texture_budget_bytes_
+  // on every GPU, drops idle textures as well once a small adapter's usage nears its limit, and
+  // free_video_memory is the last resort when an allocation has already failed.
+  static constexpr uint64_t SMALL_VRAM_BUDGET = 4096ull * 1024 * 1024;   // idle trim only at or under this
+  static constexpr uint64_t TEXTURE_IDLE_FRAMES = 600;   // unused this long: the trim may take it
+  static constexpr uint64_t TEXTURE_RETRY_FRAMES = 120;  // before a texture that did not fit is tried again
+  // EFB copies are kept by the guest address they were copied to, and nothing took one out again:
+  // every address any scene had copied to held a texture of up to the whole internal frame for the
+  // rest of the session, outside the texture budget and out of reach of free_video_memory. An hour
+  // of single-player modes filled a 2 GB shared adapter that way. trim_textures now drops a copy
+  // nothing has written or sampled for this long once more than a few exist (sooner when tight).
+  static constexpr uint64_t EFB_COPY_IDLE_FRAMES = 3600;
+  static constexpr size_t EFB_COPIES_KEPT = 16;
+  uint64_t vram_usage_bytes_ = 0, vram_budget_bytes_ = 0;   // update_vram, every 30 frames
+  bool vram_tight_ = false;
+  // A quarter of the adapter's dedicated memory, floor 256 MB, ceiling 2 GB (set in init): the
+  // texture cache is bounded on every machine, not only where memory is already short.
+  uint64_t texture_budget_bytes_ = 512ull * 1024 * 1024;
+  uint64_t texture_cache_bytes_ = 0;   // what textures_ held at the last trim pass
+  double texture_trim_time_ = 0, oom_log_time_ = 0;
+  // Textures that could not be created, by cache key, and the frame they may be tried again. They
+  // draw as missing meanwhile, so a starved adapter is not asked for the same texture every draw.
+  std::unordered_map<uint64_t, uint64_t> texture_retry_frame_;
+  void trim_textures();
+  uint32_t free_video_memory(uint64_t bytes);
+  bool oom_log_due();
+  static bool free_memory_for_ring(void* self, uint64_t bytes);
+  uint64_t texpack_report_frame_ = ~0ull;
+  int forced_scale_ = 0;
+  ComPtr<ID3D12Resource> mvec_, dlss_out_;
+  // DLSS "bias current colour" hint: 1 where a flat 2D draw (HUD, text, player tags) wrote, so DLSS
+  // keeps no history there. Without it a ticking timer or a tag following a fighter ghosted.
+  ComPtr<ID3D12Resource> hud_mask_;
+  uint32_t dlss_out_w_ = 0, dlss_out_h_ = 0;
+  float jitter_x_ = 0, jitter_y_ = 0;
+  bool dlss_reset_ = true;
+  // A draw's pose this frame and in the frame before. A model drawn in several passes in one frame
+  // (fighters are) must compare every pass with the previous frame; comparing a second pass with the
+  // first pass's pose gave zero motion, and DLSS/DLAA blended the moving fighter into the background.
+  TemporalMotionHistory last_poses_;
+  uint64_t temporal_cut_sequence_ = 0;
+  void configure_dlss();
+  void update_vram();
+  void set_dlss_mip_bias(float bias);
+  void bind_efb_targets();
+  void output_size(int* vw, int* vh) const;
+  HANDLE present_timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0x2 /* high resolution */, TIMER_ALL_ACCESS);
+  double present_deadline_ = 0, present_wait_ = 0;
+  std::vector<PipelineRecipe> pipeline_recipes_;
+  std::string shader_cache_root_;   // recipes.bin lives here, above the per-shader-version namespace
+  bool prewarming_ = false;
+  // Asynchronous pipeline creation (see get_pso).
+  struct PsoJob { PsoKey key; VSUid vsu; PSUid psu; D3D12_PRIMITIVE_TOPOLOGY_TYPE topo; PipelineRecipe recipe; };
+  struct PsoResult { PsoKey key; ComPtr<ID3D12PipelineState> pso; ComPtr<ID3DBlob> vs, ps; PipelineRecipe recipe; };
+  std::unordered_set<PsoKey, PsoKeyHash> psos_pending_;
+  struct FallbackKey { uint32_t blend, zmode, cull, topology, pixel_format, mvec, variant;
+    bool operator==(const FallbackKey& o) const { return blend == o.blend && zmode == o.zmode && cull == o.cull && topology == o.topology && pixel_format == o.pixel_format && mvec == o.mvec && variant == o.variant; } };
+  struct FallbackKeyHash { size_t operator()(const FallbackKey& k) const { return hash_bytes(&k, sizeof k); } };
+  std::unordered_map<FallbackKey, ComPtr<ID3D12PipelineState>, FallbackKeyHash> fallback_psos_;
+  std::unordered_map<uint32_t, std::pair<ComPtr<ID3DBlob>, ComPtr<ID3DBlob>>> fallback_blobs_;   // per variant and mvec
+  ID3D12PipelineState* fallback_pso(const PsoKey& key, const DrawCall& dc, D3D12_PRIMITIVE_TOPOLOGY_TYPE topo);
+  void prewarm_fallback_psos();
+  std::mutex pso_mutex_, pipeline_library_mutex_;
+  std::condition_variable pso_cv_, pso_done_cv_;
+  int pso_wait_budget_us_ = 0;   // per presented frame: how long draws may wait for their real pipeline
+  // What this frame spent its submit time on, logged when a match frame takes 10 ms or more, so a
+  // hitch says whether textures, pipelines, GPU waits or descriptor rollovers caused it.
+  struct SlowFrameCost {
+    uint32_t textures = 0, rollovers = 0, pso_queued = 0, pso_built = 0, gpu_waits = 0;
+    uint64_t texture_bytes = 0;
+    double create_ms = 0, decode_ms = 0, copy_ms = 0, pso_build_ms = 0, pso_wait_ms = 0, gpu_wait_ms = 0;
+  } slow_{};
+  unsigned slow_logged_ = 0;
+  void log_slow_frame(const Frame& frame, double seconds);
+  bool capturing_efb_ = false;
+  std::deque<PsoJob> pso_jobs_;
+  std::vector<PsoResult> pso_done_;
+  std::vector<std::thread> pso_threads_;
+  bool pso_quit_ = false;
+  ComPtr<ID3D12PipelineState> build_pso(const PsoKey& key, const VSUid& vsu, const PSUid& psu, D3D12_PRIMITIVE_TOPOLOGY_TYPE topo,
+                                        ComPtr<ID3DBlob>& vs, ComPtr<ID3DBlob>& ps);
+  void pso_worker();
+  void integrate_compiled_psos();
+  void start_pso_workers() {
+    // Many pipelines appear together at match start; spread the compiles over the spare cores.
+    int workers = std::clamp((int)std::thread::hardware_concurrency() - 2, 2, 6);
+    for (int i = 0; i < workers; ++i) pso_threads_.emplace_back([this] { pso_worker(); });
+  }
+  void stop_pso_workers() {
+    { std::lock_guard<std::mutex> lk(pso_mutex_); pso_quit_ = true; }
+    pso_cv_.notify_all();
+    for (auto& t : pso_threads_) t.join();
+    pso_threads_.clear();
+  }
+  void prewarm_pipelines();
+  void prewarm_upscalers();
+  // The caches are saved while the game runs (pipeline_cache_store.h): the saver thread calls these
+  // after new pipelines arrive, on an exit or relaunch (flush_all), and once more from the destructor.
+  cache_store::Produce produce_pipeline_recipes(cache_store::Buffer& out);
+  void remember_recipe(const PipelineRecipe& recipe);   // render thread
+  void start_cache_saver();
+  void log_pipeline_stats(const char* why, uint64_t saved_bytes);
+  std::mutex recipes_mutex_;   // pipeline_recipes_: the render thread appends, the saver thread copies what is new
+  // Saver thread: the recipes copied so far (each once) and an order-free hash of them. The prewarm
+  // files recipes in the order the workers finish, so the list's order differs from start to start.
+  size_t recipes_copied_ = 0;
+  std::vector<PipelineRecipe> recipes_unique_;
+  std::unordered_set<std::string> recipes_seen_;
+  uint64_t recipes_set_hash_ = 0;
+  bool recipes_unsaved_ = false;
+  // The root recipes.bin as read at startup (before recipes_ready_): a list it already holds is not
+  // written again, so a start that learned nothing new leaves the file alone.
+  size_t recipes_file_count_ = 0;
+  uint64_t recipes_file_set_hash_ = 0;
+  std::atomic<bool> recipes_ready_{false};   // set after the prewarm
+  std::atomic<uint64_t> pipelines_loaded_{0}, pipelines_compiled_{0};   // from the library / built by the driver
+  std::vector<uint32_t> index_scratch_;
+  void init();
+  void create_swapchain(bool waitable);
+  void create_swapchain_targets(bool resize);
+  void apply_fullscreen_mode();
+  void wait_frame_latency();
+  void create_efb();
+  int pick_scale(bool with_ssaa = true) const;
+  float output_aspect() const;
+  void wait_gpu();
+  uint32_t reserve_srvs(uint32_t count);
+  void rotate_heap(D3D12_DESCRIPTOR_HEAP_TYPE type);
+  ID3D12PipelineState* get_pso(const DrawCall& dc, D3D12_PRIMITIVE_TOPOLOGY_TYPE topo);
+  ID3D12Resource* white_texture();
+  ComPtr<ID3D12Resource> white_texture_;   // "Lightweight" flat shading (white_texture)
+  Surface look_surface_ = Surface::Textured;   // the look's treatment for the textures being bound (bind_textures)
+  Surface draw_surface_ = Surface::Textured;   // the same for the current draw, kept for bind_samplers
+  ID3D12Resource* update_video_texture(const std::shared_ptr<const video_bg::Frame>& frame,
+                                       int video_slot);
+  void draw_video_background(const std::shared_ptr<const video_bg::Frame>& frame,
+                             int video_slot, const EfbCopy& screen);
+  ID3D12Resource* get_texture(const TextureRef& t, uint32_t* w, uint32_t* h);
+  D3D12_GPU_DESCRIPTOR_HANDLE bind_textures(const DrawCall& dc);
+  D3D12_GPU_DESCRIPTOR_HANDLE bind_samplers(const DrawCall& dc);
+  void execute_draw(const Frame& frame, const DrawCall& dc, const DrawMatrices* override_matrices);
+  void execute_copy(const EfbCopy& copy);
+  void present_efb(const EfbCopy& copy);
+  void clear_efb(const EfbCopy& copy);
+  void capture_backbuffer();
+  void flush_captures();
+  struct PendingCapture { std::string path; UINT w, h, pitch; uint64_t sequence; std::vector<uint8_t> data; };
+  std::vector<PendingCapture> pending_captures_;
+  uint64_t capture_sequence_ = 0;
+
+  HWND hwnd_;
+  D3D12Options opts_;
+  int client_w_, client_h_;
+  int scale_ = 1;                                // current internal-resolution multiplier
+  // Texture LOD bias for the DLSS upscaling modes, log2(render width / output width) as NVIDIA's
+  // guide asks: without it textures are sampled at the detail of the smaller render and stay soft
+  // after the upscale. Zero for native and DLAA.
+  float dlss_mip_bias_ = 0.0f;
+  uint64_t mv_draws_ = 0, mv_matched_ = 0;
+  int fg_applied_ = -1; int reflex_applied_ = -1;
+  std::atomic<int> fg_multiplier_{1};   // frame_generation_multiplier(): 2..6 while generation runs
+  // Reflex pacing (threaded renderer, see reflex_pacing): the frame limit Reflex should hold, what it
+  // was last told, and whether this frame's token and simulation-start marker came from its sleep.
+  uint32_t reflex_limit_us_ = 0, reflex_limit_applied_ = 0;
+  bool reflex_token_ = false;
+  void apply_reflex(int want) {
+    const uint32_t limit = want > 0 ? reflex_limit_us_ : 0;
+    if (want == reflex_applied_ && limit == reflex_limit_applied_) return;
+    streamline::set_reflex(want, limit);
+    reflex_applied_ = want; reflex_limit_applied_ = limit;
+  }   // what Streamline was last told; -1 forces the first call through even when the setting is "off"
+  bool fsr_reset_ = true;
+  bool in_match_ = false;   // the frame being submitted shows a running match (set in submit_frame)
+  EffectsFilter effects_filter_;
+  // Pixel constants of each draw of the game frame being presented (execute_draw): they follow from the draw,
+  // the scale and the look alone, so an uncapped display, which presents one game frame many times, fills
+  // them once. Keyed by the frame object and its sequence; a draw's slot is filled on its first present.
+  const Frame* ps_cache_frame_ = nullptr;
+  uint64_t ps_cache_sequence_ = ~0ull;
+  int ps_cache_scale_ = 0;
+  std::vector<PSConstants> ps_cache_;
+  std::vector<uint8_t> ps_cache_filled_;
+  LightweightFilter lightweight_filter_;   // "Lightweight" for the frame being submitted (set in submit_frame)   // "Visual effects" for the frame being submitted (set in submit_frame)
+  // Whether presented_aspect's widen actually reaches anything on screen: a mode's character/stage
+  // select through its results screen, not the bare 2D menu shell around it (see
+  // frame_has_widenable_scene). Starts true so a fresh window is never letterboxed to 73:60 for the
+  // one frame before the first EFB copy sets it for real.
+  bool widenable_scene_ = true;
+  bool dlss_in_match_ = false;
+  ComPtr<IDXGIAdapter3> adapter3_;   // video memory queries   // last frame's frame_in_match: the upscaler's history restarts on a change
+  std::wstring exe_dir_;   // for loading the upscaler libraries
+  bool fsr_active() const { return fsr::is_fsr_mode(opts_.dlss_mode); }
+  // The chosen upscaler's library is loaded and runs on this GPU.
+  bool upscaler_available() const { return fsr_active() ? fsr::available() : streamline::available(); }
+  double fsr_last_time_ = 0;   // the previous FSR upscale, for its frame time
+  // AMD FSR frame generation (fsr::fg_generate), without AMD's swap chain. Each rendered frame in a
+  // match is presented twice: first the generated picture (halfway from the previous frame), then,
+  // half a frame later, the rendered one. Both present passes are recorded in the frame's own list,
+  // the generated picture into the back buffer and the rendered one into fg_real_ (the EFB is
+  // cleared after the present pass, and the pass reads the HUD from it); a small second list copies
+  // fg_real_ into the next back buffer after the first present.
+  ComPtr<ID3D12Resource> fg_out_;    // the generated picture, the upscaled picture's size (UAV)
+  ComPtr<ID3D12Resource> fg_real_;   // the rendered frame's finished window picture (COPY_SOURCE between uses)
+  ComPtr<ID3D12GraphicsCommandList> fg_list_;
+  ComPtr<ID3D12CommandAllocator> fg_allocators_[2];
+  bool fsr_fg_on_ = false;          // this frame generates (decided in submit_frame before the draws)
+  bool fsr_fg_generated_ = false;   // this frame has a generated picture to show first
+  bool fsr_fg_running_ = false;     // resources made and the loop told the 2x rate
+  uint64_t fsr_fg_prev_frame_ = ~0ull;   // frames_presented_ of the last generating frame (continuity)
+  double fsr_fg_last_present_ = 0, fsr_fg_interval_ = 0;   // the rendered frames' cadence, for the halfway present
+  uint64_t fsr_fg_shown_ = 0;   // generated frames presented (logged every 600)
+  bool fsr_fg_failed_ = false;  // a start failed: not tried again this session
+  // The second present of each generated pair, issued at its time by a thread of its own (as AMD's
+  // and NVIDIA's frame generation present from theirs), so the thread drawing frames (with
+  // sub-frames off, the simulation's too) never waits half a frame for it. Anything that picks or
+  // replaces a back buffer waits for a pending one first (fg_presenter_wait).
+  std::thread fg_presenter_;
+  std::mutex fg_mutex_;
+  std::condition_variable fg_cv_;
+  bool fg_pending_ = false, fg_quit_ = false;
+  double fg_due_ = 0;
+  UINT fg_interval_ = 0, fg_flags_ = 0;
+  void fg_presenter_wait() {
+    if (!fg_presenter_.joinable()) return;
+    std::unique_lock<std::mutex> lock(fg_mutex_);
+    fg_cv_.wait(lock, [&] { return !fg_pending_; });
+  }
+  void fg_presenter_post(double due, UINT interval, UINT flags) {
+    if (!fg_presenter_.joinable()) { fg_quit_ = false; fg_presenter_ = std::thread([this] { fg_presenter_run(); }); }
+    { std::lock_guard<std::mutex> lock(fg_mutex_); fg_due_ = due; fg_interval_ = interval; fg_flags_ = flags; fg_pending_ = true; }
+    fg_cv_.notify_all();
+  }
+  void fg_presenter_stop() {
+    if (!fg_presenter_.joinable()) return;
+    { std::lock_guard<std::mutex> lock(fg_mutex_); fg_quit_ = true; }
+    fg_cv_.notify_all();
+    fg_presenter_.join();
+  }
+  void fg_presenter_run() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    for (;;) {
+      double due; UINT interval, flags;
+      {
+        std::unique_lock<std::mutex> lock(fg_mutex_);
+        fg_cv_.wait(lock, [&] { return fg_pending_ || fg_quit_; });
+        if (!fg_pending_) break;   // asked to stop with nothing left to present
+        due = fg_due_; interval = fg_interval_; flags = fg_flags_;
+      }
+      // Its own place in the display queue (one frame at most), as the first present took one.
+      if (frame_latency_waitable_) WaitForSingleObjectEx(frame_latency_waitable_, 100, FALSE);
+      for (;;) {
+        const double remaining = due - Stopwatch::now();
+        if (remaining <= 0) break;
+        if (timer && remaining > 0.0004) {
+          LARGE_INTEGER t; t.QuadPart = -(LONGLONG)((remaining - 0.0002) * 1e7);
+          if (SetWaitableTimer(timer, &t, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(timer, INFINITE);
+          else SwitchToThread();
+        } else YieldProcessor();
+      }
+      swapchain_->Present(interval, flags);
+      { std::lock_guard<std::mutex> lock(fg_mutex_); fg_pending_ = false; }
+      fg_cv_.notify_all();
+    }
+    if (timer) CloseHandle(timer);
+  }
+  // MELEE_D3D12_VALIDATION=1: the debug layer's message queue, read after every frame; each message
+  // kind is logged once (at most 200 kinds).
+  bool validation_wanted_ = false;
+  ComPtr<ID3D12InfoQueue> info_queue_;
+  std::unordered_set<int> validation_seen_;
+  void poll_validation() {
+    if (!info_queue_) return;
+    const UINT64 n = info_queue_->GetNumStoredMessages();
+    std::vector<uint8_t> buffer;
+    for (UINT64 i = 0; i < n; ++i) {
+      SIZE_T size = 0;
+      if (FAILED(info_queue_->GetMessage(i, nullptr, &size)) || !size) continue;
+      buffer.resize(size);
+      auto* m = reinterpret_cast<D3D12_MESSAGE*>(buffer.data());
+      if (FAILED(info_queue_->GetMessage(i, m, &size))) continue;
+      if (m->Severity > D3D12_MESSAGE_SEVERITY_WARNING) continue;
+      if (!validation_seen_.insert((int)m->ID).second || validation_seen_.size() > 200) continue;
+      host::log("d3d12 validation %s: %.*s", m->Severity <= D3D12_MESSAGE_SEVERITY_ERROR ? "ERROR" : "warning",
+                (int)std::min<SIZE_T>(m->DescriptionByteLength, 700), m->pDescription ? m->pDescription : "");
+    }
+    info_queue_->ClearStoredMessages();
+  }
+  bool fsr_fg_wanted() const;
+  void update_fsr_frame_generation();
+  void release_fsr_frame_generation();
+  void present_pass(const EfbCopy& c, bool upscaled, ID3D12Resource* picture,
+                    ID3D12Resource* target, D3D12_CPU_DESCRIPTOR_HANDLE rtv, D3D12_RESOURCE_STATES target_state);
+  // The name of the upscaling mode for the log, whichever vendor it belongs to.
+  const char* upscaler_name() const { return fsr_active() ? fsr::mode_name(opts_.dlss_mode) : dlss_mode_name((DlssMode)opts_.dlss_mode); }   // draws with motion history (diagnostic, logged with DLSS on)
+  int efb_w_ = EFB_WIDTH, efb_h_ = EFB_HEIGHT;
+  ComPtr<ID3D12Device> device_;
+  // Persistent caches (opts_.shader_cache): compiled shader blobs as files, pipelines in a D3D12
+  // pipeline library the cache saver serializes while the game runs (start_cache_saver). First
+  // sessions compile; later ones load instantly.
+  ComPtr<ID3D12PipelineLibrary> pipeline_library_;
+  std::vector<uint8_t> pipeline_library_data_;
+  bool pipeline_library_dirty_ = false;
+  // Windows' pipeline cache faulted under a library call (build_pso): the library is not used again
+  // this session, and the saver deletes its file rather than saving it. Under pipeline_library_mutex_.
+  bool pipeline_library_faulted_ = false;
+  bool pipeline_library_removed_ = false;   // its file was deleted after a fault; under pipeline_library_mutex_
+  void pipeline_library_fault(const char* call);
+  void open_pipeline_library();
+  cache_store::Produce produce_pipeline_library(cache_store::Buffer& out);
+  bool load_shader_blob(const std::string& path, ComPtr<ID3DBlob>& blob);
+  void save_shader_blob(const std::string& path, ID3DBlob* blob);
+  ComPtr<ID3D12CommandQueue> queue_;
+  ComPtr<IDXGIFactory4> factory_;   // kept: the swap chain is created again when exclusive fullscreen toggles
+  ComPtr<IDXGISwapChain3> swapchain_;
+  FullscreenState fullscreen_state_;
+  // Frame latency. Without a limit DXGI lets three finished frames wait in line for the display,
+  // and whenever the GPU is the bottleneck every one of them is input delay. The swap chain is
+  // created with the frame latency waitable object, its maximum latency set to one, and the render
+  // thread waits on the object before recording a frame (wait_frame_latency). The flag is refused
+  // in exclusive fullscreen, so that mode runs a plain swap chain and the two frame slots below cap
+  // the queue instead. MELEE_D3D12_NO_WAITABLE=1 turns the whole thing off for comparison runs.
+  bool swapchain_waitable_ = false;   // the current swap chain carries the waitable flag
+  bool exclusive_deferred_ = false;   // exclusive was asked for mid-session on a waitable swap chain: borderless until restart
+  HANDLE frame_latency_waitable_ = nullptr;   // null: no waitable object, present with the default queue
+  uint32_t waitable_timeouts_ = 0;   // consecutive waits that timed out; three in a row give the wait up
+  static bool waitable_wanted() { static const bool off = [] { const char* v = std::getenv("MELEE_D3D12_NO_WAITABLE"); return v && *v == '1'; }(); return !off; }
+  UINT swapchain_flags() const { return DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | (swapchain_waitable_ ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0); }
+  ComPtr<ID3D12DescriptorHeap> rtv_heap_, dsv_heap_, srv_heap_, sampler_heap_;
+  ComPtr<ID3D12Resource> backbuffers_[3];
+  // HDR10 output (Video > HDR): the swap chain format and colour space follow it; the presenter has
+  // HDR variants of its pipelines.
+  DXGI_FORMAT backbuffer_format_ = DXGI_FORMAT_R8G8B8A8_UNORM;
+  bool hdr_active_ = false;
+  float hdr_display_peak_ = 1000.0f;
+  uint64_t hdr_checked_frame_ = ~0ull;
+  ComPtr<ID3D12PipelineState> blit_hdr_pso_, crt_hdr_pso_;
+  // Frame generation's UI layer (PS_UI): the HUD with its mask as alpha, at the window size.
+  ComPtr<ID3D12PipelineState> fg_ui_pso_;
+  ComPtr<ID3D12Resource> fg_ui_;
+  bool fg_ui_read_ = false;
+  void update_hdr();
+  ComPtr<ID3D12Resource> efb_color_, efb_depth_;
+  // MSAA (Anti-aliasing 2x/4x/8x MSAA): the draws go to these, resolved into efb_color_/efb_depth_
+  // (colour averaged, depth from sample 0) before anything reads the EFB. 1 = off.
+  ComPtr<ID3D12Resource> msaa_color_, msaa_depth_;
+  ComPtr<ID3D12PipelineState> depth_resolve_pso_, blit_msaa_pso_;
+  ComPtr<ID3DBlob> blit_vs_blob_, blit_ps_blob_;
+  uint32_t blit_msaa_samples_ = 0;
+  ID3D12PipelineState* efb_blit_pso();
+  uint32_t msaa_samples_ = 1;
+  int msaa_applied_ = 1;
+  void resolve_efb();
+  uint32_t msaa_wanted() const;
+  // MSAA draws only while nothing else reads the EFB itself: DLSS/FSR can be turned on while the
+  // game runs, and their pipelines expect the single-sample targets.
+  bool msaa_on() const { return msaa_samples_ > 1 && msaa_color_ && !mvec_out(); }
+  // The motion-vector and HUD-mask targets are written: DLSS.
+  bool mvec_out() const { return dlss_active_; }
+  // Frames in flight: each slot owns a command allocator, upload rings and the resources it
+  // retired; a slot is reused only after the fence value recorded at its submission completes.
+  // Two slots, not three: with three the CPU could run two whole GPU frames ahead, and when the GPU
+  // was the bottleneck (uncapped, no V-Sync, where the waitable object above rarely blocks) those
+  // two frames sat in the queue as input delay for the whole session. The slot fence only ever
+  // waits when the GPU is already more than a frame behind, which is exactly when the queue has to
+  // be held back; a paced or CPU-bound machine never reaches it.
+  static constexpr int FRAME_SLOTS = 2;
+  static constexpr int TIMERS_PER_SLOT = 6;   // timestamp queries per slot, see timer_heap_
+  ComPtr<ID3D12CommandAllocator> allocators_[FRAME_SLOTS];
+  uint64_t slot_fence_[FRAME_SLOTS] = {};
+  // --flicker-scan: each presented frame's EFB is copied into its slot's readback buffer, and read
+  // when that slot comes round again (its fence has passed, so the read never stalls the GPU).
+  FlickerScanner scanner_;
+  ComPtr<ID3D12Resource> scan_rb_[FRAME_SLOTS];
+  uint64_t scan_rb_size_[FRAME_SLOTS] = {};
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT scan_fp_[FRAME_SLOTS] = {};
+  bool scan_pending_[FRAME_SLOTS] = {};
+  uint32_t scan_frame_[FRAME_SLOTS] = {};
+  void record_flicker_scan();
+  void read_flicker_scan();
+  // GPU-timed cost of the DLAA/DLSS pass, each frame, read back the same way as
+  // the flicker scan above (same slot_, so it is already fence-safe). For the settings panel: "how
+  // much is this setting actually costing", not just the total render latency Reflex reports.
+  // Timers 4 and 5 of each slot bracket the whole command list: the GPU time per frame for the
+  // "gpu:" diagnostic line, which is what a "gets laggier over a session" report needs to show
+  // whether the GPU itself is slowing down.
+  ComPtr<ID3D12QueryHeap> timer_heap_;
+  ComPtr<ID3D12Resource> timer_rb_[FRAME_SLOTS];
+  uint8_t timer_mask_[FRAME_SLOTS] = {};   // bit 0: DLAA/DLSS queried this slot; bit 2: whole frame (bit 1 was DLSS 5, removed)
+  bool timer_pending_[FRAME_SLOTS] = {};
+  uint64_t timer_freq_ = 0;
+  double gpu_frame_ms_sum_ = 0; uint32_t gpu_frame_ms_samples_ = 0;   // since the last "gpu:" line
+  // When each slot's frame started recording (host seconds) and whether it was shown; the GPU's end
+  // timestamp, put on the host clock through the queue's clock calibration, gives display_lag().
+  double slot_cpu_start_[FRAME_SLOTS] = {}, slot_moment_[FRAME_SLOTS] = {};
+  bool slot_shown_[FRAME_SLOTS] = {};
+  double pending_moment_ = 0.0, display_lag_ = 0.0;
+  uint64_t display_lag_serial_ = 0;
+  uint64_t clock_gpu_ = 0, clock_cpu_ = 0; double clock_offset_ = 0.0, clock_at_ = -1.0;
+  FILE* shown_trace_ = nullptr;
+  void read_gpu_timers();
+  int slot_ = 0;
+  ComPtr<ID3D12GraphicsCommandList> list_;
+  ComPtr<ID3D12Fence> fence_;
+  HANDLE fence_event_ = nullptr;
+  uint64_t fence_value_ = 0;
+  void wait_fence(uint64_t value) {
+    if (value && fence_->GetCompletedValue() < value) { fence_->SetEventOnCompletion(value, fence_event_); host::perf::Scope wait_cost(host::perf::Stage::Wait); WaitForSingleObject(fence_event_, INFINITE); }
+  }
+  ComPtr<ID3D12RootSignature> root_;
+  ComPtr<ID3D12RootSignature> blit_root_;
+  ComPtr<ID3D12PipelineState> blit_pso_;
+  ComPtr<ID3D12PipelineState> crt_pso_;   // the present pass with the CRT display model
+  // A player-chosen shader preset reads the picture at the console's own size from this texture.
+  ComPtr<ID3D12Resource> shader_source_;
+  uint32_t shader_source_w_ = 0, shader_source_h_ = 0;
+  UINT rtv_size_ = 0, srv_size_ = 0, sampler_size_ = 0;
+  Ring vertex_ring_, index_ring_, constant_ring_, upload_ring_;
+  // One simulation frame's geometry: its whole vertex stream and each draw's index list, uploaded on
+  // the frame's first presentation and read again by every sub-frame presentation of it. At several
+  // hundred presents a second each game frame is shown about ten times, and rebuilding and copying
+  // the same indices and vertices for every one of them was a third of the submit cost. Draws whose
+  // vertices are blended between frames still upload their own per present. A set is reused for a
+  // newer frame only after the GPU has finished the last present that read it (its fence).
+  struct FrameGeometry {
+    struct DrawIndex { uint32_t offset = 0, count = 0; uint8_t state = 0, lines = 0; };   // state 0 unbuilt, 1 cached, 2 fallback
+    uint64_t sequence = 0, fence = 0, last_use = 0;
+    ComPtr<ID3D12Resource> buffer;
+    uint8_t* cpu = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+    size_t capacity = 0, used = 0;
+    std::vector<DrawIndex> draws;
+  };
+  FrameGeometry geometry_[4];
+  FrameGeometry* geometry_frame_ = nullptr;   // the set of the frame being submitted, null when not cached
+  uint64_t geometry_uses_ = 0;
+  void select_frame_geometry(const Frame& frame);
+  std::unordered_map<uint64_t, ComPtr<ID3DBlob>> vs_blobs_, ps_blobs_;
+  std::unordered_map<PsoKey, ComPtr<ID3D12PipelineState>, PsoKeyHash> psos_;
+  std::unordered_map<uint64_t, TextureEntry> textures_;       // key: hash of (addr, dims, format, data, tlut)
+  TextureEntry video_textures_[video_bg::kVideoSlots][FRAME_SLOTS];
+  uint64_t video_serial_[video_bg::kVideoSlots][FRAME_SLOTS]{};
+  bool video_layer_logged_[2]{};
+  int draw_video_slot_ = -1;   // video target sampled by the draw currently being submitted
+  std::unordered_map<uint32_t, TextureEntry> efb_copies_;     // key: guest dest address
+  std::unordered_map<SamplerSetKey, uint32_t, SamplerSetHash> sampler_sets_;  // -> heap slot base
+  uint32_t sampler_slots_used_ = 0;
+  uint32_t srv_cursor_ = 0;
+  std::unordered_map<TextureSetKey, uint32_t, TextureSetHash> texture_sets_;
+  // Textures drawn at native resolution while their pack replacement loads in the background, by
+  // texture cache key: once the replacement is ready the native one is dropped and rebuilt with it.
+  std::unordered_map<uint64_t, std::string> pending_hd_;
+  void swap_in_ready_replacements();
+  std::vector<ComPtr<ID3D12DescriptorHeap>> descriptor_garbage_[FRAME_SLOTS];
+  uint64_t frame_counter_ = 0;
+  uint32_t frames_presented_ = 0;
+  bool efb_is_rt_ = true;
+  bool have_clear_ = false;
+  EfbCopy pending_clear_{};
+  std::vector<ComPtr<ID3D12Resource>> frame_garbage_[FRAME_SLOTS];
+  std::vector<uint8_t> decode_scratch_;
+  // Last member, so it is destroyed first: its thread reads the library and the recipes above.
+  cache_store::Saver cache_saver_;
+};
+
+void D3D12Backend::init() {
+#ifdef _DEBUG
+  { ComPtr<ID3D12Debug> dbg; if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer(); }
+#else
+  // MELEE_D3D12_VALIDATION=1 (tests): Direct3D 12's debug layer (Windows' Graphics Tools), its
+  // errors and warnings in the log (poll_validation), as MELEE_VULKAN_VALIDATION does for Vulkan.
+  if (const char* v = std::getenv("MELEE_D3D12_VALIDATION"); v && *v == '1') {
+    ComPtr<ID3D12Debug> dbg;
+    if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) { dbg->EnableDebugLayer(); validation_wanted_ = true; }
+    else host::log("d3d12: validation asked for, but the debug layer is not installed (Graphics Tools)");
+  }
+#endif
+  {
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir(exe); size_t slash = dir.find_last_of(L"\\/"); if (slash != std::wstring::npos) dir.resize(slash);
+    exe_dir_ = dir;
+    // The startup panel: a progress bar in the middle of the window from here until the game starts,
+    // so a slow driver or DLSS start never looks like a hang.
+    host::loading_show(L"Starting NVIDIA DLSS and Reflex", 1, 4);
+    if (opts_.pc_settings || opts_.dlss_mode != 0 || opts_.reflex_mode != 0 || opts_.frame_generation_mode != 0)
+    // DLSS Frame Generation's plugin only for a DLSS mode: with an FSR mode, frame generation is AMD's.
+    streamline::init(dir, opts_.frame_generation_mode > 0 && !fsr::is_fsr_mode(opts_.dlss_mode));
+    host::loading_show(L"Starting the graphics device", 2, 4);
+  }
+  ComPtr<IDXGIFactory4> factory;
+  ComPtr<IDXGIAdapter1> adapter;
+  // Twice at most: when creating the device through Streamline faults, Streamline turns itself off
+  // and a plain factory and device are made instead (the game starts without DLSS).
+  for (int attempt = 0; attempt < 2 && !device_; ++attempt) {
+  if (attempt == 1 && !streamline::device_faulted()) break;
+  try { adapter.Reset(); } catch (const std::system_error&) {}
+  try { factory.Reset(); } catch (const std::system_error&) {}
+  check(create_factory(true, factory.GetAddressOf()), "factory");
+  if (attempt == 0) {
+    // Every GPU in the order they are tried, so a report shows when a machine has more than one.
+    std::string names;
+    for (UINT i = 0; enum_adapter_fastest_first(factory.Get(), i, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++i) {
+      DXGI_ADAPTER_DESC1 desc;
+      if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
+      char name[128]; WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof name, nullptr, nullptr);
+      names += names.empty() ? name : std::string(", ") + name;
+    }
+    host::log("d3d12: GPUs, fastest first: %s", names.empty() ? "none" : names.c_str());
+  }
+  for (UINT i = 0; enum_adapter_fastest_first(factory.Get(), i, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++i) {
+    DXGI_ADAPTER_DESC1 desc; adapter->GetDesc1(&desc);
+    if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+    if (SUCCEEDED(streamline::d3d12_create_device(adapter.Get(), D3D_FEATURE_LEVEL_11_0, &IID_PPV_ARGS_Helper_IID<ID3D12Device>(), (void**)device_.GetAddressOf()))) {
+      char name[128]; WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof name, nullptr, nullptr);
+      host::log("d3d12: using %s", name);
+      // A quarter of the adapter, floor 256 MB, ceiling 2 GB: enough for a stage plus a full
+      // character pack at 4x, and small enough that the game never competes with itself for VRAM.
+      replacement_budget_ = std::clamp<uint64_t>((uint64_t)desc.DedicatedVideoMemory / 4,
+                                                 256ull * 1024 * 1024, 2048ull * 1024 * 1024);
+      // The same share bounds the whole game texture cache (trim_textures), so it stops growing
+      // at a known size on every GPU instead of only when a small adapter runs short.
+      texture_budget_bytes_ = replacement_budget_;
+      g_vram_total = (float)((double)desc.DedicatedVideoMemory / 1073741824.0);   // the card's own size, for the VRAM meter
+      adapter.As(&adapter3_);   // for the VRAM meter (Windows 10 and later)
+      const bool faulted_before = streamline::device_faulted();
+      streamline::set_device(device_.Get());
+      if (!faulted_before && streamline::device_faulted()) {
+        // Its hooks stay broken in this process: a fresh start without it is the only sound way on.
+        streamline::restart_without_streamline();
+        // Streamline faulted taking the device: drop its proxy device (a throw from its broken locks
+        // only leaks it) and make a plain one on the next attempt.
+        try { device_.Reset(); } catch (const std::system_error&) {}
+        try { adapter3_.Reset(); } catch (const std::system_error&) {}
+        g_vram_total = 0;
+        break;
+      }
+      streamline::dlss_supported(adapter.Get());
+      if (!exe_dir_.empty()) fsr::init(exe_dir_, device_.Get());
+      break;
+    }
+    if (streamline::device_faulted()) break;   // start over without Streamline
+  }
+  }
+  if (!device_) host::die("D3D12: no adapter");
+  if (validation_wanted_) {
+    if (SUCCEEDED(device_.As(&info_queue_))) host::log("d3d12: validation layer on");
+    else host::log("d3d12: validation layer on, but its messages cannot be read from this device");
+  }
+  g_check_device = device_.Get();
+  g_check_settings_path = opts_.settings_path;
+  {
+    static const D3D_FEATURE_LEVEL asked[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+                                              D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1};
+    D3D12_FEATURE_DATA_FEATURE_LEVELS levels{};
+    levels.NumFeatureLevels = 4; levels.pFeatureLevelsRequested = asked;
+    g_check_level11 = SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &levels, sizeof levels)) &&
+                      levels.MaxSupportedFeatureLevel < D3D_FEATURE_LEVEL_12_0;
+    if (g_check_level11) host::log("d3d12: this GPU's highest level is Direct3D 11");
+  }
+  // MELEE_TEST_DEVICE_LOST=1 (tests only, hidden and headless runs) takes the device away at once;
+  // =old also treats the GPU as one whose highest level is Direct3D 11.
+  if (std::getenv("MELEE_NO_GC_ADAPTER") && host::test_env::getenv("MELEE_TEST_DEVICE_LOST")) {
+    if (std::string(host::test_env::getenv("MELEE_TEST_DEVICE_LOST")) == "old") g_check_level11 = true;
+    ComPtr<ID3D12Device5> removable;
+    if (SUCCEEDED(device_.As(&removable))) removable->RemoveDevice();
+  }
+  D3D12_COMMAND_QUEUE_DESC qd{}; qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+  check(device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_)), "queue");
+  factory_ = factory;
+  // Exclusive fullscreen refuses the waitable flag (SetFullscreenState fails), so a session that
+  // starts exclusive gets the plain swap chain; apply_fullscreen_mode swaps between the two.
+  if (opts_.exclusive_fullscreen && waitable_wanted())
+    host::log("d3d12: exclusive fullscreen requested; the frame latency waitable object is not allowed there, the frame slots hold the queue instead");
+  create_swapchain(waitable_wanted() && !opts_.exclusive_fullscreen);
+
+  D3D12_DESCRIPTOR_HEAP_DESC hd{};
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 17;   // 8: the MSAA EFB; 9-13 and 16: unused (were the removed path tracer's and RTX Remix bridge's); 14: frame generation's UI layer; 15: FSR frame generation's rendered picture
+  check(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&rtv_heap_)), "rtv heap");
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV; hd.NumDescriptors = 2;
+  check(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&dsv_heap_)), "dsv heap");
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = GX_SRV_HEAP_SIZE; hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+  check(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srv_heap_)), "srv heap");
+  hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER; hd.NumDescriptors = GX_SAMPLER_HEAP_SIZE;
+  check(device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&sampler_heap_)), "sampler heap");
+  rtv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  srv_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  sampler_size_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
+  for (auto& a : allocators_) check(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)), "allocator");
+  check(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0].Get(), nullptr, IID_PPV_ARGS(&list_)), "list");
+  list_->Close();
+  check(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)), "fence");
+  fence_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+  // GPU timers for the settings panel's latency breakdown (see gpu_pass_cost). Timer 0 = DLAA/DLSS
+  // start, 1 = its end, 2 and 3 unused (were DLSS 5), 4 = the frame's first command, 5 = its
+  // last, per frame slot. queue_->GetTimestampFrequency can fail on hardware/drivers that do not
+  // support GPU timestamps; the readouts just stay at 0.
+  D3D12_QUERY_HEAP_DESC qhd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, FRAME_SLOTS * TIMERS_PER_SLOT};
+  if (SUCCEEDED(device_->CreateQueryHeap(&qhd, IID_PPV_ARGS(&timer_heap_))) &&
+      SUCCEEDED(queue_->GetTimestampFrequency(&timer_freq_))) {
+    for (int i = 0; i < FRAME_SLOTS; ++i) {
+      D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+      D3D12_RESOURCE_DESC rd{};
+      rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = TIMERS_PER_SLOT * sizeof(uint64_t); rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+      rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&timer_rb_[i]));
+    }
+  } else {
+    timer_heap_.Reset(); timer_freq_ = 0;
+  }
+
+  create_swapchain_targets(false);
+  create_efb();
+  if (opts_.exclusive_fullscreen) apply_fullscreen_mode();
+  open_pipeline_library();
+  vertex_ring_.init(device_.Get(), 48 << 20);
+  index_ring_.init(device_.Get(), 24 << 20);
+  constant_ring_.init(device_.Get(), GX_CONSTANT_PAGE_SIZE);
+  upload_ring_.init(device_.Get(), 64 << 20);
+  for (Ring* ring : {&vertex_ring_, &index_ring_, &constant_ring_, &upload_ring_}) ring->on_out_of_memory(&D3D12Backend::free_memory_for_ring, this);
+
+  // Root signature: b0 (VS constants), b1 (PS constants), t0-7, s0-7.
+  D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 8, 0, 0, 0};
+  D3D12_DESCRIPTOR_RANGE samp_range{D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 8, 0, 0, 0};
+  D3D12_ROOT_PARAMETER params[4]{};
+  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; params[0].Descriptor.ShaderRegister = 0; params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV; params[1].Descriptor.ShaderRegister = 1; params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; params[2].DescriptorTable = {1, &srv_range}; params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; params[3].DescriptorTable = {1, &samp_range}; params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_SIGNATURE_DESC rsd{4, params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT};
+  ComPtr<ID3DBlob> sig, err;
+  if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)))
+    host::die("root signature: %s", err ? (const char*)err->GetBufferPointer() : "?");
+  check(device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&root_)), "root sig");
+  // Fallback pipelines are only an interim visual path while a real pipeline is compiled on a
+  // worker. Build the finite generic set now so a newly-seen draw can never compile a shader or
+  // create a D3D12 PSO on the presentation thread.
+  prewarm_fallback_psos();
+
+  // Blit pipeline (EFB -> backbuffer).
+  D3D12_STATIC_SAMPLER_DESC ss{};
+  ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR; ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  D3D12_ROOT_PARAMETER bp[2]{};
+  bp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; D3D12_DESCRIPTOR_RANGE br{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0};   // t0 image, t1 current EFB, t2 HUD mask, t3 depth
+  bp[0].DescriptorTable = {1, &br}; bp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  bp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS; bp[1].Constants.Num32BitValues = 32; bp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;   // 28 + the HDR lane
+  D3D12_ROOT_SIGNATURE_DESC brsd{2, bp, 1, &ss, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+  check(D3D12SerializeRootSignature(&brsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err), "blit root");
+  check(device_->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&blit_root_)), "blit root sig");
+  const char* blit = kPresentShader;
+  ComPtr<ID3DBlob> bvs, bps;
+  check(D3DCompile(blit, strlen(blit), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &bvs, &err), "blit vs");
+  check(D3DCompile(blit, strlen(blit), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &bps, &err), "blit ps");
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+  pd.pRootSignature = blit_root_.Get();
+  pd.VS = {bvs->GetBufferPointer(), bvs->GetBufferSize()}; pd.PS = {bps->GetBufferPointer(), bps->GetBufferSize()};
+  pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+  pd.SampleMask = UINT_MAX;
+  pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; pd.RasterizerState.DepthClipEnable = TRUE;
+  pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; pd.SampleDesc.Count = 1;
+  check(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&blit_pso_)), "blit pso");
+  blit_vs_blob_ = bvs; blit_ps_blob_ = bps;
+  {
+    // Frame generation's UI layer.
+    ComPtr<ID3DBlob> ups, uerr;
+    if (SUCCEEDED(D3DCompile(blit, strlen(blit), nullptr, nullptr, nullptr, "PS_UI", "ps_5_0", 0, 0, &ups, &uerr))) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC ud = pd;
+      ud.PS = {ups->GetBufferPointer(), ups->GetBufferSize()};
+      ud.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+      if (FAILED(device_->CreateGraphicsPipelineState(&ud, IID_PPV_ARGS(&fg_ui_pso_)))) host::log("d3d12: frame generation UI pipeline failed");
+    } else host::log("d3d12: frame generation UI shader failed: %s", uerr ? (const char*)uerr->GetBufferPointer() : "?");
+  }
+  {
+    // The HDR10 variant: the same shader with its HDR lane, into the 10-bit swap chain.
+    const std::string hdr_src = std::string("#define PRESENT_HDR 1\n") + blit;
+    ComPtr<ID3DBlob> hps, herr;
+    if (SUCCEEDED(D3DCompile(hdr_src.c_str(), hdr_src.size(), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &hps, &herr))) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC hd = pd;
+      hd.PS = {hps->GetBufferPointer(), hps->GetBufferSize()};
+      hd.RTVFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+      if (FAILED(device_->CreateGraphicsPipelineState(&hd, IID_PPV_ARGS(&blit_hdr_pso_)))) host::log("d3d12: HDR present pipeline failed");
+    } else host::log("d3d12: HDR present shader failed: %s", herr ? (const char*)herr->GetBufferPointer() : "?");
+  }
+  {
+    // MSAA depth resolve (resolve_efb): sample 0 of the multisampled depth into the EFB depth.
+    const char* dr = "Texture2DMS<float> msdepth : register(t0);\n"
+                     "float4 VS(uint id : SV_VertexID) : SV_Position { float2 p = float2((id << 1) & 2, id & 2); return float4(p * 2 - 1, 0, 1); }\n"
+                     "float PS(float4 pos : SV_Position) : SV_Depth { return msdepth.Load(int2(pos.xy), 0); }\n";
+    ComPtr<ID3DBlob> dvs, dps, derr;
+    if (SUCCEEDED(D3DCompile(dr, strlen(dr), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &dvs, &derr)) &&
+        SUCCEEDED(D3DCompile(dr, strlen(dr), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &dps, &derr))) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC dd{};
+      dd.pRootSignature = blit_root_.Get();
+      dd.VS = {dvs->GetBufferPointer(), dvs->GetBufferSize()}; dd.PS = {dps->GetBufferPointer(), dps->GetBufferSize()};
+      dd.SampleMask = UINT_MAX;
+      dd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; dd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; dd.RasterizerState.DepthClipEnable = FALSE;
+      dd.DepthStencilState.DepthEnable = TRUE; dd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+      dd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+      dd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      dd.NumRenderTargets = 0; dd.DSVFormat = DXGI_FORMAT_D32_FLOAT; dd.SampleDesc.Count = 1;
+      if (FAILED(device_->CreateGraphicsPipelineState(&dd, IID_PPV_ARGS(&depth_resolve_pso_)))) host::log("d3d12: MSAA depth resolve pipeline failed");
+    } else host::log("d3d12: MSAA depth resolve shader failed: %s", derr ? (const char*)derr->GetBufferPointer() : "?");
+  }
+  // The CRT display model (crt_shader.h) as a second pixel shader over the same inputs: the picture
+  // it reads is the one the plain present shows (HUD composite included), then occlusion and the
+  // colour sliders apply to its result. Off costs nothing: the plain shader is unchanged.
+  const std::string crt_src = std::string(blit) + kPresentCrtTap + kCrtShader + kPresentCrtMain;
+  ComPtr<ID3DBlob> cps;
+  check(D3DCompile(crt_src.data(), crt_src.size(), nullptr, nullptr, nullptr, "PS_CRT", "ps_5_0", 0, 0, &cps, &err), "crt ps");
+  pd.PS = {cps->GetBufferPointer(), cps->GetBufferSize()};
+  check(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&crt_pso_)), "crt pso");
+  {
+    const std::string hdr_crt = std::string("#define PRESENT_HDR 1\n") + crt_src;
+    ComPtr<ID3DBlob> hps, herr;
+    if (SUCCEEDED(D3DCompile(hdr_crt.c_str(), hdr_crt.size(), nullptr, nullptr, nullptr, "PS_CRT", "ps_5_0", 0, 0, &hps, &herr))) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC hd = pd;
+      hd.PS = {hps->GetBufferPointer(), hps->GetBufferSize()};
+      hd.RTVFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+      if (FAILED(device_->CreateGraphicsPipelineState(&hd, IID_PPV_ARGS(&crt_hdr_pso_)))) host::log("d3d12: HDR CRT pipeline failed");
+    } else host::log("d3d12: HDR CRT shader failed: %s", herr ? (const char*)herr->GetBufferPointer() : "?");
+  }
+}
+
+// Creates the swap chain, with the frame latency waitable object when `waitable` is set and the
+// driver allows it. Streamline may hand back a proxy (DLSS frame generation presents through it);
+// the IDXGISwapChain2 calls go through the proxy like everything else, and if the proxy or the
+// driver does not give us the object the swap chain simply presents with the default queue, with
+// one log line saying so. Any previous swap chain must already be released by the caller.
+void D3D12Backend::create_swapchain(bool waitable) {
+  fg_presenter_wait();
+  if (frame_latency_waitable_) { CloseHandle(frame_latency_waitable_); frame_latency_waitable_ = nullptr; }
+  waitable_timeouts_ = 0;
+  DXGI_SWAP_CHAIN_DESC1 sd{};
+  sd.Width = client_w_; sd.Height = client_h_; sd.Format = backbuffer_format_; sd.SampleDesc.Count = 1;
+  sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = 3; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+  // No DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH: with it, going exclusive changes the display mode
+  // to match the window, so the desktop resolution became whatever "Window size" was set to.
+  // Without it exclusive fullscreen keeps the desktop's own mode and refresh rate.
+  swapchain_waitable_ = waitable;
+  sd.Flags = swapchain_flags();
+  ComPtr<IDXGISwapChain1> sc1;
+  HRESULT hr = factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd_, &sd, nullptr, nullptr, &sc1);
+  if (FAILED(hr) && waitable) {
+    host::log("d3d12: swap chain with the frame latency waitable object refused (0x%08X); presenting with the default queue", (unsigned)hr);
+    swapchain_waitable_ = false;
+    sd.Flags = swapchain_flags();
+    hr = factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd_, &sd, nullptr, nullptr, &sc1);
+  }
+  check(hr, "swapchain");
+  check(sc1.As(&swapchain_), "swapchain3");
+  factory_->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
+  if (swapchain_waitable_) {
+    ComPtr<IDXGISwapChain2> sc2;
+    if (SUCCEEDED(swapchain_.As(&sc2))) {
+      const HRESULT latency_hr = sc2->SetMaximumFrameLatency(1);
+      if (FAILED(latency_hr)) host::log("d3d12: SetMaximumFrameLatency(1) failed (0x%08X)", (unsigned)latency_hr);
+      frame_latency_waitable_ = sc2->GetFrameLatencyWaitableObject();
+    }
+    if (frame_latency_waitable_) host::log("d3d12: waitable swap chain, at most one frame in line for the display");
+    else host::log("d3d12: frame latency waitable object unavailable on this swap chain; presenting with the default queue");
+  }
+}
+
+// Blocks until DXGI has room for another presented frame (at most one in line, see
+// swapchain_waitable_). Called before a presented frame is recorded, so a GPU that falls behind
+// stalls the render thread here instead of stacking frames of input delay in the queue. A wait
+// that fails or keeps timing out gives up for the session rather than slowing the game to the
+// timeout, and says so once.
+void D3D12Backend::wait_frame_latency() {
+  if (!frame_latency_waitable_) return;
+  const DWORD result = [&] { host::perf::Scope wait_cost(host::perf::Stage::Wait);
+    return WaitForSingleObjectEx(frame_latency_waitable_, 100, FALSE); }();
+  if (result == WAIT_OBJECT_0) { waitable_timeouts_ = 0; return; }
+  if (result == WAIT_TIMEOUT) {
+    if (++waitable_timeouts_ < 3) return;
+    host::log("d3d12: frame latency wait timed out three frames in a row; presenting with the default queue from now on");
+  } else {
+    host::log("d3d12: frame latency wait failed (%lu, error %lu); presenting with the default queue from now on", (unsigned long)result, (unsigned long)GetLastError());
+  }
+  CloseHandle(frame_latency_waitable_);
+  frame_latency_waitable_ = nullptr;
+}
+
+void D3D12Backend::create_swapchain_targets(bool resize) {
+  fg_presenter_wait();
+  for (auto& b : backbuffers_) b.Reset();
+  if (resize) {
+    const HRESULT hr = swapchain_->ResizeBuffers(3, client_w_, client_h_, backbuffer_format_, swapchain_flags());
+    // DXGI refuses a resize in the middle of a fullscreen change (seen on a laptop in exclusive
+    // fullscreen) with INVALID_CALL and leaves the old buffers as they were. Keep drawing at their
+    // size; the next size change asks again. Anything else (a lost device) still stops.
+    if (hr == DXGI_ERROR_INVALID_CALL) {
+      DXGI_SWAP_CHAIN_DESC1 desc{};
+      swapchain_->GetDesc1(&desc);
+      host::log("d3d12: resize to %dx%d refused (0x%08X); keeping %ux%u until the next size change",
+                client_w_, client_h_, (unsigned)hr, desc.Width, desc.Height);
+      client_w_ = (int)desc.Width; client_h_ = (int)desc.Height;
+    } else {
+      check(hr, "resize");
+    }
+  }
+  for (UINT i = 0; i < 3; ++i) {
+    check(swapchain_->GetBuffer(i, IID_PPV_ARGS(&backbuffers_[i])), "backbuffer");
+    D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += i * rtv_size_;
+    device_->CreateRenderTargetView(backbuffers_[i].Get(), nullptr, h);
+  }
+}
+
+void D3D12Backend::apply_fullscreen_mode() {
+  fg_presenter_wait();
+  // Every embedded window, child or toplevel: a settings change (Internal resolution) used to reach
+  // ResizeTarget/SetFullscreenState here in child embeds and leave the picture monitor-sized and cropped.
+
+  if (!swapchain_) return;
+  BOOL was_exclusive = FALSE;
+  swapchain_->GetFullscreenState(&was_exclusive, nullptr);
+  fullscreen_state_.exclusive_active = was_exclusive != FALSE;
+  // Exclusive fullscreen needs a swap chain without the frame latency waitable object, and a swap
+  // chain cannot change that after it is made. Making a second one for the same window in the
+  // middle of a session was refused on players' machines ("Access is denied": the first one is
+  // still held), which stopped the game. So a session that started windowed or borderless shows
+  // borderless fullscreen when exclusive is switched on, and exclusive starts with the next launch,
+  // where the swap chain is made for it from the beginning.
+  if (opts_.exclusive_fullscreen && swapchain_waitable_ && !exclusive_deferred_) {
+    exclusive_deferred_ = true;
+    host::log("d3d12: exclusive fullscreen starts with the next launch; borderless fullscreen for the rest of this session");
+  }
+  if (!opts_.exclusive_fullscreen) exclusive_deferred_ = false;
+  const bool want_exclusive = opts_.exclusive_fullscreen && !exclusive_deferred_;
+  if ((was_exclusive != FALSE) == want_exclusive) {
+    if (!want_exclusive) host::window_set_fullscreen(fullscreen_state_.borderless(opts_, exclusive_deferred_));
+    return;
+  }
+  pause_frame_generation_for_resize();
+  wait_gpu();
+  for (auto& buffer : backbuffers_) buffer.Reset();
+  if (was_exclusive) {
+    HRESULT hr = swapchain_->SetFullscreenState(FALSE, nullptr);
+    fullscreen_state_.exclusive_active = FAILED(hr);
+    if (FAILED(hr)) host::log("d3d12: leaving exclusive fullscreen failed (0x%08X)", (unsigned)hr);
+  }
+  if (host::window_is_fullscreen()) host::window_set_fullscreen(false);
+  // The frame latency waitable object is not allowed in exclusive fullscreen (SetFullscreenState
+  // refuses a swap chain created with the flag), so the swap chain is made again without it on the
+  // way in, and with it again on the way out. DXGI allows one flip-model swap chain per window, so
+  // the old one is released first; the GPU is idle from the wait above.
+  // The swap chain is never made again here (see above). A session that started in exclusive
+  // fullscreen keeps its swap chain without the waitable object after leaving it: the frame slots
+  // hold the queue, as they do in exclusive.
+  if (want_exclusive) {
+    ComPtr<IDXGIOutput> output;
+    DXGI_OUTPUT_DESC desc{};
+    if (SUCCEEDED(swapchain_->GetContainingOutput(&output)) && SUCCEEDED(output->GetDesc(&desc))) {
+      DXGI_MODE_DESC mode{};
+      mode.Width = (UINT)(desc.DesktopCoordinates.right - desc.DesktopCoordinates.left);
+      mode.Height = (UINT)(desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top);
+      mode.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      if (mode.Width >= 320 && mode.Height >= 240) {
+        gx::pick_paced_mode(output.Get(), opts_.fps_cap, mode);
+        swapchain_->ResizeTarget(&mode);
+      }
+    }
+    HRESULT hr;
+    fullscreen_state_.enter_exclusive([&] {
+      hr = swapchain_->SetFullscreenState(TRUE, nullptr);
+      return SUCCEEDED(hr);
+    });
+    if (FAILED(hr)) {
+      host::log("d3d12: exclusive fullscreen unavailable (0x%08X); using borderless fullscreen", (unsigned)hr);
+      host::window_set_fullscreen(fullscreen_state_.borderless(opts_));
+      RECT client{}; if (GetClientRect(hwnd_, &client)) { client_w_ = client.right; client_h_ = client.bottom; }
+    } else {
+      ComPtr<IDXGIOutput> output;
+      DXGI_OUTPUT_DESC desc{};
+      if (SUCCEEDED(swapchain_->GetContainingOutput(&output)) && SUCCEEDED(output->GetDesc(&desc))) {
+        client_w_ = desc.DesktopCoordinates.right - desc.DesktopCoordinates.left;
+        client_h_ = desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top;
+      } else host::window_client_size(&client_w_, &client_h_);
+    }
+  } else {
+    host::window_set_fullscreen(opts_.fullscreen);
+    RECT client{}; if (GetClientRect(hwnd_, &client)) { client_w_ = client.right; client_h_ = client.bottom; }
+  }
+  client_w_ = std::max(client_w_, 1); client_h_ = std::max(client_h_, 1);
+  create_swapchain_targets(true);
+  if (pick_scale() != scale_) {
+    host::log("d3d12: fullscreen transition changes internal scale %d -> %d", scale_, pick_scale());
+    drop_efb_copies(); create_efb();
+  }
+}
+
+// Mirrors Dolphin Renderer::CalculateTargetSize: an explicit multiplier, or (auto) the smallest
+// integer multiplier whose scaled 640x480 visible area covers the 4:3 output rectangle in the window.
+int D3D12Backend::pick_scale(bool with_ssaa) const {
+  constexpr int max_scale = 16384 / EFB_WIDTH;   // D3D12 texture limit
+  if (forced_scale_ > 0) return std::clamp(forced_scale_, 1, max_scale);
+  const int ssaa = with_ssaa ? std::clamp(opts_.ssaa, 1, 4) : 1;
+  if (opts_.efb_scale > 0) return std::clamp(opts_.efb_scale * ssaa, 1, max_scale);
+  float ww = (float)std::max(client_w_, 1), wh = (float)std::max(client_h_, 1);
+  float aspect = output_aspect();
+  float vw = ww, vh = ww / aspect;
+  if (vh > wh) { vh = wh; vw = wh * aspect; }
+  int s = std::max((int)std::ceil(vw / (480.0f * aspect)), (int)std::ceil(vh / 480.0f));
+  return std::clamp(s * ssaa, 1, max_scale);
+}
+
+// The game renders the same 640x480 field either way, but its camera asks for a 73:60 frustum, and
+// Slippi's widescreen code widens that to exactly 16:9. See presented_aspect in gx_d3d12.h.
+float D3D12Backend::output_aspect() const { return presented_aspect(opts_, client_w_, client_h_, widenable_scene_); }
+
+void D3D12Backend::create_efb() {
+  scale_ = pick_scale();
+  efb_w_ = EFB_WIDTH * scale_; efb_h_ = EFB_HEIGHT * scale_;
+  host::log("d3d12: internal resolution %dx%d (EFB x%d, window %dx%d)", efb_w_, efb_h_, scale_, client_w_, client_h_);
+  D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+  D3D12_RESOURCE_DESC rd{};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = efb_w_; rd.Height = efb_h_; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+  rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 1}};
+  check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&efb_color_)), "efb color");
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += 3 * rtv_size_;
+  device_->CreateRenderTargetView(efb_color_.Get(), nullptr, rtv);
+  // Typeless with a D32 view: Streamline copies depth for frame generation and cannot size a
+  // depth-only D32_FLOAT resource ("Don't know the size for resource ... native 40").
+  rd.Format = DXGI_FORMAT_R32_TYPELESS; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  D3D12_CLEAR_VALUE dv{DXGI_FORMAT_D32_FLOAT}; dv.DepthStencil.Depth = 0.0f;
+  check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dv, IID_PPV_ARGS(&efb_depth_)), "efb depth");
+  D3D12_DEPTH_STENCIL_VIEW_DESC dsvd{}; dsvd.Format = DXGI_FORMAT_D32_FLOAT; dsvd.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  device_->CreateDepthStencilView(efb_depth_.Get(), &dsvd, dsv_heap_->GetCPUDescriptorHandleForHeapStart());
+  rd.Format = DXGI_FORMAT_R16G16_FLOAT; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_CLEAR_VALUE mv{DXGI_FORMAT_R16G16_FLOAT, {0, 0, 0, 0}};
+  check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &mv, IID_PPV_ARGS(&mvec_)), "motion vectors");
+  D3D12_CPU_DESCRIPTOR_HANDLE mrtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); mrtv.ptr += 5 * rtv_size_;
+  device_->CreateRenderTargetView(mvec_.Get(), nullptr, mrtv);
+  rd.Format = DXGI_FORMAT_R8_UNORM;
+  D3D12_CLEAR_VALUE hv{DXGI_FORMAT_R8_UNORM, {0, 0, 0, 0}};
+  check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &hv, IID_PPV_ARGS(&hud_mask_)), "hud mask");
+  D3D12_CPU_DESCRIPTOR_HANDLE hrtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); hrtv.ptr += 6 * rtv_size_;
+  device_->CreateRenderTargetView(hud_mask_.Get(), nullptr, hrtv);
+  msaa_samples_ = msaa_wanted();
+  msaa_applied_ = opts_.msaa;
+  msaa_color_.Reset(); msaa_depth_.Reset();
+  if (msaa_samples_ > 1) {
+    D3D12_RESOURCE_DESC md = rd;
+    md.SampleDesc.Count = msaa_samples_; md.Format = DXGI_FORMAT_R8G8B8A8_UNORM; md.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv, IID_PPV_ARGS(&msaa_color_)), "msaa color");
+    D3D12_CPU_DESCRIPTOR_HANDLE mrt = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); mrt.ptr += 8 * rtv_size_;
+    device_->CreateRenderTargetView(msaa_color_.Get(), nullptr, mrt);
+    md.Format = DXGI_FORMAT_R32_TYPELESS; md.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &md, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dv, IID_PPV_ARGS(&msaa_depth_)), "msaa depth");
+    D3D12_DEPTH_STENCIL_VIEW_DESC mdv{}; mdv.Format = DXGI_FORMAT_D32_FLOAT; mdv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DMS;
+    D3D12_CPU_DESCRIPTOR_HANDLE mds = dsv_heap_->GetCPUDescriptorHandleForHeapStart(); mds.ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    device_->CreateDepthStencilView(msaa_depth_.Get(), &mdv, mds);
+    host::log("d3d12: %ux MSAA", msaa_samples_);
+  }
+  last_poses_.clear(); dlss_reset_ = true;
+  efb_is_rt_ = true;
+}
+
+// The MSAA the settings ask for, if this GPU has it for the EFB formats; 1 under DLSS/FSR, which
+// read the EFB themselves (as Anti-aliasing SSAA is set aside there).
+uint32_t D3D12Backend::msaa_wanted() const {
+  if (opts_.msaa <= 1 || opts_.dlss_mode) return 1;
+  for (uint32_t n = (uint32_t)std::min(opts_.msaa, 8); n > 1; n /= 2) {
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS c{DXGI_FORMAT_R8G8B8A8_UNORM, n}, d{DXGI_FORMAT_D32_FLOAT, n};
+    if (SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &c, sizeof c)) && c.NumQualityLevels &&
+        SUCCEEDED(device_->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &d, sizeof d)) && d.NumQualityLevels) return n;
+  }
+  return 1;
+}
+
+// Colour by the hardware resolve, depth by a pass that copies sample 0 into the single-sample
+// depth (D3D12 resolves no depth formats). Leaves the MSAA targets bound again.
+// The blit pipeline for drawing into the EFB itself (video backgrounds): MSAA needs one with the
+// EFB's sample count.
+ID3D12PipelineState* D3D12Backend::efb_blit_pso() {
+  if (!msaa_on()) return blit_pso_.Get();
+  if (blit_msaa_samples_ != msaa_samples_) {
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = blit_root_.Get();
+    pd.VS = {blit_vs_blob_->GetBufferPointer(), blit_vs_blob_->GetBufferSize()}; pd.PS = {blit_ps_blob_->GetBufferPointer(), blit_ps_blob_->GetBufferSize()};
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID; pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE; pd.RasterizerState.DepthClipEnable = TRUE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; pd.SampleDesc.Count = msaa_samples_;
+    blit_msaa_pso_.Reset();
+    if (FAILED(device_->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&blit_msaa_pso_)))) return nullptr;
+    blit_msaa_samples_ = msaa_samples_;
+  }
+  return blit_msaa_pso_.Get();
+}
+
+void D3D12Backend::resolve_efb() {
+  if (!msaa_on()) return;
+  D3D12_RESOURCE_BARRIER b[3]{};
+  for (auto& x : b) x.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b[0].Transition = {msaa_color_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_SOURCE};
+  b[1].Transition = {efb_color_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_DEST};
+  b[2].Transition = {msaa_depth_.Get(), 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  list_->ResourceBarrier(3, b);
+  list_->ResolveSubresource(efb_color_.Get(), 0, msaa_color_.Get(), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+  if (depth_resolve_pso_) {
+    const uint32_t slot = reserve_srvs(4);
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = srv_heap_->GetCPUDescriptorHandleForHeapStart(); cpu.ptr += slot * srv_size_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC v{}; v.Format = DXGI_FORMAT_R32_FLOAT; v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    for (int k = 0; k < 4; ++k) { D3D12_CPU_DESCRIPTOR_HANDLE h = cpu; h.ptr += k * srv_size_; device_->CreateShaderResourceView(msaa_depth_.Get(), &v, h); }
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu = srv_heap_->GetGPUDescriptorHandleForHeapStart(); gpu.ptr += slot * srv_size_;
+    D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+    list_->OMSetRenderTargets(0, nullptr, FALSE, &dsv);
+    D3D12_VIEWPORT vp{0, 0, (float)efb_w_, (float)efb_h_, 0, 1}; D3D12_RECT sc{0, 0, (LONG)efb_w_, (LONG)efb_h_};
+    list_->RSSetViewports(1, &vp); list_->RSSetScissorRects(1, &sc);
+    list_->SetPipelineState(depth_resolve_pso_.Get());
+    list_->SetGraphicsRootSignature(blit_root_.Get());
+    list_->SetGraphicsRootDescriptorTable(0, gpu);
+    list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list_->DrawInstanced(3, 1, 0, 0);
+  }
+  for (auto& x : b) std::swap(x.Transition.StateBefore, x.Transition.StateAfter);
+  list_->ResourceBarrier(3, b);
+  bind_efb_targets();
+}
+
+void D3D12Backend::bind_efb_targets() {
+  D3D12_CPU_DESCRIPTOR_HANDLE rtvs[3];
+  rtvs[0] = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtvs[0].ptr += 3 * rtv_size_;
+  rtvs[1] = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtvs[1].ptr += 5 * rtv_size_;
+  rtvs[2] = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtvs[2].ptr += 6 * rtv_size_;
+  D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+  if (msaa_on()) {
+    rtvs[0] = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtvs[0].ptr += 8 * rtv_size_;
+    dsv.ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+    list_->OMSetRenderTargets(1, rtvs, FALSE, &dsv);
+    return;
+  }
+  list_->OMSetRenderTargets(mvec_out() ? 3 : 1, rtvs, FALSE, &dsv);
+}
+
+void D3D12Backend::output_size(int* vw, int* vh) const {
+  float ww = (float)std::max(client_w_, 1), wh = (float)std::max(client_h_, 1);
+  float aspect = output_aspect();
+  float w = ww, h = ww / aspect;
+  if (h > wh) { h = wh; w = wh * aspect; }
+  *vw = std::max(1, (int)w); *vh = std::max(1, (int)h);
+}
+
+// Reconciles the DLSS mode with the window: picks the integer EFB scale whose render size fits
+// the mode's optimal/allowed range, allocates the output texture and tells Streamline.
+void D3D12Backend::set_dlss_mip_bias(float bias) {
+  if (bias == dlss_mip_bias_) return;
+  dlss_mip_bias_ = bias;
+  sampler_sets_.clear();   // samplers carry the bias: build them again on next use
+  host::log("dlss: texture LOD bias %.2f", bias);
+}
+
+
+void D3D12Backend::update_vram() {
+  DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+  if (FAILED(adapter3_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) return;
+  g_vram_used = (float)(info.CurrentUsage / 1073741824.0);
+  g_vram_budget = (float)(info.Budget / 1073741824.0);
+  // The local segment group is dedicated plus shared memory on integrated graphics, so this is the
+  // whole allowance there. "Tight" is past 85 percent of a small one.
+  vram_usage_bytes_ = info.CurrentUsage; vram_budget_bytes_ = info.Budget;
+  vram_tight_ = info.Budget && info.Budget <= SMALL_VRAM_BUDGET && info.CurrentUsage > info.Budget / 100 * 85;
+}
+
+// Once a second at most: keeps the game texture cache inside texture_budget_bytes_ by dropping the
+// textures drawn longest ago first (never one this frame has used), and while video memory is
+// tight on a small adapter (see update_vram) also drops everything nothing has drawn for
+// TEXTURE_IDLE_FRAMES frames. Runs at the top of a frame, before anything is recorded. Earlier
+// frames still on the GPU may sample these, so they go to this slot's garbage and are released
+// when the slot comes round again, exactly as swap_in_ready_replacements does; a texture drawn
+// again later is simply decoded and uploaded again. The out-of-memory retry (free_video_memory)
+// is separate and unchanged: this is the budget, that is the emergency.
+void D3D12Backend::trim_textures() {
+  const double now = Stopwatch::now();
+  if (now - texture_trim_time_ < 1.0) return;
+  texture_trim_time_ = now;
+  // Retries that have come due are forgotten here too: a texture that was refused and never drawn
+  // again (its contents changed) otherwise left its key behind for good.
+  for (auto it = texture_retry_frame_.begin(); it != texture_retry_frame_.end();)
+    if (it->second <= frame_counter_) it = texture_retry_frame_.erase(it); else ++it;
+  if (vram_tight_ || efb_copies_.size() > EFB_COPIES_KEPT) {
+    // Idle EFB copies (see EFB_COPY_IDLE_FRAMES). A draw that samples the address later falls back
+    // to the game's own texture data until the game copies there again, as before the first copy.
+    const uint64_t idle = vram_tight_ ? TEXTURE_IDLE_FRAMES : EFB_COPY_IDLE_FRAMES;
+    uint32_t copies = 0;
+    for (auto it = efb_copies_.begin(); it != efb_copies_.end();) {
+      if (it->second.last_used + idle >= frame_counter_) { ++it; continue; }
+      if (it->second.resource) frame_garbage_[slot_].push_back(it->second.resource);
+      it = efb_copies_.erase(it); ++copies;
+    }
+    if (copies) {
+      texture_sets_.clear();   // descriptor tables name resources by pointer
+      host::log("d3d12: %u idle EFB copy textures freed, %zu kept", copies, efb_copies_.size());
+    }
+  }
+  uint64_t cached = 0;
+  for (const auto& entry : textures_) cached += texture_bytes(entry.second.width, entry.second.height, entry.second.levels);
+  texture_cache_bytes_ = cached;
+  if (!vram_tight_ && cached <= texture_budget_bytes_) return;
+  uint32_t dropped = 0, idle_dropped = 0;
+  uint64_t freed = 0;
+  auto drop = [&](std::unordered_map<uint64_t, TextureEntry>::iterator it) {
+    freed += texture_bytes(it->second.width, it->second.height, it->second.levels);
+    replacement_bytes_ -= std::min(replacement_bytes_, it->second.replacement_bytes);
+    frame_garbage_[slot_].push_back(it->second.resource);
+    ++dropped;
+    return textures_.erase(it);
+  };
+  if (vram_tight_) {
+    for (auto it = textures_.begin(); it != textures_.end();) {
+      if (it->second.last_used + TEXTURE_IDLE_FRAMES >= frame_counter_) { ++it; continue; }
+      it = drop(it); ++idle_dropped;
+    }
+  }
+  if (cached - freed > texture_budget_bytes_) {
+    // Least recently drawn first, down to a tenth under the budget so this does not run every second.
+    std::vector<std::pair<uint64_t, uint64_t>> order;   // (last_used, key)
+    order.reserve(textures_.size());
+    for (const auto& entry : textures_)
+      if (entry.second.last_used != frame_counter_) order.emplace_back(entry.second.last_used, entry.first);
+    std::sort(order.begin(), order.end());
+    const uint64_t target = texture_budget_bytes_ - texture_budget_bytes_ / 10;
+    for (const auto& candidate : order) {
+      if (cached - freed <= target) break;
+      auto it = textures_.find(candidate.second);
+      if (it != textures_.end()) drop(it);
+    }
+  }
+  if (!dropped) return;
+  texture_cache_bytes_ = cached - freed;
+  texture_sets_.clear();   // descriptor tables name resources by pointer
+  host::log("d3d12: texture cache %.0f of %.0f MB budget (video memory %.2f of %.2f GB); %u textures freed (%.0f MB, %u idle), %zu kept",
+            cached / 1048576.0, texture_budget_bytes_ / 1048576.0, vram_usage_bytes_ / 1073741824.0, vram_budget_bytes_ / 1073741824.0,
+            dropped, freed / 1048576.0, idle_dropped, textures_.size());
+}
+
+// An allocation has just failed for lack of video memory. Frees cached game textures, the ones
+// drawn longest ago first, until about four times `bytes` (64 MB at least) has gone, and returns
+// how many. Unlike the trim this must give the memory back now, so it waits for the GPU to finish
+// every submitted frame and releases directly. The command list being recorded has not been
+// submitted, so the wait does not cover it: a texture used in the current frame (last_used ==
+// frame_counter_, which every lookup and creation this frame sets) is never touched, and neither is
+// this slot's garbage, which the list may still name.
+uint32_t D3D12Backend::free_video_memory(uint64_t bytes) {
+  wait_gpu();
+  for (int i = 0; i < FRAME_SLOTS; ++i) if (i != slot_) frame_garbage_[i].clear();   // retired in frames that are now complete
+  for (auto it = texture_retry_frame_.begin(); it != texture_retry_frame_.end();)   // forget retries that have come due
+    if (it->second <= frame_counter_) it = texture_retry_frame_.erase(it); else ++it;
+  std::vector<std::pair<uint64_t, uint64_t>> idle;   // (last_used, key)
+  idle.reserve(textures_.size());
+  for (const auto& entry : textures_)
+    if (entry.second.last_used != frame_counter_) idle.emplace_back(entry.second.last_used, entry.first);
+  std::sort(idle.begin(), idle.end());
+  const uint64_t want = std::max<uint64_t>(bytes * 4, 64ull * 1024 * 1024);
+  uint64_t freed_bytes = 0;
+  uint32_t freed = 0;
+  for (const auto& candidate : idle) {
+    if (freed_bytes >= want) break;
+    auto it = textures_.find(candidate.second);
+    if (it == textures_.end()) continue;
+    freed_bytes += texture_bytes(it->second.width, it->second.height, it->second.levels);
+    replacement_bytes_ -= std::min(replacement_bytes_, it->second.replacement_bytes);
+    textures_.erase(it);
+    ++freed;
+  }
+  // EFB copies nothing has written or sampled for a while go too: they are the largest textures
+  // held and were never part of this. The copy being made now is marked used before it gets here.
+  for (auto it = efb_copies_.begin(); it != efb_copies_.end();) {
+    if (it->second.last_used + TEXTURE_IDLE_FRAMES >= frame_counter_) { ++it; continue; }
+    it = efb_copies_.erase(it); ++freed;
+  }
+  if (freed) texture_sets_.clear();   // descriptor tables name resources by pointer
+  return freed;
+}
+
+// The out-of-memory lines are worth one a second, not one per failed texture.
+bool D3D12Backend::oom_log_due() {
+  const double now = Stopwatch::now();
+  if (now - oom_log_time_ < 1.0) return false;
+  oom_log_time_ = now;
+  return true;
+}
+
+bool D3D12Backend::free_memory_for_ring(void* self, uint64_t bytes) {
+  D3D12Backend* backend = static_cast<D3D12Backend*>(self);
+  const uint32_t freed = backend->free_video_memory(bytes);
+  if (backend->oom_log_due())
+    host::log("d3d12: out of video memory growing an upload buffer by %.0f MB; %u cached textures freed", bytes / 1048576.0, freed);
+  return true;   // the wait alone may have released retired resources
+}
+
+
+void D3D12Backend::configure_dlss() {
+  // Only matches use the upscaler. Keep its target at the match aspect even on a title/menu
+  // frame: changing back to the menu's 4:3 target discarded the feature we warmed at startup.
+  const bool saved_widenable = widenable_scene_;
+  widenable_scene_ = true;
+  int vw, vh; output_size(&vw, &vh);
+  widenable_scene_ = saved_widenable;
+  bool want = opts_.dlss_mode != 0 && upscaler_available();
+  if (!want) {
+    if (dlss_active_ || forced_scale_) {
+      wait_gpu(); dlss_active_ = false; dlss_in_place_ = false; dlss_mode_active_ = 0; forced_scale_ = 0; dlss_out_.Reset(); dlss_out_w_ = dlss_out_h_ = 0;
+      set_dlss_mip_bias(0.0f);
+      streamline::dlss_set_options(DlssMode::Off, vw, vh);
+      if (pick_scale() != scale_) { host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); }
+      host::log("dlss: off (native rendering at EFB x%d)", scale_);
+    }
+    return;
+  }
+  const bool in_place = (DlssMode)opts_.dlss_mode == DlssMode::DLAA || fsr::is_in_place(opts_.dlss_mode);
+  // DLAA only accepts a render size equal to its output size. The EFB is always a 640x480 multiple,
+  // which can never equal a 16:9 window, so asking for a window-sized DLAA output left the render
+  // larger than the mode's own maximum and it produced an empty image (a black screen). Anti-alias
+  // the EFB in place instead, at the scale the player chose, and let the present blit letterbox it.
+  int out_w = vw, out_h = vh, in_place_scale = 0;
+  // The upscaling modes output at the size native rendering would use (the EFB multiple the player's
+  // resolution setting picks, 3x at 1080p), and the present blit shrinks that to the window exactly as
+  // it does native. Output at the window size, DLSS had nothing to supersample and looked soft next to
+  // native for the same render cost. Kept as an experiment: MELEE_DLSS_SUPERSAMPLE=1.
+  // Off by default: measured no visible gain over window-sized output, only more GPU work.
+  const char* supersample = std::getenv("MELEE_DLSS_SUPERSAMPLE");
+  if (!in_place && supersample && *supersample == '1') {
+    const int saved = forced_scale_;
+    forced_scale_ = 0;
+    const int native_scale = pick_scale();
+    forced_scale_ = saved;
+    const double k = std::max(1.0, (480.0 * native_scale) / (double)std::max(vh, 1));
+    out_w = (int)std::lround(vw * k); out_h = (int)std::lround(vh * k);
+  }
+  if (in_place) {
+    // pick_scale() reports any scale a previous mode forced, so clear it first to get the EFB scale
+    // the player actually chose (switching straight from DLSS Quality to DLAA would otherwise size
+    // DLAA from the scale Quality had forced).
+    // DLAA is the anti-aliasing: supersampling under it doubled the render size in each direction
+    // and so quadrupled the DLAA pass (a 10-17 report: 55 fps at EFB x6 with scale 3 and SSAA 2 on a
+    // 1080p screen, the same on every version back to 0.8.78). DLAA renders at the scale the player
+    // chose, without the SSAA factor.
+    const int saved = forced_scale_;
+    forced_scale_ = 0;
+    in_place_scale = pick_scale(false);
+    forced_scale_ = saved;
+    out_w = EFB_WIDTH * in_place_scale; out_h = EFB_HEIGHT * in_place_scale;
+  }
+  if (dlss_active_ && dlss_mode_active_ == opts_.dlss_mode &&
+      (int)dlss_out_w_ == out_w && (int)dlss_out_h_ == out_h) return;
+  uint32_t rw = 0, rh = 0, min_w = 0, min_h = 0, max_w = 0, max_h = 0;
+  const bool sized = fsr_active() ? fsr::optimal_size(opts_.dlss_mode, (uint32_t)out_w, (uint32_t)out_h, &rw, &rh, &min_w, &min_h, &max_w, &max_h)
+      : streamline::dlss_optimal_size((DlssMode)opts_.dlss_mode, (uint32_t)out_w, (uint32_t)out_h, &rw, &rh, &min_w, &min_h, &max_w, &max_h);
+  if (!sized) {
+    host::log("dlss: optimal settings unavailable, staying native"); opts_.dlss_mode = 0; return;
+  }
+  int scale;
+  if (in_place) {
+    // DLAA is handed the whole EFB and writes an image the same size, so the render size is the EFB
+    // itself (640x528 per step), not the 640x480 visible region the upscaling modes feed it. Running
+    // the multiplier arithmetic below on a 480-tall assumption made the height constraint
+    // unsatisfiable and DLAA never ran at all; the scale is simply the one the player chose.
+    scale = in_place_scale;
+    if ((min_w && (uint32_t)out_w < min_w) || (min_h && (uint32_t)out_h < min_h) ||
+        (max_w && (uint32_t)out_w > max_w) || (max_h && (uint32_t)out_h > max_h)) {
+      host::log("dlss: DLAA cannot render %dx%d (it accepts %ux%u to %ux%u); staying native",
+                out_w, out_h, min_w, min_h, max_w, max_h);
+      opts_.dlss_mode = 0; return;
+    }
+  } else {
+    // Smallest integer EFB multiplier whose 640x480 visible region reaches the optimal size, within
+    // the allowed range. The upscaling modes are fed that region, not the full EFB.
+    scale = std::max(1, (int)std::ceil(std::max(rw / 640.0, rh / 480.0)));
+    while (scale > 1 && ((max_w && 640u * scale > max_w) || (max_h && 480u * scale > max_h))) --scale;
+    if (min_w && 640u * scale < min_w) scale = (int)((min_w + 639) / 640);
+    if (min_h && 480u * scale < min_h) scale = std::max(scale, (int)((min_h + 479) / 480));
+    // Raising the scale to reach the minimum can push it back past the maximum: when no multiplier
+    // satisfies both, the mode cannot run at this output size, so stay native rather than render blind.
+    if ((max_w && 640u * scale > max_w) || (max_h && 480u * scale > max_h) ||
+        640u * scale > (uint32_t)out_w || 480u * scale > (uint32_t)out_h) {
+      host::log("dlss: %s needs a render size between %ux%u and %ux%u for a %dx%d output and no EFB multiple fits",
+                upscaler_name(), min_w, min_h, max_w, max_h, out_w, out_h);
+      // Ultra Performance renders at exactly a third of the output, which is below the GameCube's
+      // own 640x480 at any display under 8K, so it can almost never fit. Step up to Performance
+      // (what it would have looked like anyway) instead of dropping all the way to native.
+      if (opts_.dlss_mode == (int)DlssMode::UltraPerformance) {
+        host::log("dlss: using Performance instead");
+        opts_.dlss_mode = (int)DlssMode::Performance;
+        configure_dlss();
+        return;
+      }
+      if (opts_.dlss_mode == fsr::kLastMode) {   // FSR Ultra Performance: the same as DLSS's
+        host::log("fsr: using FSR Performance instead");
+        opts_.dlss_mode = fsr::kLastMode - 1;
+        configure_dlss();
+        return;
+      }
+      host::log("dlss: staying native");
+      opts_.dlss_mode = 0; return;
+    }
+  }
+  pause_frame_generation_for_resize();
+  wait_gpu();
+  forced_scale_ = scale;
+  if (pick_scale() != scale_) { host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); }
+  if (!dlss_out_ || (int)dlss_out_w_ != out_w || (int)dlss_out_h_ != out_h) {
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = out_w; rd.Height = out_h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    dlss_out_.Reset();
+    check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&dlss_out_)), "dlss output");
+    dlss_out_w_ = out_w; dlss_out_h_ = out_h;
+  }
+  const bool configured = fsr_active() ? fsr::set_options(opts_.dlss_mode, (uint32_t)out_w, (uint32_t)out_h)
+                                        : streamline::dlss_set_options((DlssMode)opts_.dlss_mode, (uint32_t)out_w, (uint32_t)out_h);
+  if (!configured) { opts_.dlss_mode = 0; forced_scale_ = 0; dlss_active_ = false; return; }
+  dlss_active_ = true; dlss_in_place_ = in_place; dlss_mode_active_ = opts_.dlss_mode; dlss_reset_ = true; fsr_reset_ = true; last_poses_.clear();
+  // NVIDIA's texture LOD bias for DLSS: log2(render / display) - 1. The -1 samples textures as if at
+  // the output resolution so DLSS has the detail to reconstruct; without it faces and cloth came out
+  // soft next to native. DLAA renders at the output size, so its bias is the -1 alone.
+  // MELEE_DLSS_BIAS_EXTRA overrides the -1 for testing.
+  float bias_extra = -1.0f;
+  if (const char* e = std::getenv("MELEE_DLSS_BIAS_EXTRA")) bias_extra = (float)std::atof(e);
+  set_dlss_mip_bias((in_place ? 0.0f : std::log2((640.0f * scale) / (float)out_w)) + bias_extra);
+  if (in_place && opts_.ssaa > 1)
+    host::log("dlss: supersampling is not applied under %s (it anti-aliases already)", upscaler_name());
+  host::log("dlss: %s, render %dx%d (EFB x%d, optimal %ux%u) -> %s %dx%d%s", upscaler_name(),
+            in_place ? out_w : 640 * scale, in_place ? out_h : 480 * scale, scale, rw, rh,
+            in_place ? "anti-aliased in place at" : "output", out_w, out_h, in_place ? ", letterboxed to the window by the present blit" : "");
+}
+
+void D3D12Backend::pause_frame_generation_for_resize() {
+  // DLSS-G retains its resources between matches. It must stop using the old
+  // depth/motion sizes before a window or EFB resize, and receive the new sizes
+  // even when the player's generation multiplier did not change.
+  if (fg_applied_ > 0) {
+    streamline::set_frame_generation(0, (uint32_t)efb_w_, (uint32_t)efb_h_,
+      (uint32_t)client_w_, (uint32_t)client_h_, 3, (uint32_t)backbuffer_format_,
+      (uint32_t)DXGI_FORMAT_R16G16_FLOAT, (uint32_t)DXGI_FORMAT_R32_FLOAT);
+  }
+  fg_applied_ = -1;
+}
+
+// FSR frame generation runs with an FSR mode in Direct3D 12, Frame generation on, AMD's frame
+// generation DLL loaded, and the 8-bit picture.
+bool D3D12Backend::fsr_fg_wanted() const {
+  return opts_.frame_generation_mode > 0 && fsr_active() && dlss_active_ && dlss_out_ && fsr::fg_available() &&
+         !hdr_active_ && !fsr_fg_failed_;   // its rendered-picture copy is 8-bit SDR
+}
+
+// Each frame before the draws: makes the generated picture, the rendered picture and AMD's context
+// for the current picture and window sizes (the GPU idle first, only when one changes), releases
+// them when generation stops, and decides whether this frame generates (a match, a shown frame).
+void D3D12Backend::update_fsr_frame_generation() {
+  fsr_fg_generated_ = false;   // set by this frame's upscale (present_efb) when it generates
+  if (!fsr_fg_wanted()) {
+    if (fsr_fg_running_) release_fsr_frame_generation();
+    fsr_fg_on_ = false;
+    if (fsr_active()) fg_multiplier_.store(1, std::memory_order_relaxed);
+    return;
+  }
+  const bool sized = fg_out_ && fg_real_ && fsr::fg_ready() &&
+                     fg_out_->GetDesc().Width == dlss_out_w_ && fg_out_->GetDesc().Height == dlss_out_h_ &&
+                     fg_real_->GetDesc().Width == (UINT64)client_w_ && fg_real_->GetDesc().Height == (UINT)client_h_;
+  if (!sized) {
+    fg_presenter_wait();
+    wait_gpu();
+    fg_out_.Reset(); fg_real_.Reset();
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+    rd.Width = dlss_out_w_; rd.Height = dlss_out_h_;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const bool out_ok = SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&fg_out_)));
+    rd.Width = (UINT64)client_w_; rd.Height = (UINT)client_h_;   // the swap chain's size and format, for the copy
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    const bool real_ok = out_ok && SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&fg_real_)));
+    bool list_ok = fg_list_ != nullptr;
+    if (real_ok && !list_ok) {
+      static_assert(sizeof(fg_allocators_) / sizeof(fg_allocators_[0]) == FRAME_SLOTS, "one allocator per frame slot");
+      list_ok = true;
+      for (auto& a : fg_allocators_) list_ok = list_ok && SUCCEEDED(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a)));
+      list_ok = list_ok && SUCCEEDED(device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, fg_allocators_[0].Get(), nullptr, IID_PPV_ARGS(&fg_list_)));
+      if (list_ok) fg_list_->Close();
+      else fg_list_.Reset();
+    }
+    if (!real_ok || !list_ok || !fsr::fg_create(dlss_out_w_, dlss_out_h_, (uint32_t)efb_w_, (uint32_t)efb_h_)) {
+      host::log("fsr: frame generation could not start for a %ux%u picture; it stays off this session", dlss_out_w_, dlss_out_h_);
+      fsr_fg_failed_ = true;
+      release_fsr_frame_generation();
+      return;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE real_rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); real_rtv.ptr += 15 * rtv_size_;
+    device_->CreateRenderTargetView(fg_real_.Get(), nullptr, real_rtv);
+    fsr_fg_prev_frame_ = ~0ull;
+    fsr_fg_interval_ = 0; fsr_fg_last_present_ = 0;
+    if (!fsr_fg_running_)
+      host::log("fsr: frame generation 2x (%s) for a %ux%u picture in a %dx%d window", fsr::fg_provider().empty() ? "AMD FSR" : fsr::fg_provider().c_str(),
+                dlss_out_w_, dlss_out_h_, client_w_, client_h_);
+    fsr_fg_running_ = true;
+  }
+  // Only a running match is generated: menus and results show exactly what was drawn, at the
+  // rendered rate. Nor a frame that is not shown, or a window that cannot be seen.
+  fsr_fg_on_ = in_match_ && dlss_in_match_ && !skip_present_ && !occluded_;
+  fg_multiplier_.store(fsr_fg_on_ ? 2 : 1, std::memory_order_relaxed);
+}
+
+void D3D12Backend::release_fsr_frame_generation() {
+  fg_presenter_wait(); fg_presenter_stop();
+  wait_gpu();
+  fsr::fg_destroy();
+  fg_out_.Reset(); fg_real_.Reset();
+  if (fsr_fg_running_) host::log("fsr: frame generation off");
+  fsr_fg_running_ = fsr_fg_on_ = fsr_fg_generated_ = false;
+  fsr_fg_prev_frame_ = ~0ull;
+  fg_multiplier_.store(1, std::memory_order_relaxed);
+}
+void D3D12Backend::wait_gpu() {
+  ++fence_value_;
+  queue_->Signal(fence_.Get(), fence_value_);
+  if (fence_->GetCompletedValue() < fence_value_) {
+    fence_->SetEventOnCompletion(fence_value_, fence_event_);
+    host::perf::Scope wait_cost(host::perf::Stage::Wait);
+    Stopwatch gpu_wait_sw;
+    WaitForSingleObject(fence_event_, INFINITE);
+    ++slow_.gpu_waits; slow_.gpu_wait_ms += gpu_wait_sw.lap() * 1e3;
+  }
+}
+
+// ---------------- pipelines ----------------
+// Pipeline creation (shader compile + CreateGraphicsPipelineState) can take tens of milliseconds,
+// so outside the startup prewarm it runs on worker threads: the draw that needs a new pipeline is
+// skipped until it is ready (a few presented frames) instead of stalling the renderer and, behind
+// it, the simulation and audio.
+// Everything of a pipeline description that does not depend on the shaders' contents.
+static void describe_pipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC& pd, const PsoKey& key, D3D12_PRIMITIVE_TOPOLOGY_TYPE topo,
+                              ID3D12RootSignature* root, ID3DBlob* vs, ID3DBlob* ps) {
+  static const D3D12_INPUT_ELEMENT_DESC layout[] = {
+    {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"COLOR", 1, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT, 0, 48, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 3, DXGI_FORMAT_R32G32_FLOAT, 0, 56, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 4, DXGI_FORMAT_R32G32_FLOAT, 0, 64, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 5, DXGI_FORMAT_R32G32_FLOAT, 0, 72, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 6, DXGI_FORMAT_R32G32_FLOAT, 0, 80, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 7, DXGI_FORMAT_R32G32_FLOAT, 0, 88, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"BLENDINDICES", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 96, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"BLENDINDICES", 1, DXGI_FORMAT_R8G8B8A8_UINT, 0, 100, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    // Vertex::texmtx[7] at offset 104. Without it texture generator 7 read generator 6's index.
+    {"BLENDINDICES", 2, DXGI_FORMAT_R8_UINT, 0, 104, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+  };
+  pd.pRootSignature = root;
+  pd.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
+  pd.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
+  pd.InputLayout = {layout, _countof(layout)};
+  pd.SampleMask = UINT_MAX;
+  // Blend
+  uint32_t bm = key.blend;
+  bool alpha_in_efb = key.pixel_format == 1;  // RGBA6_Z24
+  static const D3D12_BLEND src_factors[] = {D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR,
+                                            D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA};
+  static const D3D12_BLEND dst_factors[] = {D3D12_BLEND_ZERO, D3D12_BLEND_ONE, D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR,
+                                            D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA, D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA};
+  auto& rt = pd.BlendState.RenderTarget[0];
+  bool blend_enable = bits(bm, 0, 1);
+  uint32_t sf = bits(bm, 8, 3), df = bits(bm, 5, 3);
+  D3D12_BLEND s = src_factors[sf], d = dst_factors[df];
+  if (!alpha_in_efb) {
+    if (s == D3D12_BLEND_DEST_ALPHA) s = D3D12_BLEND_ONE; if (s == D3D12_BLEND_INV_DEST_ALPHA) s = D3D12_BLEND_ZERO;
+    if (d == D3D12_BLEND_DEST_ALPHA) d = D3D12_BLEND_ONE; if (d == D3D12_BLEND_INV_DEST_ALPHA) d = D3D12_BLEND_ZERO;
+  }
+  rt.BlendEnable = blend_enable;
+  rt.SrcBlend = s; rt.DestBlend = d; rt.BlendOp = bits(bm, 11, 1) ? D3D12_BLEND_OP_REV_SUBTRACT : D3D12_BLEND_OP_ADD;
+  rt.SrcBlendAlpha = D3D12_BLEND_ONE; rt.DestBlendAlpha = D3D12_BLEND_ZERO; rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+  rt.RenderTargetWriteMask = (bits(bm, 3, 1) ? (D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE) : 0) |
+                             (bits(bm, 4, 1) ? D3D12_COLOR_WRITE_ENABLE_ALPHA : 0);
+  // Logic op CLEAR/SET etc. are rare; ignore.
+  // Rasterizer
+  static const D3D12_CULL_MODE cull_modes[] = {D3D12_CULL_MODE_NONE, D3D12_CULL_MODE_BACK, D3D12_CULL_MODE_FRONT, D3D12_CULL_MODE_BACK};
+  pd.RasterizerState.FillMode = (key.cull & 4) ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;   // Lightweight 5
+  pd.RasterizerState.CullMode = (key.cull & 4) ? D3D12_CULL_MODE_NONE : cull_modes[key.cull & 3];
+  pd.RasterizerState.FrontCounterClockwise = FALSE;
+  pd.RasterizerState.DepthClipEnable = TRUE;
+  // Depth (reversed range: GC near = 1.0)
+  uint32_t zm = key.zmode;
+  static const D3D12_COMPARISON_FUNC cmp[] = {D3D12_COMPARISON_FUNC_NEVER, D3D12_COMPARISON_FUNC_GREATER, D3D12_COMPARISON_FUNC_EQUAL,
+                                              D3D12_COMPARISON_FUNC_GREATER_EQUAL, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPARISON_FUNC_NOT_EQUAL,
+                                              D3D12_COMPARISON_FUNC_LESS_EQUAL, D3D12_COMPARISON_FUNC_ALWAYS};
+  pd.DepthStencilState.DepthEnable = bits(zm, 0, 1);
+  pd.DepthStencilState.DepthWriteMask = (bits(zm, 0, 1) && bits(zm, 4, 1)) ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+  pd.DepthStencilState.DepthFunc = bits(zm, 0, 1) ? cmp[bits(zm, 1, 3)] : D3D12_COMPARISON_FUNC_ALWAYS;
+  pd.PrimitiveTopologyType = topo;
+  pd.NumRenderTargets = (key.mvec & 1) ? 3 : 1; pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM; pd.DSVFormat = DXGI_FORMAT_D32_FLOAT;
+  if (key.mvec & 1) {
+    pd.RTVFormats[1] = DXGI_FORMAT_R16G16_FLOAT;
+    pd.RTVFormats[2] = DXGI_FORMAT_R8_UNORM;
+    pd.BlendState.IndependentBlendEnable = TRUE;
+    pd.BlendState.RenderTarget[1] = D3D12_RENDER_TARGET_BLEND_DESC{};
+    // Motion vectors belong to the surface in the depth buffer, so only draws that write depth write
+    // them. A translucent layer (smoke, sparks, fades, a stage's see-through planes) drawn over a
+    // moving fighter used to replace that pixel's motion with its own, usually none, and DLSS then
+    // blended last frame's image at the wrong place: the smearing on moving characters.
+    static const bool all_write_mvec = [] { const char* e = std::getenv("MELEE_DEBUG_MVEC_ALL"); return e && e[0] == '1'; }();   // A/B: the old rule
+    const bool writes_depth = all_write_mvec || (bits(zm, 0, 1) && bits(zm, 4, 1));
+    pd.BlendState.RenderTarget[1].RenderTargetWriteMask = writes_depth ? (D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN) : 0;
+    pd.BlendState.RenderTarget[2] = D3D12_RENDER_TARGET_BLEND_DESC{};
+    pd.BlendState.RenderTarget[2].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_RED;
+  }
+  pd.SampleDesc.Count = std::max(1u, key.mvec >> 8);   // MSAA sample count rides in mvec's high bits (0 when off)
+}
+
+// The calls into Windows' pipeline code, each under SEH. One player's game stopped in a long online
+// session on an access violation inside D3DSCache.dll (Windows' shader cache) under a pipeline worker's
+// call; only that thread stopped, so the crash dialog came up while the match went on. A fault now
+// costs the pipeline library (build_pso) or that one pipeline, not the game. No C++ objects live in
+// these functions, as SEH requires.
+static int windows_fault_filter(unsigned long code) {
+  return code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH;
+}
+static bool guarded_load_pipeline(ID3D12PipelineLibrary* library, const wchar_t* name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+                                  ID3D12PipelineState** out, HRESULT* hr) {
+  __try { *hr = library->LoadGraphicsPipeline(name, pd, IID_PPV_ARGS(out)); return true; }
+  __except (windows_fault_filter(GetExceptionCode())) { *hr = E_FAIL; return false; }
+}
+static bool guarded_store_pipeline(ID3D12PipelineLibrary* library, const wchar_t* name, ID3D12PipelineState* pso, HRESULT* hr) {
+  __try { *hr = library->StorePipeline(name, pso); return true; }
+  __except (windows_fault_filter(GetExceptionCode())) { *hr = E_FAIL; return false; }
+}
+static bool guarded_create_pipeline(ID3D12Device* device, const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, ID3D12PipelineState** out, HRESULT* hr) {
+  __try { *hr = device->CreateGraphicsPipelineState(pd, IID_PPV_ARGS(out)); return true; }
+  __except (windows_fault_filter(GetExceptionCode())) { *hr = E_FAIL; return false; }
+}
+static bool guarded_serialized_size(ID3D12PipelineLibrary* library, SIZE_T* size) {
+  __try { *size = library->GetSerializedSize(); return true; }
+  __except (windows_fault_filter(GetExceptionCode())) { *size = 0; return false; }
+}
+static bool guarded_serialize_library(ID3D12PipelineLibrary* library, void* data, SIZE_T size, HRESULT* hr) {
+  __try { *hr = library->Serialize(data, size); return true; }
+  __except (windows_fault_filter(GetExceptionCode())) { *hr = E_FAIL; return false; }
+}
+
+void D3D12Backend::pipeline_library_fault(const char* call) {
+  if (!pipeline_library_faulted_)
+    host::log("d3d12: Windows' pipeline cache faulted in %s; pipelines are built without the saved library for the rest "
+              "of this session, and the next start builds a new one", call);
+  pipeline_library_faulted_ = true;
+  cache_saver_.mark_dirty();   // the saver deletes the file now, not only at exit
+}
+
+ComPtr<ID3D12PipelineState> D3D12Backend::build_pso(const PsoKey& key, const VSUid& vsu, const PSUid& psu, D3D12_PRIMITIVE_TOPOLOGY_TYPE topo,
+                                                    ComPtr<ID3DBlob>& vs, ComPtr<ID3DBlob>& ps) {
+  char vs_name[64], ps_name[64];
+  snprintf(vs_name, sizeof vs_name, "vs_%016llX.dxbc", (unsigned long long)key.vs);
+  snprintf(ps_name, sizeof ps_name, "ps_%016llX.dxbc", (unsigned long long)key.ps);
+  // A compile error in generated code is a bug in the generator and stops the game with the source
+  // in the log. The compiler running out of memory is not (a 0.8.99 laptop report: "D3D11 Internal
+  // Compiler Error ... 0x8007000e" late in a long session): that draw keeps the generic pipeline.
+  auto compile = [&](const std::string& src, const char* stage, const char* profile, ComPtr<ID3DBlob>& blob) {
+    ComPtr<ID3DBlob> err;
+    blob.Reset();
+    const HRESULT hr = D3DCompile(src.c_str(), src.size(), stage, nullptr, nullptr, "main", profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &err);
+    if (SUCCEEDED(hr)) return true;
+    const std::string text = err ? std::string((const char*)err->GetBufferPointer(), err->GetBufferSize()) : std::string("?");
+    std::string lower = text;
+    for (char& c : lower) c = (char)std::tolower((unsigned char)c);
+    if (hr == E_OUTOFMEMORY || lower.find("8007000e") != std::string::npos || lower.find("internal compiler error") != std::string::npos) {
+      static std::atomic<int> told{0};
+      if (told.fetch_add(1) < 4) host::log("d3d12: %s shader compile ran out of memory (%08X); its draws use the generic pipeline", stage, (unsigned)hr);
+      blob.Reset();
+      return false;
+    }
+    host::log("%s shader compile failed:\n%s\n%s", stage, text.c_str(), src.c_str());
+    host::die("%s shader compile failed", stage);
+  };
+  auto compile_vs = [&] {
+    if (!compile(generate_vertex_shader(vsu), "vs", "vs_5_0", vs)) return false;
+    save_shader_blob(opts_.shader_cache + "/" + vs_name, vs.Get());
+    return true;
+  };
+  auto compile_ps = [&] {
+    if (!compile(generate_pixel_shader(psu), "ps", "ps_5_0", ps)) return false;
+    save_shader_blob(opts_.shader_cache + "/" + ps_name, ps.Get());
+    return true;
+  };
+  if (!vs && !load_shader_blob(opts_.shader_cache + "/" + vs_name, vs) && !compile_vs()) return nullptr;
+  if (!ps && !load_shader_blob(opts_.shader_cache + "/" + ps_name, ps) && !compile_ps()) return nullptr;
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+  describe_pipeline(pd, key, topo, root_.Get(), vs.Get(), ps.Get());
+  ComPtr<ID3D12PipelineState> pso;
+  wchar_t pso_name[96];
+  swprintf_s(pso_name, L"%016llX-%016llX-%X-%X-%X-%X-%X-%X", (unsigned long long)key.vs, (unsigned long long)key.ps, key.blend, key.zmode, key.cull, key.topology, key.pixel_format, key.mvec);
+  std::lock_guard<std::mutex> lk(pipeline_library_mutex_);
+  ID3D12PipelineLibrary* library = pipeline_library_faulted_ ? nullptr : pipeline_library_.Get();
+  // MELEE_TEST_PIPELINE_FAULT=1 (tests only): the first library call faults, as Windows' cache did.
+  static bool test_fault = host::test_env::getenv("MELEE_TEST_PIPELINE_FAULT") != nullptr;
+  if (library && test_fault) { test_fault = false; library = reinterpret_cast<ID3D12PipelineLibrary*>(uintptr_t(16)); }
+  // A fault leaves whatever the call had written to its output unknown: that pointer is never used
+  // (nor released), so each call writes into a fresh one.
+  ID3D12PipelineState* raw = nullptr;
+  HRESULT hr = E_FAIL;
+  if (library && !guarded_load_pipeline(library, pso_name, &pd, &raw, &hr)) { pipeline_library_fault("LoadGraphicsPipeline"); library = nullptr; raw = nullptr; }
+  if (library && SUCCEEDED(hr) && raw) { pso.Attach(raw); ++pipelines_loaded_; return pso; }
+  raw = nullptr;
+  if (!guarded_create_pipeline(device_.Get(), &pd, &raw, &hr)) {
+    host::log("d3d12: Windows faulted creating pipeline %ls; its draws use the generic pipeline", pso_name);
+    return nullptr;
+  }
+  if (SUCCEEDED(hr) && raw) pso.Attach(raw);
+  if (FAILED(hr) || !pso) {
+    // A shader file in the cache that was cut short or damaged is refused here. Both shaders are
+    // built again from source, which also replaces the files. If the pipeline is still refused
+    // the draw keeps the generic pipeline: one surface shaded roughly instead of a stopped game.
+    if (!compile_vs() || !compile_ps()) return nullptr;
+    pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC{};
+    describe_pipeline(pd, key, topo, root_.Get(), vs.Get(), ps.Get());
+    HRESULT again = E_FAIL;
+    raw = nullptr;
+    if (!guarded_create_pipeline(device_.Get(), &pd, &raw, &again)) {
+      host::log("d3d12: Windows faulted creating pipeline %ls; its draws use the generic pipeline", pso_name);
+      return nullptr;
+    }
+    if (FAILED(again) || !raw) {
+      host::log("d3d12: pipeline %ls refused (%08X, then %08X with rebuilt shaders); its draws use the generic pipeline",
+                pso_name, (unsigned)hr, (unsigned)again);
+      return nullptr;
+    }
+    pso.Attach(raw);
+    static std::atomic<int> told{0};   // a whole damaged cache would otherwise fill the log
+    if (told.fetch_add(1) < 8) host::log("d3d12: pipeline %ls refused (%08X); built again from source and accepted", pso_name, (unsigned)hr);
+  }
+  ++pipelines_compiled_;
+  HRESULT stored = E_FAIL;
+  if (library && !guarded_store_pipeline(library, pso_name, pso.Get(), &stored)) pipeline_library_fault("StorePipeline");
+  else if (library && SUCCEEDED(stored)) { pipeline_library_dirty_ = true; cache_saver_.mark_dirty(); }
+  return pso;
+}
+
+// See Backend::variable_refresh and vrr_detect.h. Called every 32 presents; a window is a second.
+void D3D12Backend::update_variable_refresh() {
+  DXGI_FRAME_STATISTICS st{};
+  HRESULT diagnostic_statistics_result = E_FAIL;
+  vrr_readable_ = swapchain_ && SUCCEEDED(diagnostic_statistics_result = swapchain_->GetFrameStatistics(&st));
+  pacing_diagnostics_.statistics(diagnostic_statistics_result, st);
+  if (!vrr_readable_) { vrr_.restart(); return; }
+  static const double qpc_hz = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (double)f.QuadPart : 1e7; }();
+  if (!vrr_.add({st.PresentCount, st.SyncRefreshCount, (double)st.SyncQPCTime.QuadPart / qpc_hz}, vrr_nominal_hz_)) return;
+  if (vrr_.state() == 1)
+    host::log("display: variable refresh (G-Sync or FreeSync) is on: %.0f refreshes a second for %.0f frames on a %.0f Hz "
+              "display; frame cap below %.0f fps, V-Sync follows the player's setting", vrr_.refreshes(), vrr_.shown(),
+              vrr_nominal_hz_, vrr::under_refresh(vrr_nominal_hz_));
+  else
+    host::log("display: fixed refresh: %.0f refreshes a second for %.0f frames on a %.0f Hz display", vrr_.refreshes(),
+              vrr_.shown(), vrr_nominal_hz_);
+  RenderOptions::live_variable_refresh().store(vrr_.state(), std::memory_order_relaxed);   // the automatic V-Sync reads it
+}
+
+void D3D12Backend::pso_worker() {
+  for (;;) {
+    PsoJob job;
+    {
+      std::unique_lock<std::mutex> lk(pso_mutex_);
+      pso_cv_.wait(lk, [&] { return pso_quit_ || !pso_jobs_.empty(); });
+      if (pso_quit_) return;
+      job = pso_jobs_.front(); pso_jobs_.pop_front();
+    }
+    PsoResult r; r.key = job.key; r.recipe = job.recipe;
+    // MELEE_TEST_PSO_DELAY_MS=<ms> (tests only): each pipeline takes that much longer, as a slow
+    // driver compile does after an update, so the frames drawn while it is pending can be seen.
+    static const int test_delay_ms = [] { const char* v = host::test_env::getenv("MELEE_TEST_PSO_DELAY_MS"); return v ? std::atoi(v) : 0; }();
+    if (test_delay_ms > 0) std::this_thread::sleep_for(std::chrono::milliseconds(test_delay_ms));
+    r.pso = build_pso(job.key, job.vsu, job.psu, job.topo, r.vs, r.ps);
+    { std::lock_guard<std::mutex> lk(pso_mutex_); pso_done_.push_back(std::move(r)); }
+    pso_done_cv_.notify_all();
+  }
+}
+
+void D3D12Backend::integrate_compiled_psos() {
+  std::vector<PsoResult> done;
+  { std::lock_guard<std::mutex> lk(pso_mutex_); done.swap(pso_done_); }
+  for (auto& r : done) {
+    psos_[r.key] = r.pso;
+    psos_pending_.erase(r.key);
+    if (r.vs && !vs_blobs_[r.key.vs]) vs_blobs_[r.key.vs] = r.vs;
+    if (r.ps && !ps_blobs_[r.key.ps]) ps_blobs_[r.key.ps] = r.ps;
+    // Wireframe pipelines (Lightweight 5, cull bit 4) are not kept: the recipe holds the game's own state only.
+    // Plain or upscaler, at any MSAA count (prewarm_variants.h): the next start builds it again from this recipe.
+    if (r.pso && prewarm_variants::keeps_recipe(r.key.mvec) && !(r.key.cull & 4) && pipeline_recipes_.size() < 16384) remember_recipe(r.recipe);
+  }
+}
+
+
+// While a draw's real pipeline compiles on a worker, draw it with a generic one (position, vertex
+// colour, texture 0) instead of skipping it: a few frames of approximate shading beat objects
+// popping in and out. Built synchronously (the shaders are tiny), one per raster state.
+ID3D12PipelineState* D3D12Backend::fallback_pso(const PsoKey& key, const DrawCall& dc, D3D12_PRIMITIVE_TOPOLOGY_TYPE topo) {
+  const bool textured = (dc.xf_regs[0x3F] & 15) != 0 && (dc.components & VB_HAS_UV0);
+  const bool colored = (dc.components & VB_HAS_COL0) != 0;
+  // Raster state is deliberately normalized here. The fallback is approximate by design; using
+  // one generic blend/depth/cull state per output format and topology bounds the set to a few
+  // startup-created PSOs instead of one synchronous PSO creation for every new guest state.
+  // A blended draw keeps its own blend and depth state: forced opaque, the first frame of a shield
+  // (or any new translucent effect) drew as a solid ball. The game uses a handful of blend modes,
+  // so the set stays small, and the shaders are compiled once per variant (fallback_blobs_).
+  const bool blended = (key.blend & 1) != 0;
+  FallbackKey fk{blended ? key.blend : 0, blended ? key.zmode : 0, 0, key.topology, key.pixel_format, key.mvec, (uint32_t)textured | ((uint32_t)colored << 1)};
+  auto it = fallback_psos_.find(fk);
+  if (it != fallback_psos_.end()) return it->second.Get();
+  // On menus and transitions only: an untextured, uncoloured draw has its colour in TEV state this
+  // stand-in cannot read and came out plain white, and a blended one (fades, transitions) came out
+  // opaque, so the first frame of a new screen flashed. Skipping them there is invisible. In a match
+  // the same kinds of draw are a stage's sky and cloud layers, and skipping one for a frame is a
+  // visible flicker (Yoshi's Story), so there the stand-in draws as it always did.
+  if (!in_match_ && (!textured && !colored)) return nullptr;
+  if (!in_match_ && (dc.bp.blendmode() & 1)) return nullptr;
+  static const char* vs_src = R"(
+cbuffer VSBlock : register(b0) {
+float4 projection[4]; float4 depthparams; float4 viewparams; float4 materials[4]; float4 lights[40];
+float4 texmatrices[24]; float4 transformmatrices[64]; float4 normalmatrices[32]; float4 posttransformmatrices[64];
+float4 unjittered_projection[4]; float4 prev_projection[4]; float4 prev_transformmatrices[64]; };
+struct VS_OUTPUT { float4 pos : SV_Position; float4 color : COLOR0; float2 uv : TEXCOORD0; };
+VS_OUTPUT main(float3 rawpos : POSITION, float3 rawnorm0 : NORMAL0, float4 color0 : COLOR0, float4 color1 : COLOR1,
+  float2 rawtex0 : TEXCOORD0, float2 rawtex1 : TEXCOORD1, float2 rawtex2 : TEXCOORD2, float2 rawtex3 : TEXCOORD3,
+  float2 rawtex4 : TEXCOORD4, float2 rawtex5 : TEXCOORD5, float2 rawtex6 : TEXCOORD6, float2 rawtex7 : TEXCOORD7,
+  uint4 blend_indices : BLENDINDICES, uint4 blend_indices2 : BLENDINDICES1) {
+  VS_OUTPUT o;
+  int posmtx = int(blend_indices.x);
+  float4 rawpos4 = float4(rawpos, 1.0);
+  float4 pos = float4(dot(transformmatrices[posmtx], rawpos4), dot(transformmatrices[posmtx+1], rawpos4), dot(transformmatrices[posmtx+2], rawpos4), 1);
+  o.pos = float4(dot(projection[0], pos), dot(projection[1], pos), dot(projection[2], pos), dot(projection[3], pos));
+  o.color = COLOR_EXPR;
+  float4 coord = float4(rawtex0, 1.0, 1.0);
+  o.uv = float2(dot(coord, texmatrices[0]), dot(coord, texmatrices[1]));
+  o.pos.z = o.pos.w * depthparams.x - o.pos.z * depthparams.y;
+  o.pos.xy *= sign(depthparams.zw * float2(-1.0, 1.0));
+  o.pos.xy = o.pos.xy + o.pos.w * depthparams.zw;
+  if (o.pos.w == 1.0) { o.pos.xy = round(o.pos.xy * viewparams.xy) * viewparams.zw; }
+  return o;
+})";
+  static const char* ps_src = R"(
+SamplerState samp[8] : register(s0); Texture2D Tex[8] : register(t0);
+void main(out float4 ocol0 : SV_Target0 MVEC_OUT, in float4 rawpos : SV_Position, in float4 color : COLOR0, in float2 uv : TEXCOORD0) {
+  float4 c = color;
+  TEX_EXPR
+  if (c.a <= 0.0) discard;
+  ocol0 = c;
+  MVEC_WRITE
+})";
+  std::string vs = vs_src, ps = ps_src;
+  vs.replace(vs.find("COLOR_EXPR"), 10, colored ? "color0" : "float4(1.0, 1.0, 1.0, 1.0)");
+  ps.replace(ps.find("TEX_EXPR"), 8, textured ? "c *= Tex[0].Sample(samp[0], uv);" : "");
+  ps.replace(ps.find("MVEC_OUT"), 8, (key.mvec & 1) ? ", out float2 omv : SV_Target1, out float ohud : SV_Target2" : "");
+  ps.replace(ps.find("MVEC_WRITE"), 10, (key.mvec & 1) ? "omv = float2(0.0, 0.0); ohud = 0.0;" : "");
+  auto& blobs = fallback_blobs_[fk.variant | ((key.mvec & 1) << 2)];
+  ComPtr<ID3DBlob>& vsb = blobs.first;
+  ComPtr<ID3DBlob>& psb = blobs.second;
+  ComPtr<ID3DBlob> err;
+  if ((!vsb && FAILED(D3DCompile(vs.c_str(), vs.size(), "fallback_vs", nullptr, nullptr, "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vsb, &err))) ||
+      (!psb && FAILED(D3DCompile(ps.c_str(), ps.size(), "fallback_ps", nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &psb, &err)))) {
+    host::log("d3d12: fallback shader compile failed: %s", err ? (const char*)err->GetBufferPointer() : "?");
+    vsb.Reset(); psb.Reset();
+    fallback_psos_[fk] = nullptr; return nullptr;
+  }
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+  PsoKey generic = key;
+  generic.blend = blended ? key.blend : 0x18;   // blended: the draw's own mode; otherwise write RGBA, blending disabled
+  generic.zmode = blended ? key.zmode : 0;      // blended: the draw's own depth test (no write); otherwise depth disabled
+  generic.cull = 0;     // no culling
+  describe_pipeline(pd, generic, topo, root_.Get(), vsb.Get(), psb.Get());
+  ComPtr<ID3D12PipelineState> pso;
+  ID3D12PipelineState* raw = nullptr;
+  HRESULT hr = E_FAIL;
+  if (!guarded_create_pipeline(device_.Get(), &pd, &raw, &hr) || FAILED(hr) || !raw) {
+    host::log("d3d12: fallback pipeline creation failed"); fallback_psos_[fk] = nullptr; return nullptr;
+  }
+  pso.Attach(raw);
+  fallback_psos_[fk] = pso;
+  return pso.Get();
+}
+
+void D3D12Backend::prewarm_fallback_psos() {
+  const D3D12_PRIMITIVE_TOPOLOGY_TYPE topologies[] = {
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+  };
+  for (auto topo : topologies) {
+    for (uint32_t pixel_format = 0; pixel_format <= 1; ++pixel_format) {
+      for (uint32_t mvec = 0; mvec <= 1; ++mvec) {
+        for (uint32_t variant = 0; variant < 4; ++variant) {
+          DrawCall draw{};
+          if (variant & 1) draw.components |= VB_HAS_UV0;
+          if (variant & 2) draw.components |= VB_HAS_COL0;
+          if (variant & 1) draw.xf_regs[0x3F] = 1;
+          PsoKey key{0, 0, 0x18, 0, 0, (uint32_t)topo, pixel_format, mvec};
+          fallback_pso(key, draw, topo);
+          // The blend modes of most translucent effects (shields, smoke, sparks): alpha over and
+          // additive, depth test without write.
+          if (topo == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
+            for (uint32_t blend : {0x18u | 1u | (5u << 5) | (4u << 8), 0x18u | 1u | (1u << 5) | (4u << 8)}) {
+              PsoKey blended_key{0, 0, blend, 0x0Fu, 0, (uint32_t)topo, pixel_format, mvec};
+              fallback_pso(blended_key, draw, topo);
+            }
+        }
+      }
+    }
+  }
+  host::log("d3d12: prewarmed generic fallback pipelines (%zu)", fallback_psos_.size());
+}
+
+ID3D12PipelineState* D3D12Backend::get_pso(const DrawCall& dc, D3D12_PRIMITIVE_TOPOLOGY_TYPE topo) {
+  // The motion-vector variant is part of the real pipeline key: it changes shader generation and the
+  // render target count. Caching on the backend alone handed a draw the other variant's pipeline
+  // the moment DLSS was switched on or off, so the variant belongs in the cached owner as well.
+  // "Lightweight" 5 draws the world as lines: bit 4 of the cull field, so it is its own pipeline, and the
+  // wire state is part of the cached owner too (a wire draw used to look its pipeline up every time).
+  // Four ids a backend keeps these far below the D3D11 backend's id base, so the two spaces stay disjoint.
+  const uint32_t wire = look_wire(lightweight_filter_, dc) ? 4u : 0u;
+  const uint64_t owner = backend_id_ * 8 + (mvec_out() ? 2u : 0u) + (wire ? 1u : 0u);
+  if (dc.cached_pipeline && dc.cached_pipeline_owner == owner) { ++g_pso_hits; return (ID3D12PipelineState*)dc.cached_pipeline; }
+  Stopwatch sw;
+  VSUid vsu = make_vs_uid(dc);
+  PSUid psu = make_ps_uid(dc);
+  vsu.motion_vectors = psu.motion_vectors = mvec_out() ? 1u : 0u;
+  uint64_t vh = vsu.hash(), ph = psu.hash();
+  PsoKey key{vh, ph, dc.bp.blendmode() & 0xFFFF, dc.bp.zmode() & 0x1F, dc.bp.cullmode() | wire, (uint32_t)topo, dc.bp.zcontrol() & 7, (mvec_out() ? 1u : 0u) | (msaa_on() ? msaa_samples_ << 8 : 0u)};
+  g_prof[6] += sw.lap(); ++g_pso_lookups;   // uid build + hash
+  auto it = psos_.find(key);
+  g_prof[7] += sw.lap();                    // map lookup
+  if (it != psos_.end()) {
+    if (!it->second) return fallback_pso(key, dc, topo);   // the driver refused this pipeline
+    dc.cached_pipeline_owner = owner, dc.cached_pipeline = it->second.Get(); return it->second.Get();
+  }
+  PipelineRecipe recipe{}; recipe.topology = (uint32_t)topo; recipe.components = dc.components;
+  recipe.bp = dc.bp; std::memcpy(recipe.xf, dc.xf_regs, sizeof(recipe.xf));
+  if (!prewarming_ && !pso_threads_.empty()) {
+    if (psos_pending_.insert(key).second) {
+      ++g_pso_creates; ++slow_.pso_queued;
+      std::lock_guard<std::mutex> lk(pso_mutex_);
+      pso_jobs_.push_front(PsoJob{key, vsu, psu, topo, recipe});   // a draw is waiting on it: ahead of prewarm work
+      pso_cv_.notify_one();
+    }
+    // Give the workers a bounded slice of this presented frame to deliver the real pipeline (a
+    // compile is usually 2 to 10 ms). Only past the budget does the draw fall back to the generic
+    // pipeline, so a new matchup costs a short display hitch instead of black or missing surfaces.
+    // A fallback captured into an EFB texture lasts for the whole scene. Portrait
+    // depth must also use the exact shader: the generic fallback has no Z texture.
+    // In a match the screen copies are redrawn every frame (stage screens, effects), so a stand-in
+    // there lasts a frame or two; waiting for each new pipeline instead stopped the frame for its
+    // whole compile, the first time an effect showed (players saw a hitch on new effects).
+    const bool exact = (capturing_efb_ && !in_match_) || (dc.bp.ztex2() & 12);
+    while (pso_wait_budget_us_ > 0 || exact) {
+      Stopwatch wait_sw;
+      {
+        std::unique_lock<std::mutex> lk(pso_mutex_);
+        host::perf::Scope wait_cost(host::perf::Stage::Wait);
+        pso_done_cv_.wait_for(lk, std::chrono::microseconds(exact ? 2000 : std::min(pso_wait_budget_us_, 2000)), [&] { return !pso_done_.empty(); });
+      }
+      const double waited = wait_sw.lap();
+      pso_wait_budget_us_ -= (int)(waited * 1e6);
+      slow_.pso_wait_ms += waited * 1e3;
+      integrate_compiled_psos();
+      auto ready = psos_.find(key);
+      if (ready != psos_.end()) {
+        if (!ready->second) return fallback_pso(key, dc, topo);
+        dc.cached_pipeline_owner = owner, dc.cached_pipeline = ready->second.Get(); return ready->second.Get();
+      }
+    }
+    ++g_pso_skips;
+    // A translucent draw waits the frame or two out instead: the stand-in cannot shape it by its
+    // texture's alpha, so the first frame of a shield drew as a square.
+    if (key.blend & 1) return nullptr;
+    return fallback_pso(key, dc, topo);   // approximate shading until the worker delivers the pipeline
+  }
+  ++g_pso_creates; ++slow_.pso_built;
+  ComPtr<ID3DBlob>& vs = vs_blobs_[vh];
+  ComPtr<ID3DBlob>& ps = ps_blobs_[ph];
+  Stopwatch build_sw;
+  ComPtr<ID3D12PipelineState> pso = build_pso(key, vsu, psu, topo, vs, ps);
+  slow_.pso_build_ms += build_sw.lap() * 1e3;
+  psos_[key] = pso;
+  if (!pso) return fallback_pso(key, dc, topo);
+  if (!prewarming_ && pipeline_recipes_.size() < 4096) remember_recipe(recipe);
+  dc.cached_pipeline_owner = owner, dc.cached_pipeline = pso.Get();
+  return pso.Get();
+}
+
+// ---------------- textures ----------------
+ID3D12Resource* D3D12Backend::update_video_texture(
+    const std::shared_ptr<const video_bg::Frame>& frame, int video_slot) {
+  if (!frame || video_slot < 0 || video_slot >= video_bg::kVideoSlots || frame->bgra.empty()) return nullptr;
+  TextureEntry& e = video_textures_[video_slot][slot_];
+  bool created = false;
+  if (!e.resource || e.width != frame->width || e.height != frame->height) {
+    e = TextureEntry{};
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = frame->width; rd.Height = frame->height;
+    rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; rd.SampleDesc.Count = 1;
+    const HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&e.resource));
+    if (FAILED(hr)) {
+      char message[96];
+      std::snprintf(message, sizeof message, "D3D12 video texture creation failed (%08X)",
+                    (unsigned)hr);
+      video_bg::report_backend_failure(video_slot, message);
+      e = TextureEntry{};
+    }
+  }
+  if (e.resource && !e.width) {
+    e.width = frame->width; e.height = frame->height; e.levels = 1;
+    video_serial_[video_slot][slot_] = 0;
+    created = true;
+  }
+  bool upload_ok = e.resource != nullptr;
+  if (upload_ok && video_serial_[video_slot][slot_] != frame->serial) {
+    if (!created) {
+      D3D12_RESOURCE_BARRIER to_copy{};
+      to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      to_copy.Transition = {e.resource.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_COPY_DEST};
+      list_->ResourceBarrier(1, &to_copy);
+    }
+    const uint32_t pitch = (frame->width * 4 + 255) & ~255u;
+    uint8_t* cpu = nullptr; D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+    if (!upload_ring_.alloc((size_t)pitch * frame->height, 512, &cpu, &gpu)) {
+      video_bg::report_backend_failure(video_slot, "D3D12 video upload allocation failed");
+      if (created) {
+        e = TextureEntry{};
+      } else {
+        D3D12_RESOURCE_BARRIER to_sample{};
+        to_sample.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_sample.Transition = {e.resource.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+        list_->ResourceBarrier(1, &to_sample);
+      }
+      upload_ok = false;
+    }
+    if (upload_ok) {
+      for (uint32_t y = 0; y < frame->height; ++y)
+        std::memcpy(cpu + (size_t)y * pitch,
+                    frame->bgra.data() + (size_t)y * frame->width * 4,
+                    (size_t)frame->width * 4);
+      D3D12_TEXTURE_COPY_LOCATION dst{e.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+      D3D12_TEXTURE_COPY_LOCATION src{upload_ring_.resource(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+      src.PlacedFootprint.Offset = gpu - upload_ring_.resource()->GetGPUVirtualAddress();
+      src.PlacedFootprint.Footprint = {DXGI_FORMAT_B8G8R8A8_UNORM, frame->width,
+                                      frame->height, 1, pitch};
+      list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+      D3D12_RESOURCE_BARRIER to_sample{};
+      to_sample.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      to_sample.Transition = {e.resource.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST,
+                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+      list_->ResourceBarrier(1, &to_sample);
+      video_serial_[video_slot][slot_] = frame->serial;
+    }
+  }
+  if (!upload_ok) return nullptr;
+  e.last_used = frame_counter_;
+  return e.resource.Get();
+}
+
+void D3D12Backend::draw_video_background(
+    const std::shared_ptr<const video_bg::Frame>& frame, int video_slot,
+    const EfbCopy& screen) {
+  ID3D12Resource* video = update_video_texture(frame, video_slot);
+  if (!video) return;
+
+  const uint32_t base = reserve_srvs(4);
+  D3D12_CPU_DESCRIPTOR_HANDLE cpu = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+  for (int i = 0; i < 4; ++i) {
+    D3D12_CPU_DESCRIPTOR_HANDLE h = cpu; h.ptr += (base + i) * srv_size_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(video, &sd, h);
+  }
+  D3D12_GPU_DESCRIPTOR_HANDLE gpu = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+  gpu.ptr += base * srv_size_;
+
+  ID3D12PipelineState* video_pso = efb_blit_pso();
+  if (!video_pso) return;
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+  rtv.ptr += (msaa_on() ? 8 : 3) * rtv_size_;
+  list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  const float s = (float)scale_;
+  D3D12_VIEWPORT vp{screen.src_x * s, screen.src_y * s,
+                    screen.src_w * s, screen.src_h * s, 0, 1};
+  D3D12_RECT sc{(LONG)(screen.src_x * scale_), (LONG)(screen.src_y * scale_),
+                (LONG)((screen.src_x + screen.src_w) * scale_),
+                (LONG)((screen.src_y + screen.src_h) * scale_)};
+  list_->RSSetViewports(1, &vp);
+  list_->RSSetScissorRects(1, &sc);
+  list_->SetPipelineState(video_pso);
+  list_->SetGraphicsRootSignature(blit_root_.Get());
+  list_->SetGraphicsRootDescriptorTable(0, gpu);
+  // Media Foundation's decoded rows are top-down while this EFB blit samples V in the opposite
+  // direction. Flip only the presentation layer; guest textures and ordinary EFB blits retain
+  // their existing orientation.
+  const float rect[20] = {1, -1, 0, 1,
+                          1.0f / frame->width, 1.0f / frame->height, 0, 0,
+                          1, 1, 0, 0,
+                          0, 0, 0, 0,
+                          1, 1, 1, 0};
+  list_->SetGraphicsRoot32BitConstants(1, 20, rect, 0);
+  list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  list_->DrawInstanced(3, 1, 0, 0);
+  bind_efb_targets();
+}
+
+ID3D12Resource* D3D12Backend::get_texture(const TextureRef& t, uint32_t* w, uint32_t* h) {
+  auto ec = efb_copies_.find(t.addr);
+  if (ec != efb_copies_.end() && ec->second.resource) {
+    ec->second.last_used = frame_counter_;
+    *w = ec->second.width; *h = ec->second.height;
+    return ec->second.resource.Get();
+  }
+  if (!t.data) return nullptr;
+  // One dynamic resource per menu and frame-in-flight slot. The slot fence has completed before
+  // this function runs, so updating this slot cannot overwrite pixels an older GPU frame samples.
+  std::string video_name;
+  if (video_bg::wants_texture_names()) {
+    video_name = texpack::base_name(t, *t.data);
+    int video_slot = -1;
+    std::shared_ptr<const video_bg::Frame> frame =
+        video_bg::lookup(video_name, t.width, t.height, &video_slot);
+    if (frame && video_slot >= 0 && video_slot < 2 && !frame->bgra.empty()) {
+      ID3D12Resource* video = update_video_texture(frame, video_slot);
+      if (video) {
+        draw_video_slot_ = video_slot;
+        *w = frame->width; *h = frame->height;
+        return video;
+      }
+    }
+  }
+  const uint8_t* src = t.data->image.data();
+  uint32_t lw = t.width, lh = t.height;
+  const uint32_t meta[] = {t.width, t.height, t.format, t.mip_levels, t.tlut_format};
+  uint64_t key = look_key(t.data->hash ^ hash_bytes(meta, sizeof meta), look_surface_);   // each look treatment has its own entries
+  auto it = textures_.find(key);
+  if (it != textures_.end()) { it->second.last_used = frame_counter_; *w = it->second.width; *h = it->second.height; return it->second.resource.Get(); }
+  // Recently refused for lack of video memory: missing (an empty descriptor) until its retry frame.
+  if (!texture_retry_frame_.empty()) {
+    auto retry = texture_retry_frame_.find(key);
+    if (retry != texture_retry_frame_.end()) {
+      if (frame_counter_ < retry->second) return nullptr;
+      texture_retry_frame_.erase(retry);
+    }
+  }
+
+  // Custom texture pack or launch-scoped cosmetic companion: Dolphin's name for this texture,
+  // then its PNG if either source has one. Both happen once per unique texture (this is the
+  // cache-miss path), never per draw. Cosmetic companions stay active independently of the
+  // general-purpose texture-pack toggle.
+  std::string pack_name;
+  std::shared_ptr<const texpack::Replacement> replacement;
+  if (texpack::enabled() || texpack::dumping() || texpack::cosmetics_enabled()) {
+    pack_name = video_name.empty() ? texpack::base_name(t, *t.data) : video_name;
+    if (texpack::has(pack_name) && !texpack::ready(pack_name)) {
+      // Not decoded yet: draw the original now and load the replacement in the background.
+      texpack::request(pack_name);
+      pending_hd_[key] = pack_name;
+    } else if (texpack::has(pack_name)) {
+      replacement = texpack::load(pack_name, replacement_bytes_ < replacement_budget_
+                                                 ? replacement_budget_ - replacement_bytes_ : 0);
+      texpack::note_lookup(replacement != nullptr);
+      if (replacement && replacement->levels < t.mip_levels && t.mip_levels > 1)
+        host::log("textures: %s replaced at %ux%u with %u of %u mip levels", pack_name.c_str(),
+                  replacement->width, replacement->height, replacement->levels, t.mip_levels);
+    }
+  }
+
+  // "Retro (64 style)": a texture larger than 64 x 64 is uploaded as its small copy (gx_retro.h).
+  if (!replacement) replacement = look_replacement(t, look_surface_);
+  TextureEntry e;
+  const uint32_t res_w = replacement ? replacement->width : t.width;
+  const uint32_t res_h = replacement ? replacement->height : t.height;
+  const uint32_t res_levels = replacement ? replacement->levels : t.mip_levels;
+  e.width = res_w; e.height = res_h; e.levels = res_levels; e.last_used = frame_counter_;
+  D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+  D3D12_RESOURCE_DESC rd{};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = res_w; rd.Height = res_h; rd.DepthOrArraySize = 1;
+  rd.MipLevels = (UINT16)res_levels; rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+  Stopwatch texture_sw;
+  ++slow_.textures; slow_.texture_bytes += texture_bytes(res_w, res_h, res_levels);
+  HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&e.resource));
+  if (out_of_video_memory(hr)) {
+    // No room: free cached textures this frame has not drawn and try once more. If it still does
+    // not fit, the draw goes ahead with this texture missing (the same empty descriptor an unused
+    // stage gets, which needs no memory) and the texture is tried again a little later.
+    const uint32_t freed = free_video_memory(texture_bytes(res_w, res_h, res_levels));
+    hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&e.resource));
+    if (oom_log_due()) host::log("d3d12: out of video memory creating a %ux%u texture; %u cached textures freed", res_w, res_h, freed);
+    if (out_of_video_memory(hr)) { texture_retry_frame_[key] = frame_counter_ + TEXTURE_RETRY_FRAMES; return nullptr; }
+  }
+  check(hr, "texture");
+  slow_.create_ms += texture_sw.lap() * 1e3;
+  // Decode each level and copy through the upload ring. A replacement arrives already RGBA8, so it
+  // skips the GX decoder and is copied straight out of the decoded PNG.
+  lw = res_w; lh = res_h;
+  const uint8_t* level_src = src;
+  for (uint32_t l = 0; l < res_levels && lw && lh; ++l) {
+    const uint8_t* rgba;
+    if (replacement) {
+      rgba = replacement->pixels.data() + replacement->level_offset[l];
+      lw = replacement->level_width[l]; lh = replacement->level_height[l];
+    } else {
+      texture_sw.lap();
+      decode_texture(level_src, lw, lh, t.format, t.data->palette.data(), t.tlut_format, decode_scratch_);
+      slow_.decode_ms += texture_sw.lap() * 1e3;
+      rgba = decode_scratch_.data();
+      if (texpack::dumping()) texpack::dump_level(pack_name, l, rgba, lw, lh);
+    }
+    uint32_t pitch = (lw * 4 + 255) & ~255u;
+    uint8_t* cpu; D3D12_GPU_VIRTUAL_ADDRESS gpu;
+    if (!upload_ring_.alloc((size_t)pitch * lh, 512, &cpu, &gpu)) {
+      // No video memory for the upload either (the ring has logged it). A texture with levels
+      // missing must not enter the cache: retire it, since copies recorded for its earlier levels
+      // still name it, and draw without it until the retry.
+      frame_garbage_[slot_].push_back(e.resource);
+      texture_retry_frame_[key] = frame_counter_ + TEXTURE_RETRY_FRAMES;
+      return nullptr;
+    }
+    texture_sw.lap();
+    for (uint32_t y = 0; y < lh; ++y) memcpy(cpu + (size_t)y * pitch, rgba + (size_t)y * lw * 4, lw * 4);
+    slow_.copy_ms += texture_sw.lap() * 1e3;
+    D3D12_TEXTURE_COPY_LOCATION dst{e.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}; dst.SubresourceIndex = l;
+    D3D12_TEXTURE_COPY_LOCATION srcloc{upload_ring_.resource(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    srcloc.PlacedFootprint.Offset = gpu - upload_ring_.resource()->GetGPUVirtualAddress();
+    srcloc.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, lw, lh, 1, pitch};
+    list_->CopyTextureRegion(&dst, 0, 0, 0, &srcloc, nullptr);
+    if (!replacement) {
+      level_src += texture_level_bytes(lw, lh, t.format);
+      lw = std::max(1u, lw / 2); lh = std::max(1u, lh / 2);
+    }
+  }
+  if (replacement) { e.replacement_bytes = replacement->bytes(); replacement_bytes_ += e.replacement_bytes; }
+  D3D12_RESOURCE_BARRIER b{};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition = {e.resource.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  list_->ResourceBarrier(1, &b);
+  ID3D12Resource* res = e.resource.Get();
+  textures_[key] = std::move(e);
+  *w = res_w; *h = res_h;
+  return res;
+}
+
+// Recorded descriptor tables stay valid until the GPU finishes this frame.
+// Never wrap and overwrite descriptors referenced by an earlier draw.
+void D3D12Backend::rotate_heap(D3D12_DESCRIPTOR_HEAP_TYPE type) {
+  const bool sampler = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+  auto& heap = sampler ? sampler_heap_ : srv_heap_;
+  descriptor_garbage_[slot_].push_back(heap);
+  ++slow_.rollovers;
+  D3D12_DESCRIPTOR_HEAP_DESC desc = heap->GetDesc();
+  ComPtr<ID3D12DescriptorHeap> replacement;
+  check(device_->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&replacement)), "descriptor rollover");
+  heap = std::move(replacement);
+  if (sampler) { sampler_sets_.clear(); sampler_slots_used_ = 0; }
+  else { srv_cursor_ = 0; texture_sets_.clear(); }
+  ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
+  list_->SetDescriptorHeaps(2, heaps);
+}
+
+uint32_t D3D12Backend::reserve_srvs(uint32_t count) {
+  if (srv_cursor_ + count > GX_SRV_HEAP_SIZE) rotate_heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  uint32_t base = srv_cursor_; srv_cursor_ += count;
+  return base;
+}
+
+// One white texel, made the first time "Lightweight" 3 asks for it. Every texture a flat-shaded
+// draw would sample reads this instead, so the game's own shader runs unchanged and shows the
+// vertex colours and lighting alone.
+ID3D12Resource* D3D12Backend::white_texture() {
+  if (white_texture_) return white_texture_.Get();
+  D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+  D3D12_RESOURCE_DESC rd{};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = 1; rd.Height = 1; rd.DepthOrArraySize = 1;
+  rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+  ComPtr<ID3D12Resource> res;
+  if (FAILED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&res)))) return nullptr;
+  uint8_t* cpu; D3D12_GPU_VIRTUAL_ADDRESS gpu;
+  if (!upload_ring_.alloc(256, 512, &cpu, &gpu)) return nullptr;
+  std::memset(cpu, 0xFF, 4);
+  D3D12_TEXTURE_COPY_LOCATION dst{res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX}; dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION srcloc{upload_ring_.resource(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+  srcloc.PlacedFootprint.Offset = gpu - upload_ring_.resource()->GetGPUVirtualAddress();
+  srcloc.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, 1, 1, 1, 256};
+  list_->CopyTextureRegion(&dst, 0, 0, 0, &srcloc, nullptr);
+  D3D12_RESOURCE_BARRIER b{};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition = {res.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  list_->ResourceBarrier(1, &b);
+  white_texture_ = std::move(res);
+  return white_texture_.Get();
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::bind_textures(const DrawCall& dc) {
+  TextureSetKey resources{};
+  const bool flat = lightweight_flat(lightweight_filter_, dc);   // "Lightweight" 3 and up
+  look_surface_ = draw_surface_ = look_surface(lightweight_filter_, dc);   // the look's treatment for this draw's textures
+  for (int i = 0; i < 8; ++i) {
+    uint32_t w = 1, h = 1;
+    if (dc.textures[i].used) resources[i] = flat ? white_texture() : get_texture(dc.textures[i], &w, &h);
+  }
+  look_surface_ = Surface::Textured;   // other callers of get_texture (EFB copies, video) take the game's own
+  auto existing = texture_sets_.find(resources);
+  uint32_t base;
+  if (existing != texture_sets_.end()) base = existing->second;
+  else {
+    base = reserve_srvs(8);
+    texture_sets_[resources] = base;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu = srv_heap_->GetCPUDescriptorHandleForHeapStart();
+    for (int i = 0; i < 8; ++i) {
+      D3D12_CPU_DESCRIPTOR_HANDLE h = cpu; h.ptr += (base + i) * srv_size_;
+      D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+      sd.Format = resources[i] ? resources[i]->GetDesc().Format : DXGI_FORMAT_R8G8B8A8_UNORM;
+      sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      sd.Texture2D.MipLevels = resources[i] ? -1 : 1;
+      device_->CreateShaderResourceView(resources[i], &sd, h);
+    }
+  }
+  D3D12_GPU_DESCRIPTOR_HANDLE g = srv_heap_->GetGPUDescriptorHandleForHeapStart();
+  g.ptr += base * srv_size_;
+  return g;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE D3D12Backend::bind_samplers(const DrawCall& dc) {
+  SamplerSetKey key{};
+  // The 64 look samples nearest texels; the draw's group was found once in bind_textures, just before.
+  const bool unfiltered = draw_surface_ != Surface::Textured && look_live().unfiltered.load(std::memory_order_relaxed);
+  for (int i = 0; i < 8; ++i) { key.mode0[i] = dc.textures[i].used ? (unfiltered ? unfiltered_mode0(dc.textures[i].mode0) : dc.textures[i].mode0) : 0; key.mode1[i] = dc.textures[i].used ? dc.textures[i].mode1 : 0; }
+  auto it = sampler_sets_.find(key);
+  uint32_t base;
+  if (it != sampler_sets_.end()) base = it->second;
+  else {
+    if (sampler_slots_used_ + 8 > GX_SAMPLER_HEAP_SIZE) rotate_heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    base = sampler_slots_used_; sampler_slots_used_ += 8;
+    sampler_sets_[key] = base;
+    for (int i = 0; i < 8; ++i) {
+      uint32_t m0 = key.mode0[i], m1 = key.mode1[i];
+      D3D12_SAMPLER_DESC sd{};
+      static const D3D12_TEXTURE_ADDRESS_MODE wrap[] = {D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR, D3D12_TEXTURE_ADDRESS_MODE_WRAP};
+      sd.AddressU = wrap[bits(m0, 0, 2)]; sd.AddressV = wrap[bits(m0, 2, 2)]; sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+      bool mag_linear = bits(m0, 4, 1);
+      uint32_t minf = bits(m0, 5, 3);
+      bool min_linear = minf & 4;
+      uint32_t mip = minf & 3;  // 0 none, 1 point, 2 linear
+      D3D12_FILTER_TYPE mn = min_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+      D3D12_FILTER_TYPE mg = mag_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+      D3D12_FILTER_TYPE mp = mip == 2 ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+      sd.Filter = D3D12_ENCODE_BASIC_FILTER(mn, mg, mp, D3D12_FILTER_REDUCTION_TYPE_STANDARD);
+      // Anisotropic filtering where the game asked for linear sampling (Dolphin's "Anisotropic Filtering").
+      if (opts_.anisotropy > 1 && min_linear && mag_linear) sd.Filter = D3D12_FILTER_ANISOTROPIC;
+      sd.MipLODBias = (float)(int32_t)((int32_t)sbits(m0, 9, 8)) / 32.0f + dlss_mip_bias_;
+      sd.MinLOD = bits(m1, 0, 8) / 16.0f;
+      sd.MaxLOD = mip ? bits(m1, 8, 8) / 16.0f : 0.0f;
+      sd.MaxAnisotropy = (UINT)std::clamp(opts_.anisotropy, 1, 16);
+      sd.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+      D3D12_CPU_DESCRIPTOR_HANDLE h = sampler_heap_->GetCPUDescriptorHandleForHeapStart(); h.ptr += (base + i) * sampler_size_;
+      device_->CreateSampler(&sd, h);
+    }
+  }
+  D3D12_GPU_DESCRIPTOR_HANDLE g = sampler_heap_->GetGPUDescriptorHandleForHeapStart();
+  g.ptr += base * sampler_size_;
+  return g;
+}
+
+// ---------------- draws ----------------
+void D3D12Backend::select_frame_geometry(const Frame& frame) {
+  geometry_frame_ = nullptr;
+  if (!frame.sequence || frame.vertices.empty()) return;
+  ++geometry_uses_;
+  for (FrameGeometry& g : geometry_)
+    if (g.sequence == frame.sequence && g.draws.size() == frame.draws.size()) { g.last_use = geometry_uses_; geometry_frame_ = &g; return; }
+  FrameGeometry* pick = &geometry_[0];
+  for (FrameGeometry& g : geometry_) if (g.last_use < pick->last_use) pick = &g;
+  wait_fence(pick->fence);   // the last present that read it has finished on the GPU
+  const size_t vbytes = frame.vertices.size() * sizeof(Vertex);
+  // Room for the vertices plus index lists: strips and fans can need three indices per vertex.
+  const size_t want = ((vbytes + 255) & ~size_t(255)) + frame.vertices.size() * 12 + (1 << 20);
+  if (pick->capacity < want) {
+    const size_t size = std::max(want + want / 4, size_t(8) << 20);
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_UPLOAD};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = size; rd.Height = 1;
+    rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    pick->buffer.Reset(); pick->cpu = nullptr; pick->capacity = 0;
+    if (FAILED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                nullptr, IID_PPV_ARGS(&pick->buffer))) ||
+        FAILED(pick->buffer->Map(0, nullptr, (void**)&pick->cpu))) {
+      pick->buffer.Reset(); pick->sequence = 0; return;
+    }
+    pick->capacity = size;
+    pick->gpu = pick->buffer->GetGPUVirtualAddress();
+  }
+  std::memcpy(pick->cpu, frame.vertices.data(), vbytes);
+  pick->used = (vbytes + 255) & ~size_t(255);
+  pick->draws.assign(frame.draws.size(), FrameGeometry::DrawIndex{});
+  pick->sequence = frame.sequence;
+  pick->last_use = geometry_uses_;
+  geometry_frame_ = pick;
+}
+
+void D3D12Backend::execute_draw(const Frame& frame, const DrawCall& dc, const DrawMatrices* override_matrices) {
+  // "Visual effects" below Full: decorative draws in a match are skipped (see skip_for_effects).
+  if (skip_for_effects(effects_filter_, dc)) return;
+  // "Lightweight" 2 and up: scenery behind the play plane is not drawn.
+  if (skip_for_lightweight(lightweight_filter_, frame, dc)) return;
+
+  Stopwatch sw;
+  const uint32_t n = dc.vertex_count;
+  D3D12_PRIMITIVE_TOPOLOGY_TYPE topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  D3D12_PRIMITIVE_TOPOLOGY prim = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+  uint8_t* vcpu; D3D12_GPU_VIRTUAL_ADDRESS vgpu, igpu;
+  size_t vbytes = (size_t)n * sizeof(Vertex);
+  uint32_t index_count = 0;
+  // This frame's geometry set, when the draw's own vertices are the frame's (not blended this present).
+  FrameGeometry::DrawIndex* cached = nullptr;
+  if (geometry_frame_ && !(override_matrices && override_matrices->vertices) && !frame.draws.empty() &&
+      &dc >= frame.draws.data() && &dc < frame.draws.data() + frame.draws.size() &&
+      (size_t)dc.first_vertex + n <= frame.vertices.size()) {
+    FrameGeometry::DrawIndex& d = geometry_frame_->draws[(size_t)(&dc - frame.draws.data())];
+    if (d.state != 2) cached = &d;
+  }
+  if (cached && cached->state == 1) {
+    if (!cached->count) return;
+    ++g_prof_draws; g_prof[0] += sw.lap();
+    if (cached->lines) { topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE; prim = D3D_PRIMITIVE_TOPOLOGY_LINELIST; }
+    vgpu = geometry_frame_->gpu + (D3D12_GPU_VIRTUAL_ADDRESS)dc.first_vertex * sizeof(Vertex);
+    igpu = geometry_frame_->gpu + cached->offset;
+    index_count = cached->count;
+    g_prof[1] += sw.lap();
+  } else {
+  // Build index list (triangle list / line list) from the GX primitive.
+  auto& idx = index_scratch_; idx.clear();
+  auto append_indices = [&](uint32_t primitive, uint32_t count, uint32_t base) {
+    if (append_segment_indices(idx, primitive, count, base) == DrawTopology::Lines) {
+      topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+      prim = D3D_PRIMITIVE_TOPOLOGY_LINELIST;
+    }
+  };
+  if (dc.segment_count && dc.first_segment <= frame.segments.size() &&
+      dc.segment_count <= frame.segments.size() - dc.first_segment) {
+    for (uint32_t s = 0; s < dc.segment_count; ++s) {
+      const DrawSegment& segment = frame.segments[dc.first_segment + s];
+      append_indices(segment.primitive, segment.vertex_count, segment.first_vertex - dc.first_vertex);
+    }
+  } else {
+    append_indices(dc.primitive, dc.vertex_count, 0);
+  }
+  if (cached) {
+    // First use of this draw in this frame: keep its indices in the frame's set for later presents.
+    const size_t ibytes = idx.size() * 4, at = (geometry_frame_->used + 3) & ~size_t(3);
+    if (idx.empty()) {
+      cached->count = 0; cached->state = 1;
+    } else if (at + ibytes <= geometry_frame_->capacity) {
+      std::memcpy(geometry_frame_->cpu + at, idx.data(), ibytes);
+      geometry_frame_->used = at + ibytes;
+      cached->offset = (uint32_t)at; cached->count = (uint32_t)idx.size();
+      cached->lines = topo == D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE; cached->state = 1;
+    } else {
+      cached->state = 2;   // no room: this draw uploads per present, as before
+      cached = nullptr;
+    }
+  }
+  if (idx.empty()) return;
+  ++g_prof_draws; g_prof[0] += sw.lap();   // index generation
+  index_count = (uint32_t)idx.size();
+  if (cached) {
+    vgpu = geometry_frame_->gpu + (D3D12_GPU_VIRTUAL_ADDRESS)dc.first_vertex * sizeof(Vertex);
+    igpu = geometry_frame_->gpu + cached->offset;
+  } else {
+    // Vertices
+    if (!vertex_ring_.alloc(vbytes, 16, &vcpu, &vgpu)) { host::log("d3d12: vertex ring full"); return; }
+    const Vertex* vsrc = (override_matrices && override_matrices->vertices) ? override_matrices->vertices : &frame.vertices[dc.first_vertex];
+    memcpy(vcpu, vsrc, vbytes);
+    uint8_t* icpu;
+    if (!index_ring_.alloc(idx.size() * 4, 4, &icpu, &igpu)) { host::log("d3d12: index ring full"); return; }
+    memcpy(icpu, idx.data(), idx.size() * 4);
+  }
+  g_prof[1] += sw.lap();   // vertex/index upload
+  }
+  // Constants
+  uint8_t* ccpu; D3D12_GPU_VIRTUAL_ADDRESS vs_gpu, ps_gpu;
+  // Only the part of the block this draw's shader can read is uploaded: the post-transform and
+  // previous-pose matrices sit at the end and are conditional, so a typical draw sends 2.7 KB
+  // instead of 4.9 KB.
+  const size_t vs_bytes = vs_constants_bytes(dc, mvec_out());
+  if (!constant_ring_.alloc(vs_bytes, 256, &ccpu, &vs_gpu)) { host::log("d3d12: constant ring full"); return; }
+  // Upload heaps can be write-combined: build scattered constants in normal
+  // CPU memory, then copy contiguously rather than touching the mapped heap
+  // repeatedly with partial writes.
+  VSConstants vs_constants;
+  if (mvec_out()) {
+    MotionInfo motion; motion.jitter_x = jitter_x_; motion.jitter_y = jitter_y_;
+    const uint64_t presentation = (uint64_t)frames_presented_ + 1;
+    const auto* previous = last_poses_.previous(dc.identity, presentation, !skip_present_);
+    const bool had = previous != nullptr;
+    if (had) { motion.prev_pos = previous->position.data(); motion.prev_proj = previous->projection.data(); }
+    ++mv_draws_; if (had) ++mv_matched_;
+    fill_vs_constants(dc, vs_constants, scale_, override_matrices, &motion);
+    last_poses_.record(dc.identity, presentation, !skip_present_,
+                       override_matrices ? override_matrices->pos : dc.posMatrices,
+                       &vs_constants.unjittered_projection[0][0]);
+  } else {
+    fill_vs_constants(dc, vs_constants, scale_, override_matrices);
+  }
+  std::memcpy(ccpu, &vs_constants, vs_bytes);
+  if (!constant_ring_.alloc(sizeof(PSConstants), 256, &ccpu, &ps_gpu)) return;
+  const size_t draw_index = (size_t)(&dc - frame.draws.data());
+  if (draw_index < frame.draws.size()) {
+    if (ps_cache_frame_ != &frame || ps_cache_sequence_ != frame.sequence || ps_cache_scale_ != scale_ ||
+        ps_cache_filled_.size() != frame.draws.size()) {
+      ps_cache_frame_ = &frame; ps_cache_sequence_ = frame.sequence; ps_cache_scale_ = scale_;
+      if (ps_cache_.size() < frame.draws.size()) ps_cache_.resize(frame.draws.size());
+      ps_cache_filled_.assign(frame.draws.size(), 0);
+    }
+    if (!ps_cache_filled_[draw_index]) {
+      fill_ps_constants(dc, ps_cache_[draw_index], scale_);
+      ps_cache_filled_[draw_index] = 1;
+    }
+    std::memcpy(ccpu, &ps_cache_[draw_index], sizeof(PSConstants));
+  } else {
+    PSConstants ps_constants;   // a copy of a draw, not the frame's own
+    fill_ps_constants(dc, ps_constants, scale_);
+    std::memcpy(ccpu, &ps_constants, sizeof(ps_constants));
+  }
+  g_prof[2] += sw.lap();   // constants
+  // Pipeline
+  ID3D12PipelineState* pso = get_pso(dc, topo);
+  g_prof[3] += sw.lap();   // pso
+  if (!pso) return;        // being compiled on a worker thread
+  D3D12_GPU_DESCRIPTOR_HANDLE srvs = bind_textures(dc);
+  D3D12_GPU_DESCRIPTOR_HANDLE samps = bind_samplers(dc);
+  g_prof[4] += sw.lap();   // textures + samplers
+  // Viewport / scissor
+  const float* vp = (const float*)&dc.xf_regs[0x1A];
+  float s = (float)scale_;
+  float X = (vp[3] - vp[0] - 342.0f) * s, Y = (vp[4] + vp[1] - 342.0f) * s, W = 2.0f * vp[0] * s, H = -2.0f * vp[1] * s;
+  if (W < 0) { X += W; W = -W; }
+  if (H < 0) { Y += H; H = -H; }
+  float min_depth = 1.0f - vp[5] / 16777216.0f, max_depth = 1.0f - (vp[5] - vp[2]) / 16777216.0f;
+  min_depth = std::clamp(min_depth, 0.0f, 1.0f); max_depth = std::clamp(max_depth, 0.0f, 1.0f);
+  if (max_depth < min_depth) std::swap(min_depth, max_depth);
+  D3D12_VIEWPORT viewport{X, Y, std::max(W, 1.0f), std::max(H, 1.0f), min_depth, max_depth};
+  uint32_t tl = dc.bp.reg[BP_SCISSORTL], br = dc.bp.reg[BP_SCISSORBR], so = dc.bp.reg[BP_SCISSOROFFSET];
+  int xoff = (int)bits(so, 0, 10) * 2 - 342, yoff = (int)bits(so, 10, 10) * 2 - 342;
+  // GX adds 342 to scissor coordinates so they stay positive (see Dolphin BPFunctions::SetScissor).
+  int sl = (int)bits(tl, 12, 12) - xoff - 342, st = (int)bits(tl, 0, 12) - yoff - 342;
+  int sr = (int)bits(br, 12, 12) - xoff - 341, sb = (int)bits(br, 0, 12) - yoff - 341;
+  sl = std::clamp(sl, 0, EFB_WIDTH); sr = std::clamp(sr, 0, EFB_WIDTH); st = std::clamp(st, 0, EFB_HEIGHT); sb = std::clamp(sb, 0, EFB_HEIGHT);
+  if (sr <= sl || sb <= st) return;
+  D3D12_RECT scissor{(LONG)(sl * scale_), (LONG)(st * scale_), (LONG)(sr * scale_), (LONG)(sb * scale_)};
+
+  list_->SetPipelineState(pso);
+  list_->SetGraphicsRootSignature(root_.Get());
+  list_->SetGraphicsRootConstantBufferView(0, vs_gpu);
+  list_->SetGraphicsRootConstantBufferView(1, ps_gpu);
+  list_->SetGraphicsRootDescriptorTable(2, srvs);
+  list_->SetGraphicsRootDescriptorTable(3, samps);
+  list_->RSSetViewports(1, &viewport);
+  list_->RSSetScissorRects(1, &scissor);
+  D3D12_VERTEX_BUFFER_VIEW vbv{vgpu, (UINT)vbytes, sizeof(Vertex)};
+  D3D12_INDEX_BUFFER_VIEW ibv{igpu, (UINT)(index_count * 4), DXGI_FORMAT_R32_UINT};
+  list_->IASetVertexBuffers(0, 1, &vbv);
+  list_->IASetIndexBuffer(&ibv);
+  list_->IASetPrimitiveTopology(prim);
+  list_->DrawIndexedInstanced((UINT)index_count, 1, 0, 0, 0);
+  g_prof[5] += sw.lap();   // state + draw calls
+}
+
+void D3D12Backend::clear_efb(const EfbCopy& c) {
+  float s = (float)scale_;
+  D3D12_RECT r{(LONG)(c.src_x * s), (LONG)(c.src_y * s), (LONG)((c.src_x + c.src_w) * s), (LONG)((c.src_y + c.src_h) * s)};
+  const uint32_t clear_colour = look_clear_colour(in_match_, c.clear_color);   // the look's background
+  float color[4] = {((clear_colour >> 16) & 0xFF) / 255.0f, ((clear_colour >> 8) & 0xFF) / 255.0f, (clear_colour & 0xFF) / 255.0f, ((clear_colour >> 24) & 0xFF) / 255.0f};
+  const bool msaa = msaa_on();
+  D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += (msaa ? 8 : 3) * rtv_size_;
+  list_->ClearRenderTargetView(rtv, color, 1, &r);
+  D3D12_CPU_DESCRIPTOR_HANDLE dsv = dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+  if (msaa) dsv.ptr += device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+  list_->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f - (float)c.clear_z / 16777215.0f, 0, 1, &r);
+}
+
+void D3D12Backend::execute_copy(const EfbCopy& c) {
+  resolve_efb();
+  // EFB -> texture at guest address: keep a GPU copy and register it for texture lookups.
+  // Like Dolphin with "scaled EFB copies": the copy keeps the internal resolution (native size x scale_).
+  // A half-scale copy (GX_TRUE mipmap flag on GXCopyTex) is a filtered 2:1 downscale, drawn with the
+  // linear blit pipeline as Dolphin's FromRenderTarget does; a 1:1 copy is an exact texture copy.
+  uint32_t w = c.src_w, h = c.src_h;
+  if (c.half_scale) { w = std::max(1u, w / 2); h = std::max(1u, h / 2); }
+  uint32_t sw = w * scale_, sh = h * scale_;
+  TextureEntry& e = efb_copies_[c.dest_addr];
+  e.last_used = frame_counter_;   // before anything can free idle copies: `e` must stay in the map
+  // Melee's EFB is RGB8 (no alpha): on hardware every copy from it is opaque. Our EFB keeps an alpha
+  // channel that the game never meant to fill (0 after most clears), and a raw copy of it made the
+  // Classic STAGE CLEAR zoom (a blurred copy of the last frame, drawn with its alpha) invisible.
+  // Those copies go through the blit with alpha forced to 1.
+  const bool opaque = !c.efb_alpha && !c.is_depth;
+  const bool blit = c.half_scale || opaque || c.is_depth;
+  ID3D12Resource* source = c.is_depth ? efb_depth_.Get() : efb_color_.Get();
+  const D3D12_RESOURCE_STATES source_before = c.is_depth ? D3D12_RESOURCE_STATE_DEPTH_WRITE : D3D12_RESOURCE_STATE_RENDER_TARGET;
+  const D3D12_RESOURCE_STATES dst_state = blit ? D3D12_RESOURCE_STATE_RENDER_TARGET : D3D12_RESOURCE_STATE_COPY_DEST;
+  const D3D12_RESOURCE_STATES src_state = blit ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE;
+  D3D12_RESOURCE_BARRIER b[2]{};
+  b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b[0].Transition = {source, 0, source_before, src_state};
+  if (!e.resource || e.width != sw || e.height != sh) {
+    if (e.resource) frame_garbage_[slot_].push_back(e.resource);
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = sw; rd.Height = sh; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1; rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, dst_state, nullptr, IID_PPV_ARGS(&e.resource));
+    if (out_of_video_memory(hr)) {
+      // No room: free cached textures this frame has not drawn and try once more. If it still does
+      // not fit this copy is skipped (nothing has been recorded for it yet) and draws that sample
+      // its address fall back to the game's own texture data until a later copy succeeds.
+      const uint32_t freed = free_video_memory((uint64_t)sw * sh * 4);
+      hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, dst_state, nullptr, IID_PPV_ARGS(&e.resource));
+      if (oom_log_due()) host::log("d3d12: out of video memory creating a %ux%u texture; %u cached textures freed", sw, sh, freed);
+      if (out_of_video_memory(hr)) { e = TextureEntry{}; return; }
+    }
+    check(hr, "efb copy tex");
+    e.width = sw; e.height = sh;
+    list_->ResourceBarrier(1, b);
+  } else {
+    b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b[1].Transition = {e.resource.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, dst_state};
+    list_->ResourceBarrier(2, b);
+  }
+  e.last_used = frame_counter_;
+  if (blit) {
+    uint32_t slot = reserve_srvs(4);
+    D3D12_CPU_DESCRIPTOR_HANDLE sh_cpu = srv_heap_->GetCPUDescriptorHandleForHeapStart(); sh_cpu.ptr += slot * srv_size_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_view{};
+    depth_view.Format = DXGI_FORMAT_R32_FLOAT; depth_view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depth_view.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; depth_view.Texture2D.MipLevels = 1;
+    for (int k = 0; k < 4; ++k) { D3D12_CPU_DESCRIPTOR_HANDLE hk = sh_cpu; hk.ptr += k * srv_size_; device_->CreateShaderResourceView(source, c.is_depth ? &depth_view : nullptr, hk); }
+    D3D12_GPU_DESCRIPTOR_HANDLE sh_gpu = srv_heap_->GetGPUDescriptorHandleForHeapStart(); sh_gpu.ptr += slot * srv_size_;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += 4 * rtv_size_;  // transient slot
+    device_->CreateRenderTargetView(e.resource.Get(), nullptr, rtv);
+    list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp{0, 0, (float)sw, (float)sh, 0, 1};
+    D3D12_RECT sc{0, 0, (LONG)sw, (LONG)sh};
+    list_->RSSetViewports(1, &vp);
+    list_->RSSetScissorRects(1, &sc);
+    list_->SetPipelineState(blit_pso_.Get());
+    list_->SetGraphicsRootSignature(blit_root_.Get());
+    list_->SetGraphicsRootDescriptorTable(0, sh_gpu);
+    // Neutral grade (1,1,1): this reads the EFB back into a texture the game itself samples from
+    // (reflections, effects), not the presented image, so brightness/contrast/vibrance must not
+    // touch it -- only the final blit to the backbuffer, below, applies those.
+    float rect[20] = {(float)c.src_w / EFB_WIDTH, (float)c.src_h / EFB_HEIGHT, (float)c.src_x / EFB_WIDTH, (float)c.src_y / EFB_HEIGHT,
+                      0, 0, 0, 0, 1.0f, 1.0f, 0, 0, 0, 0, 0, 0, 1.0f, 1.0f, 1.0f, c.is_depth ? -2.0f : (opaque ? -1.0f : 0.0f)};
+    list_->SetGraphicsRoot32BitConstants(1, 20, rect, 0);
+    list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    list_->DrawInstanced(3, 1, 0, 0);
+    // Restore the EFB as the render target; execute_draw re-sets viewport/scissor per draw.
+    bind_efb_targets();
+  } else {
+    D3D12_TEXTURE_COPY_LOCATION dst{e.resource.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_TEXTURE_COPY_LOCATION src{efb_color_.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    D3D12_BOX box{c.src_x * (UINT)scale_, c.src_y * (UINT)scale_, 0, (c.src_x + c.src_w) * (UINT)scale_, (c.src_y + c.src_h) * (UINT)scale_, 1};
+    box.right = std::min<UINT>(box.right, efb_w_); box.bottom = std::min<UINT>(box.bottom, efb_h_);
+    list_->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+  }
+  D3D12_RESOURCE_BARRIER back[2]{};
+  back[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  back[0].Transition = {source, 0, src_state, source_before};
+  back[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  back[1].Transition = {e.resource.Get(), 0, dst_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  list_->ResourceBarrier(2, back);
+}
+
+void D3D12Backend::present_efb(const EfbCopy& c) {
+  fg_presenter_wait();   // the previous frame's second present (FSR frame generation) is out first
+  resolve_efb();
+  UINT bb = swapchain_->GetCurrentBackBufferIndex();
+  // DLSS: upscale the jittered EFB region (with depth and motion vectors) into the output texture first.
+  bool upscaled = false;
+  // Menus skip the upscaler and are presented from the EFB like native (see dlss_in_match_).
+  if (dlss_active_ && dlss_out_ && dlss_in_match_) {
+    streamline::EvaluateInputs in{};
+    in.color_in = efb_color_.Get();
+    in.color_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    in.depth = efb_depth_.Get(); in.depth_state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    in.mvec = mvec_.Get(); in.mvec_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    in.hud_mask = hud_mask_.Get(); in.hud_mask_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    in.color_out = dlss_out_.Get(); in.out_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    // In place (DLAA) the render and output sizes must match exactly, so feed the whole EFB and let
+    // the present blit pick the displayed region out of the result, exactly as it does without DLSS.
+    if (dlss_in_place_) { in.in_left = 0; in.in_top = 0; in.in_w = efb_w_; in.in_h = efb_h_; }
+    else {
+      in.in_left = c.src_x * scale_; in.in_top = c.src_y * scale_;
+      in.in_w = std::min<uint32_t>(c.src_w * scale_, efb_w_ - in.in_left); in.in_h = std::min<uint32_t>(c.src_h * scale_, efb_h_ - in.in_top);
+    }
+    in.out_w = dlss_out_w_; in.out_h = dlss_out_h_;
+    const bool timing = timer_heap_ != nullptr;
+    timer_mask_[slot_] &= 4;   // the whole-frame pair (bit 2) is recorded by submit_frame; the pass bits start clean
+    if (timing) list_->EndQuery(timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * TIMERS_PER_SLOT + 0);
+    if (fsr_active()) {
+      // FSR reads its inputs from compute shaders (non-pixel-shader resources); DLSS takes them in place.
+      D3D12_RESOURCE_BARRIER fb[3]{};
+      fb[0].Type = fb[1].Type = fb[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      fb[0].Transition = {efb_color_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+      fb[1].Transition = {efb_depth_.Get(), 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+      fb[2].Transition = {mvec_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+      list_->ResourceBarrier(3, fb);
+      // MELEE_FSR_JITTER_SIGN (tests): FSR's jitter the other way round; the default was measured on captures.
+      static const float fsr_jitter = [] { const char* v = std::getenv("MELEE_FSR_JITTER_SIGN"); return v && *v ? (float)std::atof(v) : -1.0f; }();
+      const double now = Stopwatch::now();
+      const float frame_ms = fsr_last_time_ > 0 ? (float)((now - fsr_last_time_) * 1000.0) : 0.0f;
+      fsr_last_time_ = now;
+      fsr::Inputs fi{efb_color_.Get(), efb_depth_.Get(), mvec_.Get(), dlss_out_.Get(), in.in_left, in.in_top, in.in_w, in.in_h,
+                     fsr_jitter * jitter_x_ * opts_.dlss_jitter_sign, fsr_jitter * jitter_y_ * opts_.dlss_jitter_sign, frame_ms, fsr_reset_};
+      fsr_reset_ = false;   // FSR's history restart flag
+      upscaled = fsr::evaluate(list_.Get(), fi);
+      // Frame generation from the same depth and motion (still readable by compute here) and the
+      // picture just upscaled: the frame between the previous picture and this one, into fg_out_.
+      // A frame that does not follow the last generating one starts the generator over.
+      fsr_fg_generated_ = false;
+      if (upscaled && fsr_fg_on_ && fg_out_) {
+        D3D12_RESOURCE_BARRIER pic{};
+        pic.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        pic.Transition = {dlss_out_.Get(), 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+        list_->ResourceBarrier(1, &pic);
+        const bool follows = fsr_fg_prev_frame_ + 1 == (uint64_t)frames_presented_;
+        const fsr::FrameInputs gi{efb_depth_.Get(), mvec_.Get(), dlss_out_.Get(), fg_out_.Get(), in.in_w, in.in_h,
+                                  fi.jitter_x, fi.jitter_y, frame_ms, fi.reset || !follows};
+        fsr_fg_generated_ = fsr::fg_generate(list_.Get(), gi);
+        fsr_fg_prev_frame_ = (uint64_t)frames_presented_;
+        std::swap(pic.Transition.StateBefore, pic.Transition.StateAfter);
+        D3D12_RESOURCE_BARRIER after[2] = {pic, {}};
+        after[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; after[1].UAV.pResource = fg_out_.Get();
+        list_->ResourceBarrier(2, after);
+      }
+      for (auto& b : fb) std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+      list_->ResourceBarrier(3, fb);
+    } else {
+      upscaled = streamline::evaluate(list_.Get(), in);
+    }
+    if (timing) { list_->EndQuery(timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * TIMERS_PER_SLOT + 1); timer_mask_[slot_] |= 1; }
+    if (!upscaled && ++dlss_failures_ >= 30) {
+      host::log("dlss: evaluation keeps failing; switching Upscaling back to Native");
+      opts_.dlss_mode = 0; dlss_failures_ = 0;
+    } else if (upscaled) dlss_failures_ = 0;
+    if (timing && (timer_mask_[slot_] & 3)) {
+      list_->ResolveQueryData(timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * TIMERS_PER_SLOT, 4, timer_rb_[slot_].Get(), 0);
+      timer_pending_[slot_] = true;
+    }
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
+    list_->SetDescriptorHeaps(2, heaps);
+  }
+  // Diagnostics (in-place DLAA / FSR native AA only): every other presented frame shows the upscaler's own
+  // input instead of its output, while it keeps running every frame. A capture burst then puts each
+  // output next to the input it came from, so a trail left by the upscaler can be measured.
+  static const bool debug_show_input = [] { const char* e = std::getenv("MELEE_DEBUG_DLSS_INPUT_ODD"); return e && e[0] == '1'; }();
+  if (debug_show_input && upscaled && dlss_in_place_ && (frames_presented_ & 1)) upscaled = false;
+  if (opts_.flicker_scan) record_flicker_scan();
+  D3D12_CPU_DESCRIPTOR_HANDLE back_rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); back_rtv.ptr += bb * rtv_size_;
+  if (fsr_fg_generated_ && upscaled && fg_out_ && fg_real_) {
+    // FSR frame generation: the generated picture into the back buffer, shown first; the rendered
+    // frame into fg_real_, copied into the next back buffer after that present (submit_frame).
+    present_pass(c, upscaled, fg_out_.Get(), backbuffers_[bb].Get(), back_rtv, D3D12_RESOURCE_STATE_PRESENT);
+    D3D12_CPU_DESCRIPTOR_HANDLE real_rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); real_rtv.ptr += 15 * rtv_size_;
+    present_pass(c, upscaled, nullptr, fg_real_.Get(), real_rtv, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  } else {
+    fsr_fg_generated_ = false;
+    present_pass(c, upscaled, nullptr, backbuffers_[bb].Get(), back_rtv, D3D12_RESOURCE_STATE_PRESENT);
+  }
+}
+
+// The present pass: border art, the picture (upscaled or the EFB, or `picture` in its place: FSR
+// frame generation's generated one, the upscaled picture's size) with the HUD composite, colour and
+// CRT or the shader preset, and the settings overlay, into `target` (the back buffer, or FSR frame
+// generation's rendered picture), which is in `target_state` before and after.
+void D3D12Backend::present_pass(const EfbCopy& c, bool upscaled, ID3D12Resource* picture,
+                                ID3D12Resource* target, D3D12_CPU_DESCRIPTOR_HANDLE rtv, D3D12_RESOURCE_STATES target_state) {
+  ID3D12Resource* source = picture ? picture : upscaled ? dlss_out_.Get() : efb_color_.Get();
+  D3D12_RESOURCE_STATES source_state = picture || upscaled ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS : D3D12_RESOURCE_STATE_RENDER_TARGET;
+  // With DLSS the current EFB and the HUD mask are read too (HUD composite).
+  const bool hud_composite = upscaled && hud_mask_;
+  D3D12_RESOURCE_BARRIER b[4]{};
+  b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b[0].Transition = {source, 0, source_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b[1].Transition = {target, 0, target_state, D3D12_RESOURCE_STATE_RENDER_TARGET};
+  b[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b[2].Transition = {efb_color_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  b[3].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b[3].Transition = {hud_composite ? hud_mask_.Get() : nullptr, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  list_->ResourceBarrier(hud_composite ? 4 : 2, b);
+  D3D12_RESOURCE_BARRIER depth_barrier{};
+  depth_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  depth_barrier.Transition = {efb_depth_.Get(), 0, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+  list_->ResourceBarrier(1, &depth_barrier);
+  // SRVs: presented image, HUD composite inputs, and the current reversed-depth buffer for SSAO.
+  uint32_t slot = reserve_srvs(4);
+  D3D12_CPU_DESCRIPTOR_HANDLE h = srv_heap_->GetCPUDescriptorHandleForHeapStart(); h.ptr += slot * srv_size_;
+  device_->CreateShaderResourceView(source, nullptr, h);
+  { D3D12_CPU_DESCRIPTOR_HANDLE h1 = h; h1.ptr += srv_size_; D3D12_CPU_DESCRIPTOR_HANDLE h2 = h1; h2.ptr += srv_size_;
+    device_->CreateShaderResourceView(hud_composite ? efb_color_.Get() : source, nullptr, h1);
+    device_->CreateShaderResourceView(hud_composite ? hud_mask_.Get() : source, nullptr, h2); }
+  { D3D12_CPU_DESCRIPTOR_HANDLE h3 = h; h3.ptr += 3 * srv_size_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC depth_srv{};
+    depth_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    depth_srv.Format = DXGI_FORMAT_R32_FLOAT;
+    depth_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    depth_srv.Texture2D.MipLevels = 1;
+    device_->CreateShaderResourceView(efb_depth_.Get(), &depth_srv, h3); }
+  D3D12_GPU_DESCRIPTOR_HANDLE g = srv_heap_->GetGPUDescriptorHandleForHeapStart(); g.ptr += slot * srv_size_;
+  float border[4] = {0, 0, 0, 1};   // letterbox/pillarbox bars (black, as on Dolphin and a TV)
+  list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+  list_->ClearRenderTargetView(rtv, border, 0, nullptr);
+  // Border art fills the window first; the picture is drawn over it, so it shows in the bars.
+  // It is scaled to cover the window and cropped evenly where the shapes differ.
+  video_bg::set_border(opts_.border_art);
+  bool art_reversed = false;
+  // Kept for the shader preset path: a RetroArch preset's passes clear the whole window (the
+  // built-in CRT filter does not), so the art is painted again in the bars after the preset.
+  bool art_drawn = false;
+  D3D12_GPU_DESCRIPTOR_HANDLE art_gpu_kept{};
+  float art_rect_kept[28] = {}, art_hdr_kept[4] = {};
+  if (const auto art = video_bg::border_frame(&art_reversed)) {
+    if (ID3D12Resource* texture = update_video_texture(art, video_bg::kBorderSlot)) {
+      const uint32_t art_slot = reserve_srvs(4);
+      for (int k = 0; k < 4; ++k) {
+        D3D12_CPU_DESCRIPTOR_HANDLE hk = srv_heap_->GetCPUDescriptorHandleForHeapStart(); hk.ptr += (art_slot + k) * srv_size_;
+        device_->CreateShaderResourceView(texture, nullptr, hk);
+      }
+      D3D12_GPU_DESCRIPTOR_HANDLE art_gpu = srv_heap_->GetGPUDescriptorHandleForHeapStart(); art_gpu.ptr += art_slot * srv_size_;
+      const float window = (float)client_w_ / std::max((float)client_h_, 1.0f), shape = (float)art->width / std::max((float)art->height, 1.0f);
+      const float sx = shape > window ? window / shape : 1.0f, sy = shape > window ? 1.0f : shape / window;
+      // The picture's rectangle, for the soft shadow it casts on the art (border_edge 1).
+      const float art_aspect = output_aspect();
+      float art_pw = (float)client_w_, art_ph = art_pw / art_aspect;
+      if (art_ph > (float)client_h_) { art_ph = (float)client_h_; art_pw = art_ph * art_aspect; }
+      const float art_px = ((float)client_w_ - art_pw) * 0.5f, art_py = ((float)client_h_ - art_ph) * 0.5f;
+      const float art_reach = std::clamp(std::max(art_px, art_py) * 0.6f, 12.0f, 160.0f);
+      const float hdr_lane[4] = {hdr_active_ ? 1.0f : 0.0f, (float)opts_.hdr_paper_white,
+                                  opts_.hdr_peak > 0 ? (float)opts_.hdr_peak : hdr_display_peak_, 0.0f};
+      const float art_rect[28] = {sx, art_reversed ? -sy : sy, (1.0f - sx) * 0.5f, art_reversed ? 1.0f - (1.0f - sy) * 0.5f : (1.0f - sy) * 0.5f,
+                                  1.0f / art->width, 1.0f / art->height, 0, 0,
+                                  1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 1, 0,
+                                  art_px, art_py, art_px + art_pw, art_py + art_ph, art_reach, 0, 0, opts_.border_edge ? 1.0f : 0.0f};
+      D3D12_VIEWPORT art_vp{0, 0, (float)client_w_, (float)client_h_, 0, 1};
+      D3D12_RECT art_sc{0, 0, client_w_, client_h_};
+      list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+      list_->RSSetViewports(1, &art_vp);
+      list_->RSSetScissorRects(1, &art_sc);
+      list_->SetPipelineState(hdr_active_ && blit_hdr_pso_ ? blit_hdr_pso_.Get() : blit_pso_.Get());
+      list_->SetGraphicsRootSignature(blit_root_.Get());
+      list_->SetGraphicsRootDescriptorTable(0, art_gpu);
+      list_->SetGraphicsRoot32BitConstants(1, 28, art_rect, 0);
+      list_->SetGraphicsRoot32BitConstants(1, 4, hdr_lane, 28);
+      list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      list_->DrawInstanced(3, 1, 0, 0);
+      art_drawn = true;
+      art_gpu_kept = art_gpu;
+      std::memcpy(art_rect_kept, art_rect, sizeof art_rect_kept);
+      std::memcpy(art_hdr_kept, hdr_lane, sizeof art_hdr_kept);
+      // Root constants stay set: the draws after this one set only the first twenty, and must not
+      // inherit the shadow.
+      const float no_frame[8] = {};
+      list_->SetGraphicsRoot32BitConstants(1, 8, no_frame, 20);
+    }
+  }
+  // Letterbox the output at the game's aspect (XFB region c.src_w x lines); the widescreen
+  // setting also drives the Slippi code on the simulation side.
+  if (opts_.widescreen != widescreen_sent_) { widescreen_sent_ = opts_.widescreen; slippi::request_widescreen(opts_.widescreen); }
+  if (opts_.fod_reflections != fod_reflections_sent_) { fod_reflections_sent_ = opts_.fod_reflections; slippi::request_fod_reflections(opts_.fod_reflections); }
+  // The Gecko code wins if both are somehow set, so the two can never widen the same frame twice.
+  set_true_widescreen(opts_.true_widescreen && !opts_.widescreen, true_widescreen_aspect(opts_, client_w_, client_h_));
+  float src_h_lines = (float)c.src_h * c.y_scale;
+  float aspect = output_aspect();
+  float ww = (float)client_w_, wh = (float)client_h_;
+  float vw = ww, vh = ww / aspect;
+  if (vh > wh) { vh = wh; vw = wh * aspect; }
+  // A player-chosen shader preset takes the place of the built-in CRT model. Presets are written
+  // for the console's own picture, so the plain present is drawn into a texture of that size
+  // (640 columns by the lines sent to the display) and the preset's passes draw it to the window.
+  bool shader_on = !opts_.shader_preset.empty() &&
+                   user_shader::d3d12_prepare(device_.Get(), opts_.shader_preset, [](void* self) { static_cast<D3D12Backend*>(self)->wait_gpu(); }, this);
+  if (opts_.shader_preset.empty()) user_shader::d3d12_prepare(device_.Get(), std::string(), [](void* self) { static_cast<D3D12Backend*>(self)->wait_gpu(); }, this);
+  const uint32_t shader_w = (uint32_t)std::max(c.src_w, 1u), shader_h = (uint32_t)std::max(std::lround(src_h_lines), 1L);
+  if (shader_on && (!shader_source_ || shader_source_w_ != shader_w || shader_source_h_ != shader_h)) {
+    if (shader_source_) wait_gpu();
+    shader_source_.Reset();
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = shader_w; rd.Height = shader_h;
+    rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 1}};
+    if (FAILED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv, IID_PPV_ARGS(&shader_source_)))) {
+      shader_source_.Reset(); shader_on = false;
+      host::log("shaders: the picture texture could not be made; the preset is off this frame");
+    } else { shader_source_w_ = shader_w; shader_source_h_ = shader_h; }
+  }
+  const bool crt_on = opts_.crt_filter && !shader_on;
+  const CrtLook crt = crt_look(crt_on ? opts_.crt_filter : 0, opts_.crt_curve);
+  CrtFit crt_fit_now{vh, 0.0f, src_h_lines};
+  // Only the built-in CRT lays its lines on whole pixels (crt_fit: more, finer lines, the picture keeps its size).
+  if (crt_on) crt_fit_now = crt_fit(vh, src_h_lines);
+  D3D12_VIEWPORT vp{(ww - vw) * 0.5f, (wh - vh) * 0.5f, vw, vh, 0, 1};
+  if (crt_on || shader_on) { vp.TopLeftX = std::floor(vp.TopLeftX); vp.TopLeftY = std::floor(vp.TopLeftY); }   // whole pixels: the raster is laid on the pixel grid
+  D3D12_RECT sc{0, 0, client_w_, client_h_};
+  D3D12_CPU_DESCRIPTOR_HANDLE shader_rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); shader_rtv.ptr += 7 * rtv_size_;
+  if (shader_on) {
+    D3D12_RESOURCE_BARRIER to_target{};
+    to_target.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_target.Transition = {shader_source_.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET};
+    list_->ResourceBarrier(1, &to_target);
+    device_->CreateRenderTargetView(shader_source_.Get(), nullptr, shader_rtv);
+    list_->OMSetRenderTargets(1, &shader_rtv, FALSE, nullptr);
+    D3D12_VIEWPORT picture{0, 0, (float)shader_w, (float)shader_h, 0, 1};
+    D3D12_RECT picture_sc{0, 0, (LONG)shader_w, (LONG)shader_h};
+    list_->RSSetViewports(1, &picture);
+    list_->RSSetScissorRects(1, &picture_sc);
+  } else {
+    list_->RSSetViewports(1, &vp);
+    list_->RSSetScissorRects(1, &sc);
+  }
+  list_->SetPipelineState(hdr_active_ && (crt_on ? crt_hdr_pso_ : blit_hdr_pso_)
+                              ? (crt_on ? crt_hdr_pso_.Get() : blit_hdr_pso_.Get())
+                              : crt_on ? crt_pso_.Get() : blit_pso_.Get());
+  list_->SetGraphicsRootSignature(blit_root_.Get());
+  list_->SetGraphicsRootDescriptorTable(0, g);
+  // In-place DLAA leaves a full-size EFB image, so it is presented exactly like the un-upscaled EFB:
+  // same displayed sub-region, same box filter when the render is larger than the window.
+  const bool fills_output = upscaled && !dlss_in_place_;
+  float src_w = upscaled ? (float)dlss_out_w_ : (float)efb_w_, src_h = upscaled ? (float)dlss_out_h_ : (float)efb_h_;
+  const float hdr_lane[4] = {hdr_active_ ? 1.0f : 0.0f, (float)opts_.hdr_paper_white,
+                              opts_.hdr_peak > 0 ? (float)opts_.hdr_peak : hdr_display_peak_, 0.0f};
+  float rect[28] = {(float)c.src_w / EFB_WIDTH, (float)c.src_h / EFB_HEIGHT, (float)c.src_x / EFB_WIDTH, (float)c.src_y / EFB_HEIGHT,
+                    1.0f / std::max(src_w, 1.0f), 1.0f / std::max(src_h, 1.0f), std::clamp(opts_.sharpness, 0.0f, 1.0f), 0.0f,   // 0: the removed path tracer's HDR picture flag
+                    1.0f, 1.0f, hud_composite ? 1.0f : 0.0f, std::getenv("MELEE_DEBUG_HUDMASK") ? 1.0f : 0.0f,
+                    // Output uv to EFB uv, for the HUD mask and the depth the ambient occlusion reads.
+                    // Only an upscaled image that fills the output needs the mapping: the plain EFB
+                    // and DLAA's EFB-sized image are already sampled with EFB uv (rect above), and
+                    // mapping those a second time drew the occlusion edges away from their objects.
+                    fills_output ? (float)c.src_w / EFB_WIDTH : 1.0f, fills_output ? (float)c.src_h / EFB_HEIGHT : 1.0f,
+                    fills_output ? (float)c.src_x / EFB_WIDTH : 0.0f, fills_output ? (float)c.src_y / EFB_HEIGHT : 0.0f,
+                    opts_.brightness, opts_.contrast, opts_.vibrance, opts_.screen_space_ao,
+                    // The CRT model: scanline depth, mask depth, curvature, scanlines in the picture;
+                    // columns, output pixels per scanline, halation.
+                    crt.scan, crt.mask, crt.curve, std::max(crt_fit_now.lines, 1.0f),
+                    (float)c.src_w, vh / std::max(crt_fit_now.lines, 1.0f), crt.halation, crt_fit_now.shift};
+  // Averaging box when the rendered image is larger than the output. The two axes shrink by
+  // different amounts (the picture is letterboxed to 16:9 inside the window), so they get their
+  // own tap counts; using the horizontal count for both left vertical edges aliasing.
+  if (!fills_output) {
+    rect[8] = (float)std::clamp((int)std::lround((double)c.src_w * scale_ / std::max(vw, 1.0f)), 1, 4);
+    rect[9] = (float)std::clamp((int)std::lround((double)c.src_h * scale_ / std::max(vh, 1.0f)), 1, 4);
+  }
+  if (fills_output) {
+    rect[0] = 1.0f; rect[1] = 1.0f; rect[2] = 0.0f; rect[3] = 0.0f;
+    // DLSS output larger than the window (supersampled): the same averaging box native gets.
+    rect[8] = (float)std::clamp((int)std::lround((double)dlss_out_w_ / std::max(vw, 1.0f)), 1, 4);
+    rect[9] = (float)std::clamp((int)std::lround((double)dlss_out_h_ / std::max(vh, 1.0f)), 1, 4);
+  }
+  if (shader_on) {   // the averaging box for the console-sized texture, and no sharpening before the preset
+    rect[6] = 0.0f;
+    rect[8] = (float)std::clamp((int)std::lround((fills_output ? (double)dlss_out_w_ : (double)c.src_w * scale_) / shader_w), 1, 4);
+    rect[9] = (float)std::clamp((int)std::lround((fills_output ? (double)dlss_out_h_ : (double)c.src_h * scale_) / shader_h), 1, 4);
+  }
+  list_->SetGraphicsRoot32BitConstants(1, 28, rect, 0);
+  list_->SetGraphicsRoot32BitConstants(1, 4, hdr_lane, 28);
+  list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  list_->DrawInstanced(3, 1, 0, 0);
+  if (fg_applied_ > 0 && hud_composite && fg_ui_pso_) {
+    // Frame generation's UI layer: the same picture placement, the HUD alone with its mask as alpha.
+    if (!fg_ui_ || fg_ui_->GetDesc().Width != (UINT64)client_w_ || fg_ui_->GetDesc().Height != (UINT)client_h_) {
+      fg_ui_.Reset();
+      fg_ui_read_ = false;
+      D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+      D3D12_RESOURCE_DESC rd{};
+      rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D; rd.Width = (UINT64)client_w_; rd.Height = (UINT)client_h_;
+      rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+      rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+      D3D12_CLEAR_VALUE cv{DXGI_FORMAT_R8G8B8A8_UNORM, {0, 0, 0, 0}};
+      if (FAILED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                                                  IID_PPV_ARGS(&fg_ui_)))) fg_ui_.Reset();
+      if (fg_ui_) {
+        D3D12_CPU_DESCRIPTOR_HANDLE h = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); h.ptr += 14 * rtv_size_;
+        device_->CreateRenderTargetView(fg_ui_.Get(), nullptr, h);
+      }
+    }
+    if (fg_ui_) {
+      constexpr D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      D3D12_RESOURCE_BARRIER ub{};
+      ub.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      if (fg_ui_read_) {
+        ub.Transition = {fg_ui_.Get(), 0, kRead, D3D12_RESOURCE_STATE_RENDER_TARGET};
+        list_->ResourceBarrier(1, &ub);
+      }
+      D3D12_CPU_DESCRIPTOR_HANDLE ui_rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); ui_rtv.ptr += 14 * rtv_size_;
+      const float clear[4] = {0, 0, 0, 0};
+      list_->ClearRenderTargetView(ui_rtv, clear, 0, nullptr);
+      list_->OMSetRenderTargets(1, &ui_rtv, FALSE, nullptr);
+      list_->SetPipelineState(fg_ui_pso_.Get());
+      list_->DrawInstanced(3, 1, 0, 0);
+      ub.Transition = {fg_ui_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, kRead};
+      list_->ResourceBarrier(1, &ub);
+      fg_ui_read_ = true;
+      streamline::tag_frame_generation_ui(list_.Get(), fg_ui_.Get(), (uint32_t)kRead, (uint32_t)client_w_, (uint32_t)client_h_);
+      list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    }
+  }
+  if (shader_on) {
+    D3D12_RESOURCE_BARRIER to_source{};
+    to_source.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_source.Transition = {shader_source_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE};
+    list_->ResourceBarrier(1, &to_source);
+    const user_shader::Target where{vp.TopLeftX, vp.TopLeftY, (uint32_t)std::max(vw, 1.0f), (uint32_t)std::max(vh, 1.0f)};
+    user_shader::d3d12_draw(list_.Get(), shader_source_.Get(), rtv.ptr, (int)backbuffer_format_,
+                            (uint32_t)client_w_, (uint32_t)client_h_, where, (size_t)frame_counter_);
+    // The preset's passes leave their own heaps, pipeline, targets and viewport on the list.
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
+    list_->SetDescriptorHeaps(2, heaps);
+    list_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    D3D12_VIEWPORT whole{0, 0, (float)client_w_, (float)client_h_, 0, 1};
+    list_->RSSetViewports(1, &whole);
+    if (art_drawn) {
+      // The bars around the picture (pillarbox and letterbox), each its own scissor.
+      const LONG px0 = (LONG)std::floor(vp.TopLeftX), py0 = (LONG)std::floor(vp.TopLeftY);
+      const LONG px1 = (LONG)std::ceil(vp.TopLeftX + vp.Width), py1 = (LONG)std::ceil(vp.TopLeftY + vp.Height);
+      const D3D12_RECT bars[4] = {{0, 0, px0, client_h_}, {px1, 0, client_w_, client_h_},
+                                  {px0, 0, px1, py0}, {px0, py1, px1, client_h_}};
+      list_->SetPipelineState(hdr_active_ && blit_hdr_pso_ ? blit_hdr_pso_.Get() : blit_pso_.Get());
+      list_->SetGraphicsRootSignature(blit_root_.Get());
+      list_->SetGraphicsRootDescriptorTable(0, art_gpu_kept);
+      list_->SetGraphicsRoot32BitConstants(1, 28, art_rect_kept, 0);
+      list_->SetGraphicsRoot32BitConstants(1, 4, art_hdr_kept, 28);
+      list_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      for (const D3D12_RECT& bar : bars) {
+        if (bar.right <= bar.left || bar.bottom <= bar.top) continue;
+        list_->RSSetScissorRects(1, &bar);
+        list_->DrawInstanced(3, 1, 0, 0);
+      }
+      const float no_frame[8] = {};
+      list_->SetGraphicsRoot32BitConstants(1, 8, no_frame, 20);
+    }
+    list_->RSSetScissorRects(1, &sc);
+  }
+  std::swap(depth_barrier.Transition.StateBefore, depth_barrier.Transition.StateAfter);
+  list_->ResourceBarrier(1, &depth_barrier);
+#ifdef GX_PC_SETTINGS
+  if (settings_ui_) {
+    // ImGui's texture upload does not check its GPU calls: on a lost device it would crash on a null
+    // buffer. Report the loss here, with its reason and the switch to Direct3D 11.
+    if (const HRESULT removed = device_->GetDeviceRemovedReason(); FAILED(removed)) check(removed, "the settings overlay");
+    settings_ui_->draw(list_.Get());
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
+    list_->SetDescriptorHeaps(2, heaps);
+  }
+#endif
+  D3D12_RESOURCE_BARRIER back[4]{};
+  back[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  back[0].Transition = {source, 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, source_state};
+  back[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  back[1].Transition = {target, 0, D3D12_RESOURCE_STATE_RENDER_TARGET, target_state};
+  back[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  back[2].Transition = {efb_color_.Get(), 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET};
+  back[3].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  back[3].Transition = {hud_composite ? hud_mask_.Get() : nullptr, 0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET};
+  list_->ResourceBarrier(hud_composite ? 4 : 2, back);
+  // Restore EFB as the render target for any later commands in this frame.
+  bind_efb_targets();
+}
+
+void D3D12Backend::record_flicker_scan() {
+  resolve_efb();
+  const D3D12_RESOURCE_DESC desc = efb_color_->GetDesc();
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+  UINT64 total = 0;
+  device_->GetCopyableFootprints(&desc, 0, 1, 0, &fp, nullptr, nullptr, &total);
+  if (!scan_rb_[slot_] || scan_rb_size_[slot_] < total) {
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = total; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    scan_rb_[slot_].Reset();
+    if (FAILED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&scan_rb_[slot_])))) return;
+    scan_rb_size_[slot_] = total;
+  }
+  D3D12_RESOURCE_BARRIER b{};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition = {efb_color_.Get(), 0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+  list_->ResourceBarrier(1, &b);
+  D3D12_TEXTURE_COPY_LOCATION dst{scan_rb_[slot_].Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+  dst.PlacedFootprint = fp;
+  D3D12_TEXTURE_COPY_LOCATION src{efb_color_.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+  src.SubresourceIndex = 0;
+  list_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  std::swap(b.Transition.StateBefore, b.Transition.StateAfter);
+  list_->ResourceBarrier(1, &b);
+  scan_fp_[slot_] = fp; scan_pending_[slot_] = true; scan_frame_[slot_] = frames_presented_;
+}
+
+// Reduces the copied EFB to the scanner's grid: each cell averages a 4x4 spread of pixels from its
+// block of the picture (the visible 640x480 part; the rows below it are never shown).
+void D3D12Backend::read_flicker_scan() {
+  scan_pending_[slot_] = false;
+  const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp = scan_fp_[slot_];
+  const D3D12_RANGE range{0, (SIZE_T)scan_rb_size_[slot_]};
+  void* mapped = nullptr;
+  if (FAILED(scan_rb_[slot_]->Map(0, &range, &mapped))) return;
+  const uint8_t* base = (const uint8_t*)mapped + fp.Offset;
+  const uint32_t w = fp.Footprint.Width, h = std::min<uint32_t>(fp.Footprint.Height, fp.Footprint.Width * 480 / 640);
+  constexpr int G = FlickerScanner::kGrid;
+  static float grid[G * G];
+  for (int gy = 0; gy < G; ++gy)
+    for (int gx = 0; gx < G; ++gx) {
+      float sum = 0;
+      for (int sy = 0; sy < 4; ++sy)
+        for (int sx = 0; sx < 4; ++sx) {
+          const uint32_t x = (uint32_t)((gx + (sx + 0.5f) / 4.0f) * w / G), y = (uint32_t)((gy + (sy + 0.5f) / 4.0f) * h / G);
+          const uint8_t* p = base + (size_t)y * fp.Footprint.RowPitch + (size_t)x * 4;
+          sum += p[0] * 0.25f + p[1] * 0.6f + p[2] * 0.15f;
+        }
+      grid[gy * G + gx] = sum / 16.0f;
+    }
+  const D3D12_RANGE none{0, 0};
+  scan_rb_[slot_]->Unmap(0, &none);
+  scanner_.push(grid, scan_frame_[slot_]);
+}
+
+// Reads back the previous use of this frame slot's query pair(s), fence-safe for the same reason
+// read_flicker_scan is: this only runs after wait_fence(slot_fence_[slot_]) at the top of the frame.
+void D3D12Backend::read_gpu_timers() {
+  timer_pending_[slot_] = false;
+  const uint8_t mask = timer_mask_[slot_];
+  if (!timer_freq_) return;
+  // A pass that did not run this frame (its mask bit clear) goes back to 0 rather than keeping its
+  // last measurement: a stale "+9ms" sitting in the breakdown after the pass was turned off
+  // would misreport what is actually happening, and would throw off the "Native (estimated)" number
+  // too, since that subtracts these from the total.
+  if (!(mask & 1)) g_dlaa_pass_ms = 0.0f;
+  if (!mask) return;
+  const D3D12_RANGE range{0, TIMERS_PER_SLOT * sizeof(uint64_t)};
+  uint64_t* ts = nullptr;
+  if (FAILED(timer_rb_[slot_]->Map(0, &range, (void**)&ts))) return;
+  auto ms = [&](int a, int b) { return ts[b] > ts[a] ? (float)((double)(ts[b] - ts[a]) * 1000.0 / (double)timer_freq_) : -1.0f; };
+  if (mask & 1) { const float v = ms(0, 1); if (v >= 0.0f) g_dlaa_pass_ms = v; }
+  if (mask & 4) { const float v = ms(4, 5); if (v >= 0.0f) { gpu_frame_ms_sum_ += v; ++gpu_frame_ms_samples_; } }
+  if ((mask & 4) && slot_shown_[slot_] && clock_at_ >= 0.0 && ts[5] != 0) {
+    static const double qpc_hz = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (double)f.QuadPart : 1e7; }();
+    const double gpu_end = (double)clock_cpu_ / qpc_hz + clock_offset_ +
+                           (double)(int64_t)(ts[5] - clock_gpu_) / (double)timer_freq_;
+    const double lag = gpu_end - slot_cpu_start_[slot_];
+    if (lag > 0.0 && lag < 0.1) { display_lag_ = lag; ++display_lag_serial_; }
+    if (shown_trace_) std::fprintf(shown_trace_, "%.6f,%.6f,%.6f\n", slot_cpu_start_[slot_], gpu_end, slot_moment_[slot_]);
+  }
+  static uint64_t logged = 0;
+  if (mask & 3) {
+    if (++logged % 180 == 1) host::log("gputimer: mask %u freq %llu dlaa %.2f ms", mask, (unsigned long long)timer_freq_, g_dlaa_pass_ms.load());
+  }
+  const D3D12_RANGE none{0, 0};
+  timer_rb_[slot_]->Unmap(0, &none);
+}
+
+// A replacement that finished loading in the background: drop the native texture drawn meanwhile so
+// the next use builds it again from the replacement (which load() now returns at once). The old
+// resource is kept until the GPU is done with it, and descriptor tables name resources by pointer.
+void D3D12Backend::swap_in_ready_replacements() {
+  if (pending_hd_.empty() || (frame_counter_ & 1)) return;
+  bool dropped = false;
+  for (auto it = pending_hd_.begin(); it != pending_hd_.end();) {
+    auto tex = textures_.find(it->first);
+    if (tex == textures_.end()) { it = pending_hd_.erase(it); continue; }
+    if (!texpack::ready(it->second)) { ++it; continue; }
+    frame_garbage_[slot_].push_back(tex->second.resource);
+    textures_.erase(tex);
+    it = pending_hd_.erase(it);
+    dropped = true;
+  }
+  if (dropped) texture_sets_.clear();
+}
+
+// HDR10 output: whether the screen the window is on has Windows HDR on (checked every 60 presents),
+// and the swap chain in the format and colour space the setting asks for. A change rebuilds the
+// swap chain's buffers in place and the settings panel for the new format.
+void D3D12Backend::update_hdr() {
+  if (!swapchain_) return;
+#ifdef GX_PC_SETTINGS
+  // Tests (MELEE_TEST_OVERLAY_REBUILD=<n>): the overlay is rebuilt n times, 300 frames apart from
+  // frame 300, as an HDR switch rebuilds it, so a test can check that its pictures survive.
+  {
+    static int rebuilds = [] { const char* v = host::test_env::getenv("MELEE_TEST_OVERLAY_REBUILD"); return v ? std::atoi(v) : 0; }();
+    if (rebuilds > 0 && settings_ui_ && frame_counter_ >= 300 && frame_counter_ % 300 == 0) {
+      --rebuilds;
+      wait_gpu();
+      settings_ui_.reset();
+      settings_ui_ = std::make_unique<PcSettingsUI>(hwnd_, device_.Get(), queue_.Get(), opts_, (int)backbuffer_format_);
+      host::log("d3d12: overlay rebuilt for a test (%d more)", rebuilds);
+    }
+  }
+#endif
+  if (hdr_checked_frame_ == ~0ull || frame_counter_ - hdr_checked_frame_ >= 60) {
+    hdr_checked_frame_ = frame_counter_;
+    bool display_hdr = false;
+    ComPtr<IDXGIOutput> output;
+    ComPtr<IDXGIOutput6> output6;
+    if (SUCCEEDED(swapchain_->GetContainingOutput(&output)) && SUCCEEDED(output.As(&output6))) {
+      DXGI_OUTPUT_DESC1 desc{};
+      if (SUCCEEDED(output6->GetDesc1(&desc))) {
+        display_hdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ||
+                      host::test_env::getenv("MELEE_TEST_HDR_DISPLAY") != nullptr;   // hidden test runs: the HDR switch on an SDR screen
+        if (desc.MaxLuminance > 100.0f) hdr_display_peak_ = desc.MaxLuminance;
+      }
+    }
+    // Windows HDR on with the game's HDR output off: Windows maps the game's SDR picture itself,
+    // which on some screens looks washed out. Logged on every change so a colour report shows it.
+    static bool hdr_state_logged = false;
+    if (g_hdr_display.exchange(display_hdr, std::memory_order_relaxed) != display_hdr || !hdr_state_logged)
+      host::log("display: Windows HDR %s for this screen%s", display_hdr ? "on" : "off",
+                display_hdr && !opts_.hdr_output ? "; the game's HDR output is off, so Windows maps its SDR picture" : "");
+    hdr_state_logged = true;
+  }
+  // A RetroArch shader preset draws SDR into the swap chain itself: HDR waits until it is off.
+  const bool want = opts_.hdr_output && hdr_display_available() && blit_hdr_pso_ && opts_.shader_preset.empty();
+  if (want == hdr_active_) return;
+  wait_gpu();
+  hdr_active_ = want;
+  backbuffer_format_ = want ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+  create_swapchain_targets(true);
+  ComPtr<IDXGISwapChain3> sc3;
+  if (SUCCEEDED(swapchain_.As(&sc3))) {
+    const DXGI_COLOR_SPACE_TYPE space = want ? DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    UINT support = 0;
+    if (SUCCEEDED(sc3->CheckColorSpaceSupport(space, &support)) && (support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
+      sc3->SetColorSpace1(space);
+  }
+#ifdef GX_PC_SETTINGS
+  PcSettingsUI::set_hdr_paper_white(want ? (float)opts_.hdr_paper_white : 0.0f);
+  // The old panel goes first: its destructor ends the current ImGui context, which would be the new
+  // panel's if that were made first (a crash at the next draw, every start with HDR on).
+  if (settings_ui_) {
+    settings_ui_.reset();
+    settings_ui_ = std::make_unique<PcSettingsUI>(hwnd_, device_.Get(), queue_.Get(), opts_, (int)backbuffer_format_);
+  }
+#endif
+  if (fg_applied_ > 0) fg_applied_ = -1;   // frame generation picks up the new format at the next present
+  host::log("d3d12: HDR10 output %s (paper white %d nits, peak %.0f nits)", want ? "on" : "off", opts_.hdr_paper_white,
+            opts_.hdr_peak > 0 ? (float)opts_.hdr_peak : hdr_display_peak_);
+}
+
+void D3D12Backend::capture_backbuffer() {
+  fg_presenter_wait();
+  // Read back the last presented back buffer into a PPM (development aid).
+  if (backbuffer_format_ != DXGI_FORMAT_R8G8B8A8_UNORM) { host::log("capture: skipped (HDR10 output is on)"); return; }
+  UINT bb = (swapchain_->GetCurrentBackBufferIndex() + 2) % 3;
+  ID3D12Resource* src = backbuffers_[bb].Get();
+  D3D12_RESOURCE_DESC desc = src->GetDesc();
+  UINT pitch = (UINT)((desc.Width * 4 + 255) & ~255ull);
+  D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+  D3D12_RESOURCE_DESC rd{};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = (UINT64)pitch * desc.Height; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+  rd.SampleDesc.Count = 1; rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  ComPtr<ID3D12Resource> staging;
+  check(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&staging)), "readback");
+  wait_gpu();   // the readback reuses this slot's allocator: every in-flight frame must be done
+  allocators_[slot_]->Reset(); list_->Reset(allocators_[slot_].Get(), nullptr);
+  D3D12_RESOURCE_BARRIER b{};
+  b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  b.Transition = {src, 0, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE};
+  list_->ResourceBarrier(1, &b);
+  D3D12_TEXTURE_COPY_LOCATION dst{staging.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+  dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R8G8B8A8_UNORM, (UINT)desc.Width, desc.Height, 1, pitch};
+  D3D12_TEXTURE_COPY_LOCATION s{src, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+  list_->CopyTextureRegion(&dst, 0, 0, 0, &s, nullptr);
+  b.Transition = {src, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT};
+  list_->ResourceBarrier(1, &b);
+  list_->Close();
+  ID3D12CommandList* lists[] = {list_.Get()};
+  queue_->ExecuteCommandLists(1, lists);
+  wait_gpu();
+  uint8_t* data; staging->Map(0, nullptr, (void**)&data);
+  if (opts_.capture_burst) {
+    // Keep burst captures in memory so consecutive presented frames stay microseconds apart; the
+    // files are written when the burst ends (or at shutdown).
+    PendingCapture pc; pc.path = opts_.capture_path; pc.w = (UINT)desc.Width; pc.h = desc.Height; pc.pitch = pitch; pc.sequence = capture_sequence_;
+    pc.data.assign(data, data + (size_t)pitch * desc.Height);
+    pending_captures_.push_back(std::move(pc));
+    staging->Unmap(0, nullptr);
+    if (pending_captures_.size() >= opts_.capture_burst) flush_captures();
+    return;
+  }
+    std::ofstream f(opts_.capture_path, std::ios::binary);
+  f << "P6\n" << desc.Width << ' ' << desc.Height << "\n255\n";
+  for (UINT y = 0; y < desc.Height; ++y) for (UINT x = 0; x < desc.Width; ++x) f.write((const char*)data + (size_t)y * pitch + x * 4, 3);
+  staging->Unmap(0, nullptr);
+  host::log("captured %s (sim frame %llu)", opts_.capture_path.c_str(), (unsigned long long)capture_sequence_);
+}
+
+void D3D12Backend::flush_captures() {
+  for (const PendingCapture& pc : pending_captures_) {
+    std::ofstream f(pc.path, std::ios::binary);
+    f << "P6\n" << pc.w << ' ' << pc.h << "\n255\n";
+    for (UINT y = 0; y < pc.h; ++y) for (UINT x = 0; x < pc.w; ++x) f.write((const char*)pc.data.data() + (size_t)y * pc.pitch + x * 4, 3);
+    host::log("captured %s (sim frame %llu)", pc.path.c_str(), (unsigned long long)pc.sequence);
+  }
+  pending_captures_.clear();
+}
+
+// Set from the settings UI's key handling (F2), read on the render thread.
+std::atomic<unsigned> g_capture_request{0};
+
+static void dump_frame(const Frame& frame, const std::string& path) {
+  FILE* f = fopen(path.c_str(), "w");
+  if (!f) return;
+  fprintf(f, "frame %llu: %zu draws, %zu copies, %zu vertices\n", (unsigned long long)frame.sequence, frame.draws.size(), frame.copies.size(), frame.vertices.size());
+  for (const FrameCommand& cmd : frame.commands) {
+    if (cmd.kind == FrameCommand::Copy) {
+      const EfbCopy& c = frame.copies[cmd.index];
+      fprintf(f, "COPY dest=%08X src=%u,%u %ux%u fmt=%u xfb=%d clear=%d color=%08X z=%06X yscale=%.3f\n", c.dest_addr, c.src_x, c.src_y, c.src_w, c.src_h, c.format, c.to_xfb, c.clear, c.clear_color, c.clear_z, c.y_scale);
+      continue;
+    }
+    const DrawCall& d = frame.draws[cmd.index];
+    const float* vp = (const float*)&d.xf_regs[0x1A];
+    const float* pr = (const float*)&d.xf_regs[0x20];
+    fprintf(f, "DRAW prim=%02X n=%u comps=%06X | vp wd=%.1f ht=%.1f zr=%.0f xo=%.1f yo=%.1f fz=%.0f | proj type=%u [%g %g %g %g %g %g] | genmode=%06X zmode=%02X blend=%04X alphacmp=%06X zctl=%02X scissor=%06X/%06X off=%06X | texgens=%u chans=%u mia=%06X\n",
+            d.primitive, d.vertex_count, d.components, vp[0], vp[1], vp[2], vp[3], vp[4], vp[5], d.xf_regs[0x26], pr[0], pr[1], pr[2], pr[3], pr[4], pr[5],
+            d.bp.reg[0], d.bp.zmode(), d.bp.blendmode(), d.bp.alpha_test(), d.bp.zcontrol(), d.bp.reg[BP_SCISSORTL], d.bp.reg[BP_SCISSORBR], d.bp.reg[BP_SCISSOROFFSET],
+            d.xf_regs[0x3F] & 15, d.xf_regs[0x09] & 3, d.matrix_index_a);
+    fprintf(f, "   owner=%u skinned=%u\n", d.owner_player, d.skinned ? 1u : 0u);
+    const Vertex& v = frame.vertices[d.first_vertex];
+    fprintf(f, "   v0 pos=(%g %g %g) nrm=(%g %g %g) col0=%02X%02X%02X%02X uv0=(%g %g) posmtx=%u | mtx row0=[%g %g %g %g]\n", v.pos[0], v.pos[1], v.pos[2], v.nrm[0], v.nrm[1], v.nrm[2],
+            v.col0[0], v.col0[1], v.col0[2], v.col0[3], v.uv[0][0], v.uv[0][1], v.posmtx, d.posMatrices[v.posmtx * 4], d.posMatrices[v.posmtx * 4 + 1], d.posMatrices[v.posmtx * 4 + 2], d.posMatrices[v.posmtx * 4 + 3]);
+    {
+      const float* nm = &d.normalMatrices[(v.posmtx >= 32 ? v.posmtx - 32 : v.posmtx) * 3];
+      const float* pm = &d.posMatrices[v.posmtx * 4];
+      fprintf(f, "   posmtx rows: [%g %g %g %g] [%g %g %g %g] [%g %g %g %g] | nrmmtx rows: [%g %g %g] [%g %g %g] [%g %g %g]\n",
+              pm[0], pm[1], pm[2], pm[3], pm[4], pm[5], pm[6], pm[7], pm[8], pm[9], pm[10], pm[11], nm[0], nm[1], nm[2], nm[3], nm[4], nm[5], nm[6], nm[7], nm[8]);
+    }
+    fprintf(f, "   xf: numchan=%u chan0 col=%04X alpha=%04X chan1 col=%04X alpha=%04X amb=%08X/%08X mat=%08X/%08X | tevregs RA/BG: %06X/%06X %06X/%06X %06X/%06X %06X/%06X\n",
+            d.xf_regs[0x09] & 3, d.xf_regs[0x0E], d.xf_regs[0x10], d.xf_regs[0x0F], d.xf_regs[0x11], d.xf_regs[0x0A], d.xf_regs[0x0B], d.xf_regs[0x0C], d.xf_regs[0x0D],
+            d.bp.reg[0xE0], d.bp.reg[0xE1], d.bp.reg[0xE2], d.bp.reg[0xE3], d.bp.reg[0xE4], d.bp.reg[0xE5], d.bp.reg[0xE6], d.bp.reg[0xE7]);
+    for (int i = 0; i < 8; ++i) if (d.textures[i].used)
+      fprintf(f, "   tex%d addr=%08X %ux%u fmt=%u tlut=%X/%u mode0=%06X mode1=%06X mips=%u\n", i, d.textures[i].addr, d.textures[i].width, d.textures[i].height, d.textures[i].format, d.textures[i].tlut_addr, d.textures[i].tlut_format, d.textures[i].mode0, d.textures[i].mode1, d.textures[i].mip_levels);
+    for (uint32_t s = 0; s <= d.bp.numtevstages(); ++s)
+      fprintf(f, "   tev%u cc=%06X ac=%06X order: map=%d coord=%d en=%d chan=%d\n", s, d.bp.tev_color(s), d.bp.tev_alpha(s), d.bp.order_texmap(s), d.bp.order_texcoord(s), d.bp.order_enable(s), d.bp.order_colorchan(s));
+  }
+  // Every unique shader in the frame, plus the light blocks of lit draws.
+  std::unordered_map<uint64_t, bool> seen_vs, seen_ps;
+  for (size_t di = 0; di < frame.draws.size(); ++di) {
+    const DrawCall& d = frame.draws[di];
+    VSUid vu = make_vs_uid(d); PSUid pu = make_ps_uid(d);
+    uint64_t vh = vu.hash(), ph = pu.hash();
+    if (!seen_vs[vh]) {
+      seen_vs[vh] = true;
+      fprintf(f, "\n---- vertex shader %016llX (first used by draw %zu) ----\n%s\n", (unsigned long long)vh, di, generate_vertex_shader(vu).c_str());
+      if ((d.xf_regs[0x09] & 3) != 0) {
+        for (int L = 0; L < 8; ++L) {
+          const float* fl = (const float*)(d.lights[L] + 16);
+          uint32_t col; memcpy(&col, d.lights[L] + 12, 4);
+          fprintf(f, "   light%d color=%08X cosatt=(%g %g %g) distatt=(%g %g %g) pos=(%g %g %g) dir=(%g %g %g)\n", L, col,
+                  fl[0], fl[1], fl[2], fl[3], fl[4], fl[5], fl[6], fl[7], fl[8], fl[9], fl[10], fl[11]);
+        }
+      }
+    }
+    if (!seen_ps[ph]) {
+      seen_ps[ph] = true;
+      fprintf(f, "\n---- pixel shader %016llX (first used by draw %zu) ----\n%s\n", (unsigned long long)ph, di, generate_pixel_shader(pu).c_str());
+    }
+  }
+  fclose(f);
+}
+
+void D3D12Backend::log_slow_frame(const Frame& frame, double seconds) {
+  const double ms = seconds * 1e3;
+  if (ms < 10.0 || !in_match_ || slow_logged_ >= 200) return;
+  ++slow_logged_;
+  const SlowFrameCost& c = slow_;
+  host::log("d3d12: slow frame %llu: submit %.1f ms; %u new textures (%.2f MB: create %.1f, decode %.1f, copy %.1f ms); "
+            "pipelines %u queued, %u built in %.1f ms, waited %.1f ms; %u GPU waits %.1f ms; %u descriptor rollovers",
+            (unsigned long long)frame.sequence, ms, c.textures, c.texture_bytes / 1048576.0, c.create_ms, c.decode_ms,
+            c.copy_ms, c.pso_queued, c.pso_built, c.pso_build_ms, c.pso_wait_ms, c.gpu_waits, c.gpu_wait_ms, c.rollovers);
+}
+
+void D3D12Backend::submit_frame(const Frame& frame, const DrawMatrices* overrides) {
+  // Lag test ledger (host.h lagtest_flash_mode): "report" fills from the adapter's newest report,
+  // whatever frame this is; "tick" arrives in frame.test_fill. One line per change, with the time
+  // from its cause to the return of the Present that shows it.
+  double flash_since = 0.0;
+  const int flash_mode = host::lagtest_flash_mode();
+  const int flash_fill = flash_mode == 1 ? host::lagtest_flash_report_fill(&flash_since) : flash_mode == 2 ? frame.test_fill : -1;
+  if (flash_mode == 2) flash_since = frame.tick.pad;
+  struct FlashLog {
+    int fill; double since; const bool& shown;
+    ~FlashLog() {
+      static int last = -1; static int lines = 0;
+      if (fill < 0 || fill == last || !shown) return;
+      last = fill;
+      if (lines++ < 2000) host::log("lag test ledger: %s %.2f ms after its cause (Present returned)", fill ? "white" : "black", (host::now_seconds() - since) * 1000.0);
+    }
+  };
+  bool flash_presented = false;
+  FlashLog flash_log{flash_fill, flash_since, flash_presented};
+  set_presented_test_fill(flash_mode == 1 ? flash_fill : frame.test_fill);
+  Stopwatch frame_sw;
+  Stopwatch part_sw;   // the parts of a frame outside its draws, for the "render cost" line
+  static const bool startup_diag = std::getenv("MELEE_GPU_STARTUP_DIAG") != nullptr;
+  double diag_time = startup_diag ? Stopwatch::now() : 0.0;
+  auto diag = [&](const char* part) {
+    if (!startup_diag) return;
+    const double now = Stopwatch::now(), ms = (now - diag_time) * 1000.0;
+    if (ms > 20.0) host::log("gpu-startup: sim %llu %s %.1f ms", (unsigned long long)frame.sequence, part, ms);
+    diag_time = now;
+  };
+  struct FrameTimer { Stopwatch& sw; ~FrameTimer() { g_prof[11] += sw.lap(); ++g_prof_frames; } } frame_timer{frame_sw};
+  slow_ = {};
+  struct SlowFrameLog { D3D12Backend& backend; const Frame& frame; Stopwatch sw; ~SlowFrameLog() { backend.log_slow_frame(frame, sw.lap()); } } slow_log{*this, frame, {}};
+  video_bg::set_enabled(opts_.video_backgrounds);
+  video_bg::begin_frame(frame.scene_major, frame.scene_minor);
+  set_css_scene(video_bg::learning::scene_slot(frame.scene_major, frame.scene_minor) == 0);
+  in_match_ = frame_in_match(frame);
+  cache_saver_.hold(in_match_);   // timed cache saves wait for the next menu (a library copy is large)
+  set_lightweight_level(opts_.lightweight);
+  publish_look(opts_);
+  effects_filter_ = effects_filter(frame, lightweight_effects_level(opts_.effects_level, opts_.lightweight));
+  lightweight_filter_ = lightweight_filter(frame, opts_.lightweight);
+  widenable_scene_ = frame_has_widenable_scene(frame);
+  integrate_compiled_psos();
+  if (opts_.anisotropy != anisotropy_applied_) { anisotropy_applied_ = opts_.anisotropy; wait_gpu(); sampler_sets_.clear(); }
+  if (opts_.ssaa != ssaa_applied_ || (!dlss_active_ && pick_scale() != scale_)) {
+    ssaa_applied_ = opts_.ssaa;
+    if (pick_scale() != scale_ || opts_.msaa != msaa_applied_) { wait_gpu(); host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); host::log("d3d12: internal resolution now EFB x%d", scale_); }
+  }
+  struct FloatEnvironment {
+    unsigned saved = _mm_getcsr();
+    FloatEnvironment() { _mm_setcsr(0x1f80); }
+    ~FloatEnvironment() { _mm_setcsr(saved); }
+  } float_environment;
+#ifdef GX_PC_SETTINGS
+  // A texture pack was switched on or off in the panel: everything already uploaded was built with
+  // the old set, so drop it and let the next draw rebuild what it needs.
+  if (settings_ui_ && settings_textures_dirty()) { wait_gpu(); textures_.clear(); texture_sets_.clear(); }
+  if (settings_ui_) { settings_set_game_aspect(output_aspect()); settings_set_hud_snapshot(frame); }
+  Stopwatch ui_sw;
+  if (settings_ui_ && settings_ui_->begin(opts_)) {
+    apply_fullscreen_mode();
+    if (pick_scale() != scale_ || opts_.msaa != msaa_applied_) { wait_gpu(); host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); }
+  }
+  g_prof[8] += ui_sw.lap();
+#endif
+  // Texture packs can be switched on and off while the game runs. Every texture already uploaded
+  // was built with (or without) its replacement, so the cache has to go; the GPU may still be
+  // reading those resources this frame, hence the wait.
+  if (texpack::configure(opts_.custom_textures, opts_.dump_textures)) {
+    wait_gpu();
+    textures_.clear();
+    texture_sets_.clear();
+    replacement_bytes_ = 0;
+    texpack_report_frame_ = frame_counter_ + 600;
+  }
+  // A skin picked on the character select screen brought other portraits or stock icons: the same.
+  if (texpack::take_cosmetics_changed()) {
+    wait_gpu();
+    textures_.clear();
+    texture_sets_.clear();
+    replacement_bytes_ = 0;
+  }
+  if (adapter3_ && (frame_counter_ % 30) == 0) update_vram();
+  if (adapter3_ && frame_counter_ && (frame_counter_ % 3600) == 0) {
+    float used = 0, total = 0;
+    if (vram_usage(&used, &total)) host::log("vram: %.2f of %.2f GB in use (EFB %dx%d, replacement textures %.0f MB)", used, total, efb_w_, efb_h_, replacement_bytes_ / 1048576.0);
+    host::log_memory();
+  }
+  if (texpack::enabled() && frame_counter_ >= texpack_report_frame_) {
+    texpack::report();
+    float used = 0, total = 0;
+    if (vram_usage(&used, &total)) host::log("vram: %.2f of %.2f GB (replacement textures %.0f MB of %.0f MB)", used, total,
+                                               replacement_bytes_ / 1048576.0, replacement_budget_ / 1048576.0);
+    texpack_report_frame_ = frame_counter_ + 3600;
+  }
+  // Back from Alt+Tab: Windows took the swap chain out of exclusive fullscreen and nothing put it
+  // back, so the fullscreen-sized buffers were shown in a window of another size, shifted. The mode
+  // is applied again; when it is already right this returns at once.
+  if (host::window_take_activation() && opts_.exclusive_fullscreen && !exclusive_deferred_) apply_fullscreen_mode();
+  if (host::window_take_fullscreen_toggle()) {   // Alt+Enter, F11, or eligible F
+    if (opts_.exclusive_fullscreen) opts_.exclusive_fullscreen = false;
+    else opts_.fullscreen = !host::window_is_fullscreen();
+    apply_fullscreen_mode();
+    if (pick_scale() != scale_ || opts_.msaa != msaa_applied_) { wait_gpu(); host::log("d3d12: dropping %zu EFB copy textures, internal scale %d -> %d", efb_copies_.size(), scale_, pick_scale()); drop_efb_copies(); create_efb(); }
+  }
+  configure_dlss();
+  diag("frame setup");
+  // Never block the presentation thread on a driver pipeline compile. A 12 ms
+  // wait is already most of a 60 Hz frame and is nearly three frames at 240 Hz;
+  // AMD drivers can take long enough here to produce recurring visible hitches.
+  // The fallback PSO keeps the draw alive while the worker publishes the real one.
+  pso_wait_budget_us_ = 0;
+  capturing_efb_ = std::any_of(frame.copies.begin(),frame.copies.end(),[](const EfbCopy& c) { return !c.to_xfb; });
+  ++frame_counter_;
+  if (frame.discontinuous && frame.sequence != temporal_cut_sequence_) {
+    temporal_cut_sequence_ = frame.sequence;
+    last_poses_.clear();
+    dlss_reset_ = fsr_reset_ = true;
+  }
+  if (!opts_.dump_path.empty() && frame_counter_ == opts_.dump_frame) dump_frame(frame, opts_.dump_path);
+  // Submitted frames the GPU has not finished, sampled before this frame's slot wait: the GPU
+  // queue depth the CPU found when it arrived, which is the latency the player feels.
+  const uint64_t fence_completed = fence_->GetCompletedValue();
+  const unsigned frames_queued = fence_value_ > fence_completed ? (unsigned)(fence_value_ - fence_completed) : 0u;
+  slot_ = (int)(frame_counter_ % FRAME_SLOTS);
+  { Stopwatch fence_sw;
+    wait_fence(slot_fence_[slot_]);   // this slot's previous frame (FRAME_SLOTS frames ago) is complete
+    g_prof[17] += fence_sw.lap(); }
+  diag("frame slot fence");
+  if (scan_pending_[slot_]) read_flicker_scan();
+  if (timer_pending_[slot_]) read_gpu_timers();
+  timer_mask_[slot_] = 0;   // this slot's new frame records its own timers
+  if (frame_counter_ % 300 == 0) {
+    // The line a "gets laggier the longer I play" report needs: GPU time per frame from the
+    // timestamp pair around the command list (read back a slot later, so it never stalls), the
+    // queue depth found above, the solver's pairing table and the texture cache. If the delay
+    // grows over a session, one of these grows with it.
+    host::log("gpu: %.2f ms/frame, %u frames queued, solver pairs %zu, textures %zu",
+              gpu_frame_ms_samples_ ? gpu_frame_ms_sum_ / gpu_frame_ms_samples_ : 0.0, frames_queued,
+              solver_pair_counter().load(std::memory_order_relaxed), textures_.size());
+    gpu_frame_ms_sum_ = 0; gpu_frame_ms_samples_ = 0;
+  }
+  vertex_ring_.reset(slot_); index_ring_.reset(slot_); constant_ring_.reset(slot_); upload_ring_.reset(slot_);
+  g_prof[12] += part_sw.lap();
+  select_frame_geometry(frame);
+  g_prof[13] += part_sw.lap();
+  diag("geometry upload fence");
+  frame_garbage_[slot_].clear();
+  descriptor_garbage_[slot_].clear();
+  swap_in_ready_replacements();
+  trim_textures();
+  check(allocators_[slot_]->Reset(), "allocator reset");
+  update_hdr();   // before recording: switching it rebuilds the swap chain's buffers
+  check(list_->Reset(allocators_[slot_].Get(), nullptr), "list reset");
+  ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
+  list_->SetDescriptorHeaps(2, heaps);
+  if (timer_heap_) list_->EndQuery(timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * TIMERS_PER_SLOT + 4);   // frame start, for the "gpu:" line
+  {
+    const double started = host::now_seconds();
+    slot_cpu_start_[slot_] = started; slot_moment_[slot_] = pending_moment_; slot_shown_[slot_] = false;
+    if (timer_freq_ && (clock_at_ < 0.0 || started - clock_at_ > 0.5)) {
+      // The GPU's timestamps on the host clock, refreshed twice a second (the two clocks drift apart slowly).
+      static const double qpc_hz = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (double)f.QuadPart : 1e7; }();
+      UINT64 gpu = 0, cpu = 0;
+      if (SUCCEEDED(queue_->GetClockCalibration(&gpu, &cpu))) {
+        clock_gpu_ = gpu; clock_cpu_ = cpu; clock_offset_ = host::now_seconds() - (double)cpu / qpc_hz; clock_at_ = started;
+      }
+    }
+    static bool trace_opened = false;
+    if (!trace_opened) {
+      trace_opened = true;
+      if (const char* p = host::test_env::getenv("MELEE_TEST_SHOWN_TRACE"); p && *p && (shown_trace_ = std::fopen(p, "w"))) {
+        std::setvbuf(shown_trace_, nullptr, _IOFBF, 1 << 20);
+        std::fputs("cpu_start,gpu_end,moment\n", shown_trace_);
+      }
+    }
+  }
+  bind_efb_targets();
+  if (dlss_active_) {
+    D3D12_CPU_DESCRIPTOR_HANDLE mrtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); mrtv.ptr += 5 * rtv_size_;
+    const float zero[4] = {0, 0, 0, 0};
+    list_->ClearRenderTargetView(mrtv, zero, 0, nullptr);
+    D3D12_CPU_DESCRIPTOR_HANDLE hrtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); hrtv.ptr += 6 * rtv_size_;
+    list_->ClearRenderTargetView(hrtv, zero, 0, nullptr);
+    if (!reflex_token_) streamline::new_frame((uint32_t)frame_counter_);
+    streamline::jitter(frames_presented_, &jitter_x_, &jitter_y_);
+    // Prefer the fighter camera: TM-CE can submit its perspective HUD before the world.
+    streamline::FrameConstants fc{};
+    bool found = false;
+    // Menus are shown exactly as rendered: with no main scene, no draw is jittered or given motion,
+    // and the present blit takes every pixel from the EFB. The upscaler has nothing to add to flat
+    // 2D screens, and the character select cursor left trails through it.
+    const bool in_match = frame_in_match(frame);
+    if (in_match != dlss_in_match_) { dlss_in_match_ = in_match; fc.reset = true; dlss_reset_ = true; fsr_reset_ = true; }
+    // Startup has already allocated and evaluated the feature. This also handles a live mode change.
+    if (!in_match && dlss_active_) streamline::dlss_allocate(list_.Get());
+    if (in_match) {
+      if (const auto* scene = frame_scene_draw(frame)) {
+        build_projection(*scene, fc.projection); set_main_projection(scene); found = true;
+        fc.orthographic = fc.projection[15] == 1.0f;   // the Arcade look's 2D camera
+      }
+    }
+    if (!found) set_main_projection(nullptr);
+    if (!found && !frame.draws.empty()) { build_projection(frame.draws[0], fc.projection); fc.orthographic = true; }
+    fc.jitter_x = jitter_x_ * opts_.dlss_jitter_sign; fc.jitter_y = jitter_y_ * opts_.dlss_jitter_sign;
+    fc.render_w = 640 * scale_; fc.render_h = 480 * scale_;
+    fc.reset = dlss_reset_;
+    // A drained frame writes EFB textures but never evaluates the upscaler. It must not advance
+    // either the per-draw history above or Streamline's previous camera projection.
+    if (!skip_present_) {
+      dlss_reset_ = false;
+      streamline::set_constants(fc);
+    }
+    if (frame_counter_ % 600 == 0 && mv_draws_) { host::log("dlss: %.1f%% of draws had a previous pose (%llu of %llu)", 100.0 * mv_matched_ / mv_draws_, (unsigned long long)mv_matched_, (unsigned long long)mv_draws_); mv_draws_ = mv_matched_ = 0; }
+    if (frame_counter_ % 600 == 0) last_poses_.prune((uint64_t)frames_presented_ + 1);
+  }
+  // Reflex and frame generation: a frame token is needed for the markers even without DLSS, and even
+  // with Reflex's own low-latency mode left Off -- the PC Latency markers below are what feeds the
+  // latency reading, and that keeps working at Native so there is something to compare On against.
+  if (!dlss_active_ && streamline::reflex_available() && !reflex_token_) streamline::new_frame((uint32_t)frame_counter_);
+  {
+    // DLSS-G is only valid while Melee is drawing a running 3D match. Keep it off during
+    // menus, loading screens, and results; those frames do not have usable motion/depth inputs.
+    // With an FSR mode chosen, frame generation is AMD's (update_fsr_frame_generation below).
+    const int want_fg = opts_.frame_generation_mode > 0 && in_match_ && dlss_active_ && !fsr_active() &&
+                        streamline::frame_generation_available()
+                        ? opts_.frame_generation_mode : 0;
+    {
+      // Why frame generation is held off in a match while it is chosen: logged once per reason.
+      static int logged_reason = -1;
+      const int reason = opts_.frame_generation_mode <= 0 || !in_match_ || fsr_active() ? 0
+                       : !dlss_active_ ? 1 : !streamline::frame_generation_available() ? 2 : 0;
+      if (reason != logged_reason) {
+        logged_reason = reason;
+        static const char* const why[] = {"", "DLSS or DLAA is not running", "the plugin is not ready"};
+        if (reason) host::log("dlss: frame generation is chosen but held off in this match: %s", why[reason]);
+      }
+    }
+    // Frame generation needs Reflex on: it takes at least "On" while frame generation runs.
+    const int want_reflex = streamline::reflex_available() ? std::max(opts_.reflex_mode, want_fg ? 1 : 0) : 0;
+    apply_reflex(want_reflex);
+    // Sampled regardless of mode: the PC Latency markers run every frame either way (below), so the
+    // measurement stays available running plain Native -- Reflex's low-latency algorithm is a
+    // separate thing from being told how long a frame is taking.
+    if (streamline::reflex_available() && (frame_counter_ % 30) == 0) streamline::update_reflex_stats();
+    if (want_reflex && (frame_counter_ % 600) == 0) host::log("reflex: render latency %.2f ms", streamline::reflex_latency_ms());
+    if (want_fg != fg_applied_) {
+      streamline::set_frame_generation(want_fg, (uint32_t)efb_w_, (uint32_t)efb_h_, (uint32_t)client_w_,
+                                       (uint32_t)client_h_, 3, (uint32_t)backbuffer_format_,
+                                       (uint32_t)DXGI_FORMAT_R16G16_FLOAT, (uint32_t)DXGI_FORMAT_R32_FLOAT);
+      fg_applied_ = want_fg;
+      // mode 1..3 = 2x..4x, 5 = 5x, 6 = 6x; Dynamic (4) and off leave the rendered rate alone.
+      fg_multiplier_.store(want_fg >= 1 && want_fg <= 3 ? want_fg + 1 : want_fg == 5 || want_fg == 6 ? want_fg : 1,
+                           std::memory_order_relaxed);
+    }
+  }
+  update_fsr_frame_generation();
+  // Both modes measure the same submission boundary. Starting the marker after Reflex's sleep
+  // included subsequent frame selection/re-posing only when Reflex was on, inflating its counter.
+  streamline::pcl_marker(0);
+  streamline::pcl_marker(1); streamline::pcl_marker(2);
+  if (have_clear_) { clear_efb(pending_clear_); have_clear_ = false; }
+  g_prof[14] += part_sw.lap();
+  const EfbCopy* screen = nullptr;
+  for (const EfbCopy& copy : frame.copies) if (copy.to_xfb) screen = &copy;
+  int fullscreen_slot = -1;
+  std::shared_ptr<const video_bg::Frame> fullscreen = video_bg::fullscreen_frame(&fullscreen_slot);
+  const bool css_fullscreen = fullscreen && fullscreen_slot == 0 && screen;
+  unsigned leading_untextured_draws = 0;
+  bool background_drawn = false;
+  bool presented = false;
+  // A backlog frame (skip_present_: the renderer fell behind and catches up without showing it) needs
+  // only the draws that feed its texture copies: later frames read those. The draws after its last
+  // texture copy paint a picture nobody sees, and the screen copy's clear wipes them before the next
+  // frame. Skipping them keeps a GPU that is over budget (an upscaler at a high resolution) from falling
+  // further behind until the simulation has to wait for it. Not when the screen copy keeps the EFB.
+  const size_t needed_commands = [&] {
+    static const bool full_backlog = std::getenv("MELEE_BACKLOG_FULL") != nullptr;   // comparison switch: the pre-0.8.5 full draw
+    if (!skip_present_ || !screen || !screen->clear || full_backlog) return frame.commands.size();
+    size_t end = 0;
+    for (size_t i = 0; i < frame.commands.size(); ++i)
+      if (frame.commands[i].kind != FrameCommand::Draw && !frame.copies[frame.commands[i].index].to_xfb) end = i + 1;
+    return end;
+  }();
+  // A repeated present that a newer game frame overtakes (set_submit_cancel) stops here: no more
+  // draws are recorded, no texture copy is taken from the half-drawn EFB (the copies of this frame's
+  // first present stand), the clears still run so the next frame starts empty, and nothing is
+  // presented. What was recorded is executed as usual, so every tracked resource state holds. Only
+  // on the plain path: an upscaler, frame generation and captures keep per-present history that a
+  // dropped present would leave half written.
+  submit_cancelled_ = false;
+  // MELEE_TEST_CUT_WHILE_CAPTURING=1 (tests): presents are cut short during a capture too, so the captured
+  // frames after a cut can be compared with the same game frames drawn without any.
+  static const bool cut_while_capturing = [] { const char* v = host::test_env::getenv("MELEE_TEST_CUT_WHILE_CAPTURING"); return v && *v == '1'; }();
+  bool cancellable = submit_cancel_ && !skip_present_ && screen && screen->clear && !mvec_out() &&
+                     fg_applied_ <= 0 && !fsr_active() &&
+                     (opts_.capture_path.empty() || cut_while_capturing) && !opts_.flicker_scan && !g_capture_request.load(std::memory_order_relaxed);
+  for (size_t command_index = 0; command_index < frame.commands.size(); ++command_index) {
+    const FrameCommand& cmd = frame.commands[command_index];
+    if (cancellable && !submit_cancelled_ && (command_index & 7) == 0 && (*submit_cancel_)()) {
+      submit_cancelled_ = true;
+      submit_cancel_time_ = host::now_seconds();
+    }
+    if (submit_cancelled_) {
+      if (cmd.kind != FrameCommand::Draw && frame.copies[cmd.index].clear) clear_efb(frame.copies[cmd.index]);
+      continue;
+    }
+    if (cmd.kind == FrameCommand::Draw) {
+      if (command_index >= needed_commands) continue;
+      const DrawCall& dc = frame.draws[cmd.index];
+      if (css_fullscreen && !background_drawn) {
+        bool textured = false;
+        for (const TextureRef& texture : dc.textures) textured |= texture.used;
+        if (!textured) {
+          ++leading_untextured_draws;
+        } else if (video_bg::learning::should_insert_fullscreen_layer(
+                       fullscreen_slot, leading_untextured_draws, textured)) {
+          draw_video_background(fullscreen, fullscreen_slot, *screen);
+          background_drawn = true;
+          if (!video_layer_logged_[fullscreen_slot]) {
+            host::log("video backgrounds: CSS full-screen layer inserted after %u hardcoded background draws (D3D12)",
+                      leading_untextured_draws);
+            video_layer_logged_[fullscreen_slot] = true;
+          }
+        }
+      }
+      draw_video_slot_ = -1;
+      execute_draw(frame, dc, overrides ? overrides + cmd.index : nullptr);
+      // The SSS backdrop's guest material tints arbitrary footage blue/purple. Keep the learned
+      // texture draw as the precise layer marker, then cover only that completed backdrop with the
+      // untinted frame. Every stage icon, line and cursor is drawn afterwards, matching MnSlMap
+      // background mods while accepting any MP4.
+      if (fullscreen && screen && fullscreen_slot == 1 && draw_video_slot_ == 1 && !background_drawn) {
+        draw_video_background(fullscreen, fullscreen_slot, *screen);
+        background_drawn = true;
+        if (!video_layer_logged_[fullscreen_slot]) {
+          host::log("video backgrounds: SSS full-screen layer composited after learned backdrop draw (D3D12)");
+          video_layer_logged_[fullscreen_slot] = true;
+        }
+      }
+    } else {
+      const EfbCopy& c = frame.copies[cmd.index];
+      if (c.to_xfb) diag("scene draws and textures");
+      if (c.to_xfb) { if (!skip_present_) { Stopwatch pe_sw; present_efb(c); g_prof[9] += pe_sw.lap(); presented = true; } }
+      if (c.to_xfb) diag("upscaler and present blit");
+      else execute_copy(c);
+      if (c.clear) clear_efb(c);
+    }
+  }
+  part_sw.lap();   // the draws and the present pass have their own counters
+  if (timer_heap_) {
+    // Frame end: the pair is resolved into the slot's readback after the pass timers (offsets 0 to
+    // 3) and read when this slot comes round again, after its fence.
+    list_->EndQuery(timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * TIMERS_PER_SLOT + 5);
+    list_->ResolveQueryData(timer_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot_ * TIMERS_PER_SLOT + 4, 2, timer_rb_[slot_].Get(), 4 * sizeof(uint64_t));
+    timer_mask_[slot_] |= 4; timer_pending_[slot_] = true;
+  }
+  {
+    const HRESULT closed = list_->Close();
+    if (FAILED(closed)) poll_validation();   // MELEE_D3D12_VALIDATION=1: what the debug layer saw, before the stop
+    check(closed, "list close");
+  }
+  ID3D12CommandList* lists[] = {list_.Get()};
+  queue_->ExecuteCommandLists(1, lists);
+  diag("command execution");
+  g_prof[15] += part_sw.lap();
+  present_wait_ = 0;
+  if (presented) {
+    const double wait_start = Stopwatch::now();
+    // A shown frame waits for its place in the display queue (see swapchain_waitable_) here, after
+    // it is recorded and submitted, not before: the CPU records this frame while the GPU still runs
+    // the last one, as Direct3D 11 does with its device latency of 1. Waiting before recording made
+    // every frame take CPU plus GPU time under a heavy GPU load (16x SSAA ran 30% slower than D3D11).
+    // A backlog frame presents nothing and takes no place; a hidden window gets no presents to signal it.
+    if (!occluded_) wait_frame_latency();
+    diag("frame latency wait");
+    { host::perf::Scope wait_cost(host::perf::Stage::Wait);
+    for (;;) {
+      double remaining = present_deadline_ - Stopwatch::now();
+      if (remaining <= 0) break;
+      if (present_timer_ && remaining > 0.0004) {
+        LARGE_INTEGER due; due.QuadPart = -(LONGLONG)((remaining-0.0002)*1e7);
+        if (SetWaitableTimer(present_timer_, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(present_timer_, INFINITE);
+        else SwitchToThread();
+      } else YieldProcessor();
+    }
+    }
+    present_wait_ = Stopwatch::now()-wait_start;
+    streamline::pcl_marker(3); streamline::pcl_marker(4);
+    Stopwatch present_sw;
+    try {
+      // Sync by the player's choice or the explicit scanline-sync diagnostic. Detecting VRR
+      // alone must not force V-Sync on. Frame generation paces its own frames, so it also
+      // suppresses the scanline diagnostic's sync request. FSR frame generation paces its two
+      // presents itself (the second one below), as DLSS's does.
+      const bool synced = opts_.vsync || (tear_free_ && fg_applied_ <= 0 && !fsr_fg_generated_);
+      // Keep the existing deadline timer, simulation-locked path and DXGI queue limit.
+      // A subframe without a timer deadline may rely on Reflex/vblank pacing: keep interval 1.
+      const UINT interval = synced ? 1u : 0u;
+      const UINT present_flags = !synced && !fullscreen_state_.exclusive_active ? DXGI_PRESENT_ALLOW_TEARING : 0u;
+      const double present_call = Stopwatch::now();
+      // While the window cannot be seen (minimized, or alt-tabbed out of exclusive fullscreen),
+      // only test whether it can again, as DXGI asks. Presenting on regardless fed screen capture
+      // (a Discord stream) frames that flashed an old picture. Not under frame generation, which
+      // paces its own presents. Embedded launches keep drawing so the first-frame ready signal
+      // releases the app cover.
+      const bool test_only = occluded_ && fg_applied_ <= 0;
+      slot_shown_[slot_] = !test_only;
+      const HRESULT present_result = [&] { host::perf::Scope wait_cost(host::perf::Stage::Wait);
+          if (test_only) return swapchain_->Present(0, DXGI_PRESENT_TEST);
+          return swapchain_->Present(interval, present_flags); }();
+      const bool now_occluded = present_result == DXGI_STATUS_OCCLUDED;
+      if (now_occluded != occluded_) {
+        occluded_ = now_occluded;
+        host::log(occluded_ ? "d3d12: window hidden, presents paused" : "d3d12: window visible, presents resumed");
+      }
+      if (!test_only && SUCCEEDED(present_result) && frame.test_fill < 0) host::startup_first_frame();
+      present_wait_ += Stopwatch::now() - present_call;   // a synced Present waits for the display (see gx_d3d11.cpp)
+      if (!test_only) pacing_diagnostics_.present(present_call, opts_.vsync,
+          interval, present_flags, opts_.fps_cap, fullscreen_state_.exclusive_active);
+    } catch (const std::system_error& error) {
+      streamline::disable_after_resource_error(error.what());
+      opts_.frame_generation_mode = 0;
+      opts_.dlss_mode = 0;
+      fg_applied_ = 0;
+    }
+    // MELEE_FSR_FG_SHOW_GENERATED=1 (tests): only the generated pictures are shown, so a capture
+    // holds one to set beside the rendered frames around it.
+    static const bool show_generated_only = [] { const char* v = std::getenv("MELEE_FSR_FG_SHOW_GENERATED"); return v && *v == '1'; }();
+    if (fsr_fg_generated_ && !show_generated_only) {
+      // FSR frame generation: the generated picture is on its way; the rendered frame follows half
+      // a rendered frame later (the cadence measured at these presents, at most 50 ms apart), from
+      // fg_real_ into the next back buffer, presented by the presenter thread at that time.
+      const double shown = Stopwatch::now();
+      if (fsr_fg_last_present_ > 0) {
+        const double gap = shown - fsr_fg_last_present_;
+        if (gap > 0 && gap < 0.1) fsr_fg_interval_ = fsr_fg_interval_ > 0 ? fsr_fg_interval_ * 0.9 + gap * 0.1 : gap;
+      }
+      fsr_fg_last_present_ = shown;
+      const double halfway = shown + 0.5 * std::min(fsr_fg_interval_, 0.05);
+      check(fg_allocators_[slot_]->Reset(), "frame generation allocator reset");
+      check(fg_list_->Reset(fg_allocators_[slot_].Get(), nullptr), "frame generation list reset");
+      const UINT next = swapchain_->GetCurrentBackBufferIndex();
+      D3D12_RESOURCE_BARRIER to_copy{};
+      to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      to_copy.Transition = {backbuffers_[next].Get(), 0, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST};
+      fg_list_->ResourceBarrier(1, &to_copy);
+      fg_list_->CopyResource(backbuffers_[next].Get(), fg_real_.Get());
+      std::swap(to_copy.Transition.StateBefore, to_copy.Transition.StateAfter);
+      fg_list_->ResourceBarrier(1, &to_copy);
+      check(fg_list_->Close(), "frame generation list close");
+      ID3D12CommandList* fg_lists[] = {fg_list_.Get()};
+      queue_->ExecuteCommandLists(1, fg_lists);
+      // The present itself is the presenter thread's (fg_presenter_run), at its time, so this
+      // thread (with sub-frames off, the simulation's as well) goes on with the next frame.
+      // V-Sync on: issued half a refresh early, so it is shown at the blank nearest halfway.
+      // The refresh the presentation loop reports every frame (60 without it: test runs only).
+      const double hz = vrr_nominal_hz_ > 0 ? vrr_nominal_hz_ : 60.0;
+      fg_presenter_post(opts_.vsync ? halfway - 0.5 / std::max(hz, 30.0) : halfway, opts_.vsync ? 1u : 0u,
+                        (!opts_.vsync && !fullscreen_state_.exclusive_active) ? DXGI_PRESENT_ALLOW_TEARING : 0u);
+      ++fsr_fg_shown_;
+      if (fsr_fg_shown_ % 600 == 0)
+        host::log("fsr: frame generation, %llu generated frames shown, rendered frames %.2f ms apart",
+                  (unsigned long long)fsr_fg_shown_, fsr_fg_interval_ * 1000.0);
+    }
+    diag("swapchain Present and pacing");
+    g_prof[10] += present_sw.lap();
+    flash_presented = true;
+    streamline::pcl_marker(5);
+    reflex_token_ = false;
+    ++frames_presented_;
+    if ((frames_presented_ & 31) == 0) update_variable_refresh();
+    streamline::frame_generation_after_present();
+    if (frames_presented_ % 600 == 0) streamline::log_frame_generation();
+  }
+  part_sw.lap();   // the wait and Present are counted above
+  poll_validation();
+  // Signal, do not wait: the next frames render while the GPU finishes this one.
+  ++fence_value_;
+  queue_->Signal(fence_.Get(), fence_value_);
+  slot_fence_[slot_] = fence_value_;
+  if (geometry_frame_) geometry_frame_->fence = fence_value_;
+  // F2: write the next N presented frames out, whatever the capture options say.
+  if (presented) {
+    unsigned want = g_capture_request.load(std::memory_order_relaxed);
+    if (want) {
+      g_capture_request.store(want - 1, std::memory_order_relaxed);
+      CreateDirectoryA("capture", nullptr);
+      const std::string saved = opts_.capture_path;
+      char path[64];
+      snprintf(path, sizeof path, "capture\\blink_%05u.ppm", frames_presented_);
+      opts_.capture_path = path;
+      capture_backbuffer();
+      opts_.capture_path = saved;
+      if (want == 1) { flush_captures(); host::log("capture: wrote the requested frames into capture\\"); }
+    }
+  }
+  if (presented && !opts_.capture_path.empty()) {
+    capture_sequence_ = frame.sequence;
+    // Test runs (MELEE_TEST_CAPTURE_MATCH_FRAME=N): the capture starts at match frame N instead of a
+    // simulation frame, so a busy PC that reaches the match later still captures the same moment.
+    {
+      static const uint32_t at_match = [] { const char* v = host::test_env::getenv("MELEE_TEST_CAPTURE_MATCH_FRAME"); return v ? (uint32_t)std::strtoul(v, nullptr, 10) : 0u; }();
+      if (at_match && !opts_.capture_sim_frame && in_match_ && frame.source_match_frame >= at_match) {
+        opts_.capture_sim_frame = frame.sequence;
+        host::log("capture: match frame %u at simulation frame %llu", frame.source_match_frame, (unsigned long long)frame.sequence);
+      }
+    }
+    if (opts_.capture_sim_frame && !opts_.capture_frame && frame.sequence >= opts_.capture_sim_frame) opts_.capture_frame = frames_presented_;
+    bool burst = opts_.capture_burst && opts_.capture_frame && frames_presented_ >= opts_.capture_frame && frames_presented_ < opts_.capture_frame + opts_.capture_burst;
+    if (frames_presented_ == opts_.capture_frame && !burst) capture_backbuffer();
+    else if (burst || (opts_.capture_every && frames_presented_ % opts_.capture_every == 0)) {
+      std::string saved = opts_.capture_path;
+      char suffix[32]; snprintf(suffix, sizeof suffix, "_%05u.ppm", frames_presented_);
+      opts_.capture_path = saved.substr(0, saved.size() > 4 && saved.compare(saved.size() - 4, 4, ".ppm") == 0 ? saved.size() - 4 : saved.size()) + suffix;
+      capture_backbuffer();
+      opts_.capture_path = saved;
+    }
+  }
+  pacing_diagnostics_.poll(swapchain_.Get(), hwnd_);
+  g_prof[16] += part_sw.lap();
+}
+
+}  // namespace
+
+// Outside the anonymous namespace: the settings UI calls this from another translation unit.
+void request_frame_capture(unsigned frames) { g_capture_request.store(frames, std::memory_order_relaxed); }
+unsigned gx_capture_request() { return g_capture_request.load(std::memory_order_relaxed); }
+void gx_capture_request_set(unsigned frames) { g_capture_request.store(frames, std::memory_order_relaxed); }
+
+// Atomically publish complete cache files. Concurrent instances may replace one
+// another's cache, but cannot expose a truncated file to a reader.
+static void write_cache(const std::string& path, const void* data, size_t size) {
+  std::string temporary = path + "." + std::to_string(GetCurrentProcessId()) + ".tmp";
+  FILE* file = std::fopen(temporary.c_str(), "wb");
+  if (!file) return;
+  bool ok = std::fwrite(data, 1, size, file) == size;
+  ok = std::fclose(file) == 0 && ok;
+  if (ok) ok = MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+  if (!ok) DeleteFileA(temporary.c_str());
+}
+
+void D3D12Backend::prewarm_upscalers() {
+  if (!opts_.dlss_mode) return;
+  Stopwatch timer;
+  host::loading_show(L"Preparing anti-aliasing", 0, 6);
+  configure_dlss();
+  if (!dlss_active_) return;
+
+  // Evaluate the complete match path, not just feature allocation. The driver/model lazily
+  // prepares kernels on the first dispatch. Do this on initialized black inputs before the
+  // simulation or audio device starts, and fence every iteration so no preparation spills over.
+  EfbCopy black{};
+  black.src_w = EFB_WIDTH; black.src_h = EFB_HEIGHT;
+  black.clear_color = 0xFF000000; black.clear_z = 0; black.y_scale = 1.0f;
+  EfbCopy screen = black;
+  screen.src_h = 480; screen.to_xfb = true;
+  dlss_in_match_ = true;
+  // Diagnostic: MELEE_WARMUP_MONOTONIC=1 numbers the warm-up frames from the live frame counter, so
+  // Streamline sees one increasing frame sequence from warm-up into the game.
+  const char* mono_env = std::getenv("MELEE_WARMUP_MONOTONIC");
+  const bool monotonic_ids = mono_env && *mono_env == '1';
+  host::log("d3d12: upscaler warm-up frame ids %s", monotonic_ids ? "continue the frame counter" : "0xFFFFFF00+i");
+  for (unsigned i = 0; i < 6; ++i) {
+    slot_ = i % FRAME_SLOTS;
+    vertex_ring_.reset(slot_); index_ring_.reset(slot_); constant_ring_.reset(slot_); upload_ring_.reset(slot_);
+    check(allocators_[slot_]->Reset(), "upscaler warm-up allocator");
+    check(list_->Reset(allocators_[slot_].Get(), nullptr), "upscaler warm-up list");
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), sampler_heap_.Get()};
+    list_->SetDescriptorHeaps(2, heaps);
+    bind_efb_targets();
+    clear_efb(black);
+    const float zero[4] = {};
+    auto rtv = rtv_heap_->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += 5 * rtv_size_;
+    list_->ClearRenderTargetView(rtv, zero, 0, nullptr);
+    rtv.ptr += rtv_size_;
+    list_->ClearRenderTargetView(rtv, zero, 0, nullptr);
+    streamline::FrameConstants fc{};
+    // Valid perspective projection; no game geometry or temporal history is consumed.
+    fc.projection[0] = fc.projection[5] = 1.0f;
+    fc.projection[10] = -1.0002f; fc.projection[11] = -2.0002f; fc.projection[14] = -1.0f;
+    fc.render_w = 640 * scale_; fc.render_h = 480 * scale_; fc.reset = i == 0;
+    streamline::jitter(i, &fc.jitter_x, &fc.jitter_y);
+    {
+      streamline::new_frame(monotonic_ids ? (uint32_t)(frame_counter_ + i) : 0xFFFFFF00u + i);
+      streamline::set_constants(fc);
+      if (i == 0) streamline::dlss_allocate(list_.Get());
+      // No frame generation allocation here: these warm-up frames tag no depth or motion vectors, so
+      // NGX refused to create the feature (0xBAD0000A, missing input) and generation never produced
+      // a frame afterwards. Streamline creates it at the first match Present, which has its tags.
+    }
+    present_efb(screen);
+    // A warm-up frame the device refuses to close (one report: the close failed with E_INVALIDARG
+    // and the game stopped before its first frame) turns off the upscaler instead of stopping the
+    // game. The refused list is closed, so the next one resets it.
+    // MELEE_TEST_WARMUP_REFUSED=<n> (tests only, hidden and headless runs) refuses the first n frames.
+    HRESULT closed = list_->Close();
+    {
+      static int refuse = std::getenv("MELEE_NO_GC_ADAPTER") && host::test_env::getenv("MELEE_TEST_WARMUP_REFUSED") ? std::atoi(host::test_env::getenv("MELEE_TEST_WARMUP_REFUSED")) : 0;
+      if (SUCCEEDED(closed) && refuse > 0) { --refuse; closed = E_INVALIDARG; }
+    }
+    if (FAILED(closed)) {
+      host::log("d3d12: upscaler warm-up frame %u was refused by the device (%08X): the upscaler is off for this session",
+                i, (unsigned)closed);
+      wait_gpu();
+      opts_.dlss_mode = 0;
+      configure_dlss();
+      break;
+    }
+    ID3D12CommandList* lists[] = {list_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+    wait_gpu();
+    if (timer_pending_[slot_]) read_gpu_timers();
+    host::loading_show(L"Preparing anti-aliasing", i + 1, 6);
+  }
+  // Nothing was presented or simulated. Start the real scene with clean temporal history.
+  if (monotonic_ids) frame_counter_ += 6;
+  dlss_in_match_ = false; dlss_reset_ = true; fsr_reset_ = true;
+  jitter_x_ = jitter_y_ = 0.0f;
+  host::log("d3d12: completed 6 upscaler warm-up frames before guest/audio startup in %.1f ms", timer.lap() * 1000.0);
+}
+
+// Pipeline recipes (the game-side state a pipeline was built from) do not depend on the shader
+// sources, so they live at the cache root and survive every shader/namespace change; older
+// per-namespace files are merged in. This is what lets a fresh build precompile before boot.
+void D3D12Backend::prewarm_pipelines() {
+  host::loading_show(L"Loading shaders", 3, 4);
+  std::vector<PipelineRecipe> recipes;
+  read_recipe_file(shader_cache_root_ + "/recipes.bin", recipes);
+  {  // what the root file holds: the saver writes it again only once the list differs
+    std::unordered_set<std::string> in_file;
+    for (const auto& r : recipes)
+      if (in_file.insert(std::string((const char*)&r, sizeof r)).second) { ++recipes_file_count_; recipes_file_set_hash_ += hash_bytes(&r, sizeof r); }
+  }
+  std::error_code ec;
+  for (auto& entry : std::filesystem::directory_iterator(shader_cache_root_, ec))
+    if (entry.is_directory(ec)) read_recipe_file(entry.path().string() + "/recipes.bin", recipes);
+  read_shipped_d3d_recipes(recipes);
+  if (recipes.empty()) return;
+  std::unordered_set<std::string> seen;
+  std::unordered_set<PsoKey, PsoKeyHash> keys_seen;
+  Stopwatch timer;
+  // All recipes go to the compile workers at once (the pipeline library makes known ones cheap);
+  // the window title shows progress while the game waits to boot. The start waits only for the
+  // variant this session draws with (prewarm_variants.h): with an upscaler available, the other one
+  // (plain or with motion vectors for DLSS/FSR) compiles behind it after the boot, so the first
+  // match with an upscaler switched on finds it built, and a start never waits for pipelines the
+  // previous session had no reason to save.
+  const bool session_upscaler = opts_.dlss_mode != 0 && upscaler_available();   // configure_dlss's test
+  const bool upscaler_possible = streamline::available() || fsr::available();
+  const uint32_t msaa = msaa_samples_ > 1 && msaa_color_ ? msaa_samples_ : 1u;   // msaa_on() without motion vectors
+  const prewarm_variants::Plan plan = prewarm_variants::plan(session_upscaler, upscaler_possible, msaa, opts_.prewarm_only);
+  std::unordered_set<PsoKey, PsoKeyHash> waited;   // queued pipelines the start waits for, until they arrive
+  std::vector<PsoJob> later;                       // the other variant: queued behind them, not waited for
+  for (const auto& recipe : recipes) {
+    if ((recipe.topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE && recipe.topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE) ||
+        (recipe.xf[0x3F] & 15) > 8 || (recipe.xf[9] & 3) > 2) continue;
+    if (!seen.insert(std::string((const char*)&recipe, sizeof recipe)).second) continue;
+    if (pipeline_recipes_.size() >= 16384) break;
+    DrawCall draw{}; draw.components = recipe.components; draw.bp = recipe.bp;
+    std::memcpy(draw.xf_regs, recipe.xf, sizeof(recipe.xf));
+    auto topo = (D3D12_PRIMITIVE_TOPOLOGY_TYPE)recipe.topology;
+    for (int v = 0; v < plan.count; ++v) {
+      const prewarm_variants::Variant& variant = plan.variants[v];
+      VSUid vsu = make_vs_uid(draw); PSUid psu = make_ps_uid(draw);
+      vsu.motion_vectors = psu.motion_vectors = prewarm_variants::motion_vectors(variant.mvec) ? 1u : 0u;
+      PsoKey key{vsu.hash(), psu.hash(), draw.bp.blendmode() & 0xFFFF, draw.bp.zmode() & 0x1F, draw.bp.cullmode(), (uint32_t)topo, draw.bp.zcontrol() & 7, variant.mvec};
+      // One recipe per pipeline: recipes that only differ in state the pipeline key ignores are dropped.
+      if (psos_.count(key)) { if (v == 0 && keys_seen.insert(key).second) remember_recipe(recipe); continue; }
+      if (!psos_pending_.insert(key).second) continue;
+      if (v == 0) keys_seen.insert(key);
+      PsoJob job{key, vsu, psu, topo, recipe};
+      if (variant.wait) {
+        waited.insert(key);
+        std::lock_guard<std::mutex> lk(pso_mutex_); pso_jobs_.push_back(job);
+      } else {
+        later.push_back(job);
+      }
+    }
+  }
+  {  // behind every pipeline the start waits for; a draw that needs one goes ahead of them (get_pso)
+    std::lock_guard<std::mutex> lk(pso_mutex_);
+    for (auto& job : later) pso_jobs_.push_back(std::move(job));
+  }
+  pso_cv_.notify_all();
+  const size_t total = waited.size();
+  // A cache that is already warm finishes in a moment; the progress panel only appears once the
+  // wait is long enough to notice, so a normal launch never flashes it.
+  const double panel_after = host::now_seconds() + 0.4;
+  for (;;) {
+    integrate_compiled_psos();
+    for (auto it = waited.begin(); it != waited.end();) it = psos_pending_.count(*it) ? std::next(it) : waited.erase(it);
+    const size_t pending = waited.size();
+    wchar_t title[192]; swprintf_s(title, L"%ls  |  compiling shaders %zu / %zu", host::window_title_base().c_str(), total - pending, total);
+    host::window_set_title(title);
+    if (pending && host::now_seconds() >= panel_after)
+      host::loading_show(L"Preparing graphics for this PC (first start only)", total - pending, total);
+    if (!pending) break;
+    { host::perf::Scope wait_cost(host::perf::Stage::Wait);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20)); }
+  }
+  if (!later.empty())
+    host::log("d3d12: %zu pipelines for the other upscaler setting compile after the boot (not waited for)", later.size());
+  host::loading_close();
+  host::window_set_title(host::window_title_base().c_str());
+  host::log("d3d12: prewarmed %zu pipelines from %zu recipes before guest startup in %.1f ms", psos_.size(), pipeline_recipes_.size(), timer.lap()*1000.0);
+}
+
+void D3D12Backend::remember_recipe(const PipelineRecipe& recipe) {
+  { std::lock_guard<std::mutex> lk(recipes_mutex_); pipeline_recipes_.push_back(recipe); }
+  cache_saver_.mark_dirty();
+}
+
+// Saver thread. Only the recipes added since the last save are copied under the lock, so the render
+// thread's remember_recipe never waits behind a copy of the whole list.
+cache_store::Produce D3D12Backend::produce_pipeline_recipes(cache_store::Buffer& data) {
+  if (!recipes_ready_) return cache_store::Produce::Nothing;
+  std::vector<PipelineRecipe> fresh;
+  {
+    std::lock_guard<std::mutex> lk(recipes_mutex_);
+    if (pipeline_recipes_.size() > recipes_copied_) fresh.assign(pipeline_recipes_.begin() + recipes_copied_, pipeline_recipes_.end());
+    recipes_copied_ = pipeline_recipes_.size();
+  }
+  for (const auto& r : fresh)
+    if (recipes_seen_.insert(std::string((const char*)&r, sizeof r)).second) {
+      recipes_unique_.push_back(r);
+      recipes_set_hash_ += hash_bytes(&r, sizeof r);
+      recipes_unsaved_ = true;
+    }
+  if (!recipes_unsaved_) return cache_store::Produce::Nothing;
+  recipes_unsaved_ = false;   // a failed write sets it again (start_cache_saver)
+  if (!opts_.prewarm_only && recipes_unique_.size() == recipes_file_count_ && recipes_set_hash_ == recipes_file_set_hash_) return cache_store::Produce::Nothing;
+  const size_t bytes = recipes_unique_.size() * sizeof(PipelineRecipe);
+  uint64_t header[3] = {0x3150535247505847ull, recipes_unique_.size(), hash_bytes(recipes_unique_.data(), bytes)};
+  data.resize(sizeof(header) + bytes);
+  std::memcpy(data.data(), header, sizeof(header));
+  std::memcpy(data.data() + sizeof(header), recipes_unique_.data(), bytes);
+  return cache_store::Produce::Write;
+}
+
+void D3D12Backend::start_cache_saver() {
+  // A failed write is forgotten as saved, so the next round writes it again (pipeline_cache_store.h).
+  cache_saver_.add(shader_cache_root_ + "/recipes.bin", [this](cache_store::Buffer& out) { return produce_pipeline_recipes(out); },
+                   [this] { recipes_unsaved_ = true; });
+  cache_saver_.add(opts_.shader_cache + "/pipelines.bin", [this](cache_store::Buffer& out) { return produce_pipeline_library(out); },
+                   [this] {
+                     std::lock_guard<std::mutex> lk(pipeline_library_mutex_);
+                     if (!pipeline_library_faulted_) pipeline_library_dirty_ = true;
+                   });
+  cache_saver_.on_saved([this](uint64_t bytes, const char* why) { log_pipeline_stats(why, bytes); });
+  cache_saver_.start();
+}
+
+// One line per save and per session; the second launch of a version should say compiled=0.
+void D3D12Backend::log_pipeline_stats(const char* why, uint64_t saved_bytes) {
+  host::log("d3d12: pipelines cache_hits=%llu compiled=%llu saved_bytes=%llu (%s)", (unsigned long long)pipelines_loaded_.load(),
+            (unsigned long long)pipelines_compiled_.load(), (unsigned long long)saved_bytes, why);
+}
+
+void D3D12Backend::open_pipeline_library() {
+  CreateDirectoryA(opts_.shader_cache.c_str(), nullptr);
+  shader_cache_root_ = opts_.shader_cache;
+  opts_.shader_cache += "/" GX_SHADER_CACHE_VERSION;
+  CreateDirectoryA(opts_.shader_cache.c_str(), nullptr);
+  if (const unsigned long long freed =
+          opts_.shader_cache_shared ? 0 : gx::prune_old_shader_caches(shader_cache_root_, GX_SHADER_CACHE_VERSION))
+    host::log("shaders: removed the shader caches of earlier builds (%.0f MB)", freed / 1048576.0);
+  ComPtr<ID3D12Device1> device1;
+  if (FAILED(device_.As(&device1))) { host::log("d3d12: pipeline library unsupported"); return; }
+  std::string path = opts_.shader_cache + "/pipelines.bin";
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (f) {
+    std::fseek(f, 0, SEEK_END); long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+    if (n > (256 << 20)) n = 0;
+    pipeline_library_data_.resize(n > 0 ? (size_t)n : 0);
+    if (n > 0 && std::fread(pipeline_library_data_.data(), 1, (size_t)n, f) != (size_t)n) pipeline_library_data_.clear();
+    std::fclose(f);
+  }
+  HRESULT hr = pipeline_library_data_.empty() ? E_FAIL : device1->CreatePipelineLibrary(pipeline_library_data_.data(), pipeline_library_data_.size(), IID_PPV_ARGS(&pipeline_library_));
+  if (FAILED(hr)) {   // absent, or built by another driver/adapter version: start a fresh library
+    pipeline_library_data_.clear();
+    if (FAILED(device1->CreatePipelineLibrary(nullptr, 0, IID_PPV_ARGS(&pipeline_library_)))) { pipeline_library_.Reset(); host::log("d3d12: pipeline library unavailable"); return; }
+    host::log("d3d12: new pipeline library in %s", opts_.shader_cache.c_str());
+  } else {
+    host::log("d3d12: pipeline library loaded from %s (%zu bytes)", path.c_str(), pipeline_library_data_.size());
+  }
+}
+
+// Saver thread. Only the state checks and GetSerializedSize run under pipeline_library_mutex_, which
+// every pipeline build takes: the copy itself runs without it (a pipeline library synchronizes
+// itself, except two loads of the same name, and those happen under the lock), so a 100 MB library
+// never holds back a pipeline worker or a draw waiting for its pipeline. A pipeline stored during
+// the copy marks the library dirty again for the next save; if it made the library outgrow the
+// size asked for, the copy is taken again.
+cache_store::Produce D3D12Backend::produce_pipeline_library(cache_store::Buffer& data) {
+  ComPtr<ID3D12PipelineLibrary> library;
+  SIZE_T size = 0;
+  {
+    std::lock_guard<std::mutex> lk(pipeline_library_mutex_);
+    if (pipeline_library_faulted_) {   // its file may be what Windows tripped on: the next start builds a new one
+      if (pipeline_library_removed_) return cache_store::Produce::Nothing;
+      pipeline_library_removed_ = true;
+      return cache_store::Produce::Remove;
+    }
+    if (!pipeline_library_ || !pipeline_library_dirty_) return cache_store::Produce::Nothing;
+    if (!guarded_serialized_size(pipeline_library_.Get(), &size)) {
+      pipeline_library_fault("GetSerializedSize");
+      pipeline_library_removed_ = true;
+      return cache_store::Produce::Remove;
+    }
+    if (size == 0 || size > (SIZE_T)(256 << 20)) return cache_store::Produce::Nothing;
+    library = pipeline_library_;
+    pipeline_library_dirty_ = false;   // a pipeline stored from here on marks it again
+  }
+  // A fault here (Windows' cache, as under build_pso) costs the library, as it does there.
+  auto faulted = [&](const char* call) {
+    std::lock_guard<std::mutex> lk(pipeline_library_mutex_);
+    pipeline_library_fault(call);
+    if (pipeline_library_removed_) return cache_store::Produce::Nothing;
+    pipeline_library_removed_ = true;
+    return cache_store::Produce::Remove;
+  };
+  const auto copy_started = std::chrono::steady_clock::now();
+  for (int attempt = 0;; ++attempt) {
+    data.resize((size_t)size);   // the saver keeps this buffer between saves: no new allocation, no zero fill
+    HRESULT hr = E_FAIL;
+    if (!guarded_serialize_library(library.Get(), data.data(), size, &hr)) return faulted("Serialize");
+    if (SUCCEEDED(hr)) break;
+    SIZE_T now = 0;
+    if (!guarded_serialized_size(library.Get(), &now)) return faulted("GetSerializedSize");
+    // Not grown (a real failure), or still growing after a few tries: the failed write path marks
+    // it dirty again, so a later save tries once more.
+    if (now <= size || attempt >= 3 || now > (SIZE_T)(256 << 20)) return cache_store::Produce::Failed;
+    size = now;
+  }
+  {  // a worker's call faulted Windows' cache while this copy ran: its bytes are not kept
+    std::lock_guard<std::mutex> lk(pipeline_library_mutex_);
+    if (pipeline_library_faulted_) {
+      if (pipeline_library_removed_) return cache_store::Produce::Nothing;
+      pipeline_library_removed_ = true;
+      return cache_store::Produce::Remove;
+    }
+  }
+  const double copy_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - copy_started).count();
+  static std::atomic<int> slow_copies{0};
+  if (copy_ms > 50.0 && slow_copies.fetch_add(1) < 4)
+    host::log("d3d12: copying the pipeline library (%zu bytes) took %.1f ms on the cache saver's thread", (size_t)size, copy_ms);
+  return cache_store::Produce::Write;
+}
+
+bool D3D12Backend::load_shader_blob(const std::string& path, ComPtr<ID3DBlob>& blob) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return false;
+  std::fseek(f, 0, SEEK_END); long n = std::ftell(f); std::fseek(f, 0, SEEK_SET);
+  if (n <= 0 || n > (16 << 20) || FAILED(D3DCreateBlob((SIZE_T)n, &blob))) { std::fclose(f); return false; }
+  bool ok = std::fread(blob->GetBufferPointer(), 1, (size_t)n, f) == (size_t)n;
+  std::fclose(f);
+  if (!ok) blob.Reset();
+  return ok;
+}
+
+void D3D12Backend::save_shader_blob(const std::string& path, ID3DBlob* blob) {
+  write_cache(path, blob->GetBufferPointer(), blob->GetBufferSize());
+}
+
+std::string d3d12_profile_line() {
+  char buf[512];
+  double n = (double)std::max<uint64_t>(1, g_prof_draws);
+  double l = (double)std::max<uint64_t>(1, g_pso_lookups);
+  snprintf(buf, sizeof buf, "%llu draws: index %.2f, upload %.2f, constants %.2f, pso %.2f, bind %.2f, draw %.2f us/draw | pso cache hits %llu, lookups %llu (uid %.2f + map %.2f us), created %llu, draws on the fallback pipeline while compiling %llu",
+           (unsigned long long)g_prof_draws, 1e6 * g_prof[0] / n, 1e6 * g_prof[1] / n, 1e6 * g_prof[2] / n, 1e6 * g_prof[3] / n, 1e6 * g_prof[4] / n, 1e6 * g_prof[5] / n,
+           (unsigned long long)g_pso_hits, (unsigned long long)g_pso_lookups, 1e6 * g_prof[6] / l, 1e6 * g_prof[7] / l, (unsigned long long)g_pso_creates, (unsigned long long)g_pso_skips);
+  const double f = (double)std::max<uint64_t>(1, g_prof_frames);
+  char tail[320];
+  snprintf(tail, sizeof tail, " | per frame: panel %.3f, present pass %.3f, Present %.3f, whole %.3f ms (setup %.3f of it GPU slot wait %.3f, geometry %.3f, begin %.3f, close and execute %.3f, end %.3f)",
+           1e3 * g_prof[8] / f, 1e3 * g_prof[9] / f, 1e3 * g_prof[10] / f, 1e3 * g_prof[11] / f,
+           1e3 * g_prof[12] / f, 1e3 * g_prof[17] / f, 1e3 * g_prof[13] / f, 1e3 * g_prof[14] / f, 1e3 * g_prof[15] / f, 1e3 * g_prof[16] / f);
+  std::string line = std::string(buf) + tail;
+  std::memset(g_prof, 0, sizeof g_prof); g_prof_frames = 0; g_prof_draws = g_pso_hits = g_pso_lookups = g_pso_creates = g_pso_skips = 0;
+  return line;
+}
+
+// Asked before the renderer is made, through plain DXGI and D3D12 (Streamline is not loaded yet).
+// NVIDIA adapters are not test-created here: Streamline must see the first device on them, and its
+// own fault fallback covers that path.
+bool d3d12_usable() {
+  ComPtr<IDXGIFactory4> factory;
+  const HRESULT hr = create_factory(false, factory.GetAddressOf());
+  if (FAILED(hr) || !factory) { host::log("d3d12: no DXGI factory (0x%08X)", (unsigned)hr); return false; }
+  ComPtr<IDXGIAdapter1> adapter;
+  for (UINT i = 0; enum_adapter_fastest_first(factory.Get(), i, adapter.ReleaseAndGetAddressOf()) != DXGI_ERROR_NOT_FOUND; ++i) {
+    DXGI_ADAPTER_DESC1 desc;
+    if (FAILED(adapter->GetDesc1(&desc)) || (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
+    // An Intel GPU whose highest level is Direct3D 11 (HD 4600 and others of its age) runs Direct3D 12
+    // through an old driver path that loses the device in a match (0.8.98 and 0.9.106 reports). It
+    // starts on Direct3D 11, which draws the same picture there, instead of crashing once first.
+    // MELEE_TEST_OLD_INTEL=1 (tests only) treats the first adapter as one.
+    const char* old_intel_test = host::test_env::getenv("MELEE_TEST_OLD_INTEL");
+    if (old_intel_test && std::atoi(old_intel_test) == 1) {
+      host::log("d3d12: this Intel GPU's highest level is Direct3D 11; starting on Direct3D 11 (test)");
+      return false;
+    }
+    // NVIDIA too: a GeForce from before Direct3D 12 (a GT 330M, a DirectX 10.1 part, 0.9.117 report)
+    // was taken as able, so the game stopped on "D3D12: no adapter" where Direct3D 11, or the message
+    // that the card is older than DirectX 11, was due. The check creates nothing.
+    const HRESULT device = guarded_device_check(adapter.Get());
+    if (SUCCEEDED(device) && desc.VendorId == 0x8086 &&
+        FAILED(guarded_device_check(adapter.Get(), D3D_FEATURE_LEVEL_12_0))) {
+      host::log("d3d12: this Intel GPU's highest level is Direct3D 11; starting on Direct3D 11");
+      return false;
+    }
+    if (SUCCEEDED(device)) return true;
+    host::log("d3d12: adapter %u cannot make a device (%s0x%08X)", i, device == E_ABORT ? "fault, " : "", (unsigned)device);
+  }
+  return false;
+}
+
+Backend* create_d3d12_backend(void* hwnd, int w, int h, const D3D12Options& options) {
+  return new D3D12Backend((HWND)hwnd, w, h, options);
+}
+const D3D12Options& d3d12_options(Backend* backend) { return static_cast<D3D12Backend*>(backend)->options(); }
+void d3d12_resize(Backend* backend, int w, int h) { static_cast<D3D12Backend*>(backend)->resize(w, h); }
+void d3d12_stats(Backend* backend, uint32_t* frames, uint32_t* pipelines, uint32_t* textures) {
+  auto* b = static_cast<D3D12Backend*>(backend);
+  if (frames) *frames = b->frames_presented();
+  if (pipelines) *pipelines = b->pipeline_count();
+  if (textures) *textures = b->texture_count();
+}
+
+}  // namespace gx

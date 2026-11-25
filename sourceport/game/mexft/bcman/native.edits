@@ -1,0 +1,10 @@
+# the grab anchor is the game's capturedamage.x18, a whole pointer natively (8 bytes), not an int
+@@ code/fighter.c
+-    fd->state_var.state_var7=(int)fd->bones[anchor].joint; // native capturedamage.x18
++    *(void **)&fd->state_var.state_var7=fd->bones[anchor].joint; // native capturedamage.x18 (8 bytes natively)
+
+# armour: console byte 0x2220 bit 0x10 is the decomp's x2220_b3, another bit of that byte natively
+@@ code/fighter.c
+-    unsigned char *flags=(unsigned char *)&fd->flags.can_input_multijump;
+-    if (on) *flags |= 0x10; else *flags &= ~0x10;
++    fd->flags.x2220_b3 = on ? 1 : 0;

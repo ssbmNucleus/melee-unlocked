@@ -1,0 +1,6 @@
+# TEST ONLY. NOT A RELEASE KEY. Never trust this key in a build that ships.
+# The 32-byte Ed25519 private key (RFC 8032 seed) the fighter plugin signature tests sign with
+# (port/tests/plugin_gate_test.cpp, port/tests/plugin_approval_test.py). Anyone can read it, so
+# anything it signs proves nothing. Its public key is TEST_ONLY_ed25519_public.txt, and is trusted
+# only by a host configured with -DMELEE_PLUGIN_TEST_KEY=ON (port/app/plugin_keys.cpp).
+997f408e918a1ed0af51768862d133f2cbf8ed990183b4f86879116a9b364e86

@@ -1,0 +1,142 @@
+// Command ids, payload bounds and the call contract the native game uses to reach the Slippi host.
+// SPDX-License-Identifier: GPL-2.0-or-later
+#pragma once
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include "../abi/mu_commands.h"
+#include "../abi/mu_pick_preview.h"
+#if MU_SQUAD
+// Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+#include "../abi/mu_squad_wire.h"
+#endif
+
+namespace slippi::online {
+
+// Slippi's command ids under the host's names; the numbers are the registry's (abi/mu_commands.h).
+enum Cmd : uint8_t {
+  CMD_ONLINE_INPUTS = MU_CMD_ONLINE_INPUTS, CMD_CAPTURE_SAVESTATE = MU_CMD_CAPTURE_SAVESTATE,
+  CMD_LOAD_SAVESTATE = MU_CMD_LOAD_SAVESTATE, CMD_GET_MATCH_STATE = MU_CMD_GET_MATCH_STATE,
+  CMD_FIND_OPPONENT = MU_CMD_FIND_OPPONENT, CMD_SET_MATCH_SELECTIONS = MU_CMD_SET_MATCH_SELECTIONS,
+  CMD_OPEN_LOGIN = MU_CMD_OPEN_LOGIN, CMD_LOGOUT = MU_CMD_LOGOUT, CMD_UPDATE = MU_CMD_UPDATE_APP,
+  CMD_GET_ONLINE_STATUS = MU_CMD_GET_ONLINE_STATUS, CMD_CLEANUP_CONNECTION = MU_CMD_CLEANUP_CONNECTION,
+  CMD_SEND_CHAT_MESSAGE = MU_CMD_SEND_CHAT_MESSAGE, CMD_GET_NEW_SEED = MU_CMD_GET_NEW_SEED,
+  CMD_REPORT_GAME = MU_CMD_REPORT_GAME, CMD_FETCH_CODE_SUGGESTION = MU_CMD_FETCH_CODE_SUGGESTION,
+  CMD_OVERWRITE_SELECTIONS = MU_CMD_OVERWRITE_SELECTIONS, CMD_GP_COMPLETE_STEP = MU_CMD_GP_COMPLETE_STEP,
+  CMD_GP_FETCH_STEP = MU_CMD_GP_FETCH_STEP, CMD_REPORT_SET_COMPLETE = MU_CMD_REPORT_SET_COMPLETE,
+  CMD_GET_PLAYER_SETTINGS = MU_CMD_GET_PLAYER_SETTINGS, CMD_REPORT_MATCH_STATUS_UPDATE = MU_CMD_REPORT_MATCH_STATUS,
+  CMD_GET_DELAY = MU_CMD_GET_DELAY, CMD_GET_RANK = MU_CMD_GET_RANK, CMD_FETCH_RANK = MU_CMD_FETCH_RANK,
+  CMD_GET_RANK_VISIBILITY = MU_CMD_GET_RANK_VISIBILITY, CMD_NATIVE_MENU_FLAGS = MU_CMD_NATIVE_MENU_FLAGS,
+};
+
+// Results of a native command call, mirrored by the host ABI comment in mu_host.h.
+enum : int32_t {
+  NATIVE_COMMAND_OK = 0,
+  NATIVE_COMMAND_UNKNOWN = -1,
+  NATIVE_COMMAND_BOUNDS = -2,
+  NATIVE_COMMAND_NEEDS_NATIVE_ROLLBACK = -3,
+};
+
+namespace bridge_detail {
+inline uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+}  // namespace bridge_detail
+
+// Fixed EXI payload sizes. Unknown commands pass here; the dispatcher reports them itself.
+inline bool command_payload_valid(uint8_t cmd, const uint8_t* payload, uint32_t payload_len) {
+#if MU_SQUAD
+  // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+  if (cmd == MU_SQUAD_COMMAND) {
+    if (!payload || !payload_len) return false;
+    switch (payload[0]) {
+      case 0: return payload_len == 2 && payload[1] <= 1; // chosen row
+      // Count zero is a bounded invalidation transaction: the handler clears the
+      // previous lineup and rejects lock-in. Do not filter it out before dispatch.
+      case 1: return payload_len >= 2 && payload[1] <= MU_SQUAD_LINEUP &&
+                     payload_len == 2u + 2u * payload[1]; // own lineup / clear
+      case 2: return payload_len == 9; // begin budget digest, two u32 BE budgets
+      case 3: return payload_len >= 10 && payload_len <= 137; // file fact
+      case 4: case 5: return payload_len == 1; // finish digest / read setup
+      case MU_SQUAD_OP_FRIEND: return payload_len == 2 && payload[1] <= MU_SQUAD_FRIEND_INTENT;
+      default: return false;
+    }
+  }
+#endif
+  // Live pick previews: {send, wire} every character-screen frame, or {read}.
+  if (cmd == MU_PICK_PREVIEW_COMMAND)
+    return payload && ((payload_len == 1u + MU_PICK_PREVIEW_WIRE && payload[0] == MU_PICK_PREVIEW_OP_SEND) ||
+                       (payload_len == 1 && payload[0] == MU_PICK_PREVIEW_OP_READ));
+  // Reason byte: 1 the CSS's hold-Z, 2 the Friends lobby's match is over and its select is back (the room stays),
+  // 3 the main menu came up (a search the player chose to keep goes on).
+  if (cmd == CMD_CLEANUP_CONNECTION)
+    return payload_len == 0 || (payload_len == 1 && payload && payload[0] >= 1 && payload[0] <= 3);
+  uint32_t expected = 0;
+  switch (cmd) {
+    case CMD_ONLINE_INPUTS: expected = 27; break;
+    case CMD_CAPTURE_SAVESTATE: case CMD_LOAD_SAVESTATE: expected = 32; break;
+    case CMD_FIND_OPPONENT: expected = 19; break;
+    case CMD_SET_MATCH_SELECTIONS: expected = 9; break;
+    case CMD_SEND_CHAT_MESSAGE: expected = 2; break;
+    case CMD_REPORT_GAME: expected = 368; break;
+    case CMD_FETCH_CODE_SUGGESTION: expected = 31; break;
+    case CMD_OVERWRITE_SELECTIONS: expected = 14; break;
+    case CMD_GP_COMPLETE_STEP: expected = 5; break;
+    case CMD_GP_FETCH_STEP: case CMD_REPORT_SET_COMPLETE:
+    case CMD_REPORT_MATCH_STATUS_UPDATE: expected = 1; break;
+    case CMD_GET_MATCH_STATE: case CMD_OPEN_LOGIN: case CMD_LOGOUT: case CMD_UPDATE:
+    case CMD_GET_ONLINE_STATUS: case CMD_CLEANUP_CONNECTION: case CMD_GET_NEW_SEED:
+    case CMD_GET_PLAYER_SETTINGS: case CMD_GET_DELAY: case CMD_GET_RANK:
+    case CMD_FETCH_RANK: case CMD_GET_RANK_VISIBILITY:
+    expected = 0; break;
+    // 0xFA is two commands: the online menu's Ranked query (no payload) and the replay viewer's gate
+    // (shim/mu_replay.c CMD_REPLAY_GATE: the next frame, then 0 ask or 1 restore). Refusing the gate's
+    // five bytes left every replay control dead: pause, jumps, fast forward and take over (1.0 report).
+    case CMD_NATIVE_MENU_FLAGS: return payload_len == 0 || (payload_len == 5 && payload && payload[4] <= 1);
+    default: return true;
+  }
+  if (payload_len != expected || (expected && !payload)) return false;
+  if (cmd == CMD_LOAD_SAVESTATE) {
+    // The preserve-block list ends with a zero address. The last 4-byte slot cannot hold a
+    // nonzero address because there is no room for its length.
+    for (uint32_t i = 4; i + 4 <= expected; i += 8) {
+      if (bridge_detail::be32(payload + i) == 0) return true;
+      if (i + 8 > expected) return false;
+    }
+    return false;
+  }
+  return true;
+}
+
+// The whole native call contract. `handle(cmd, payload, size, reply)` returns false for commands
+// it does not own. Savestate commands are refused until the host can snapshot the native game.
+template <class Handler>
+int32_t native_command(uint8_t command, const uint8_t* payload, uint32_t payload_size,
+                       uint8_t* response, uint32_t response_capacity, uint32_t* response_size,
+                       uint32_t minimum_capacity, bool native_savestates, Handler&& handle) {
+  if (!response_size) return NATIVE_COMMAND_BOUNDS;
+  *response_size = 0;
+  if (!native_savestates && (command == CMD_CAPTURE_SAVESTATE || command == CMD_LOAD_SAVESTATE))
+    return NATIVE_COMMAND_NEEDS_NATIVE_ROLLBACK;
+  if (!response || response_capacity < minimum_capacity || (payload_size && !payload))
+    return NATIVE_COMMAND_BOUNDS;
+  if (!command_payload_valid(command, payload, payload_size)) {
+#if MU_SQUAD
+    // Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+    // A malformed selection must invalidate match 1 too. Dispatch only the
+    // canonical bounded clear, never the rejected bytes, then retain the error.
+    if (command == MU_SQUAD_COMMAND && payload_size && payload[0] == 1) {
+      const uint8_t clear[] = {1, 0};
+      std::vector<uint8_t> ignored;
+      handle(command, clear, sizeof clear, ignored);
+    }
+#endif
+    return NATIVE_COMMAND_BOUNDS;
+  }
+  std::vector<uint8_t> reply;
+  if (!handle(command, payload, payload_size, reply)) return NATIVE_COMMAND_UNKNOWN;
+  if (reply.size() > response_capacity) return NATIVE_COMMAND_BOUNDS;
+  if (!reply.empty()) std::memcpy(response, reply.data(), reply.size());
+  *response_size = (uint32_t)reply.size();
+  return NATIVE_COMMAND_OK;
+}
+
+}  // namespace slippi::online

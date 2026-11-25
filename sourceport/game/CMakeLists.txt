@@ -1,0 +1,903 @@
+# The game, built from source as a library the host runtime loads.
+#
+# A separate project because it needs GCC even when the host uses another compiler
+# (see ../cmake/mingw-w64-x86_64.cmake). The host talks to it through one exported entry point and
+# two tables of function pointers, so nothing here links against the host and the host links against
+# nothing here.
+cmake_minimum_required(VERSION 3.25)
+project(melee_game C CXX)
+
+enable_testing()
+# Every test here needs only this build (no game run, no disc), so all are "quick" (the labels'
+# meaning: port/tests/test_labels.cmake; commands: docs/build-source-port.md, "Running the tests").
+function(mu_label_quick)
+  get_property(tests DIRECTORY PROPERTY TESTS)
+  foreach(test IN LISTS tests)
+    set_property(TEST ${test} APPEND PROPERTY LABELS quick)
+  endforeach()
+endfunction()
+cmake_language(DEFER CALL mu_label_quick)
+
+if(NOT CMAKE_C_COMPILER_ID STREQUAL "GNU" OR CMAKE_C_COMPILER_VERSION VERSION_LESS 14)
+  message(FATAL_ERROR "melee_game needs GCC 14 or newer: scalar_storage_order, and -ffp-contract=on meaning what the standard says")
+endif()
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  message(FATAL_ERROR "melee_game requires an x86-64 target")
+endif()
+if(NOT WIN32 AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "melee_game supports Windows x64 and native Linux x86-64")
+endif()
+
+get_filename_component(REPO "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
+# Assertions and the debug file name their source file. Without this they carry the full path of
+# the folder the game was built in, which then shows up in every player's crash report.
+add_compile_options("-ffile-prefix-map=${REPO}=.")
+get_filename_component(MU_TOOLCHAIN_ROOT "${CMAKE_C_COMPILER}" DIRECTORY)
+get_filename_component(MU_TOOLCHAIN_ROOT "${MU_TOOLCHAIN_ROOT}/.." ABSOLUTE)
+add_compile_options("-ffile-prefix-map=${MU_TOOLCHAIN_ROOT}=toolchain")
+set(MELEE_DECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../extern/melee" CACHE PATH "checkout of the game sources")
+set(D "${MELEE_DECOMP_DIR}")
+# Game sources kept outside the tree get the same short name they have inside it, so no build folder
+# path reaches the game's assertions or a player's crash report.
+get_filename_component(MU_DECOMP_REAL "${D}" ABSOLUTE)
+add_compile_options("-ffile-prefix-map=${MU_DECOMP_REAL}=./sourceport/extern/melee")
+if(NOT EXISTS "${D}/src/melee/gm/gmmain.c")
+  message(FATAL_ERROR "melee_game: no game sources at ${D}")
+endif()
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+# The game sources must be prepared: the public decompilation with the native patch applied, or (in a
+# development tree) the private working fork, whose commits hold the changes. --check changes nothing;
+# it stops on a public checkout without the patch, or on a fork checkout with the patch tracked again.
+if(EXISTS "${D}/.git" AND EXISTS "${REPO}/tools/prepare_native_sources.py")
+  execute_process(COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/prepare_native_sources.py" --check --decomp "${D}"
+    RESULT_VARIABLE mu_prepared OUTPUT_VARIABLE mu_prepared_out ERROR_VARIABLE mu_prepared_err
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
+  if(NOT mu_prepared EQUAL 0)
+    message(FATAL_ERROR "melee_game: ${mu_prepared_err}${mu_prepared_out}")
+  endif()
+  message(STATUS "${mu_prepared_out}")
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # LP64 must never widen the console's explicit long fields or its audio sample
+  # buffers. Keep the original source/Windows build intact; compile a lexical
+  # overlay that preserves 64-bit integers and host ABI shim declarations.
+  file(GLOB_RECURSE MU_CONSOLE_INPUTS CONFIGURE_DEPENDS
+    "${D}/src/*" "${D}/libs/dolphin/*")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${MU_CONSOLE_INPUTS}
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tools/console_long_overlay.py")
+  set(MU_CONSOLE_OVERLAY "${CMAKE_CURRENT_BINARY_DIR}/console-lp64")
+  execute_process(COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tools/console_long_overlay.py" "${D}" "${MU_CONSOLE_OVERLAY}"
+    COMMAND_ERROR_IS_FATAL ANY)
+  set(D "${MU_CONSOLE_OVERLAY}")
+endif()
+set(SDK "${D}/libs/dolphin/src/dolphin")
+# ---- how game code is compiled: one definition, shared by the game and by the parity library ----
+add_library(game_flags INTERFACE)
+target_include_directories(game_flags INTERFACE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include" "${D}/src" "${D}/src/MSL" "${D}/libs/dolphin/include" "${SDK}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include_stub" "${REPO}/port/runtime/abi")
+target_compile_definitions(game_flags INTERFACE MU_NATIVE VERSION_GALE01 BUILD_VERSION=0)
+# The player release (the host's option of the same name, docs/client-release.md): the Direct
+# exception of the Online menu and the online self-test are left out, and the library exports
+# mu_public_build so --print-info can tell the packager.
+option(NUCLEUS_PUBLIC_BUILD "Build the player release: test hooks left out" OFF)
+if(NUCLEUS_PUBLIC_BUILD)
+  target_compile_definitions(game_flags INTERFACE NUCLEUS_PUBLIC_BUILD=1)
+endif()
+# GCC 14's scalar replacement loses scalar_storage_order on nested DISC_PTR unions
+# (native_disc_layout returns byte-swapped pointers with -O2), on Windows and Linux alike.
+# Preserve the actual loads/stores until that optimizer regression is resolved upstream.
+target_compile_options(game_flags INTERFACE -fno-tree-sra)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_options(game_flags INTERFACE -fPIC -fvisibility=hidden)
+  add_executable(mu_linux_sdk_layout_test tests/linux_sdk_layout.c)
+  target_link_libraries(mu_linux_sdk_layout_test PRIVATE game_flags)
+  set_target_properties(mu_linux_sdk_layout_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+  add_test(NAME native_linux_sdk_layout COMMAND mu_linux_sdk_layout_test)
+  add_test(NAME native_console_long_overlay COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_console_long_overlay.py")
+  add_test(NAME native_game_image_bounds COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_check_game_image.py")
+  add_test(NAME native_audio_map_ranges COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tools/test_audio_ranges.py")
+endif()
+target_compile_options(game_flags INTERFACE
+  -O2 -g
+  -include "${CMAKE_CURRENT_SOURCE_DIR}/include/mu_native.h"   # only C targets link game_flags
+  -mno-ms-bitfields          # the console compiler packs a u8 and a u16 bitfield into one run; the MS layout does not
+  -fno-strict-aliasing       # the sources read floats through integer pointers throughout
+  -fwrapv
+  -fno-aggressive-loop-optimizations   # the sources read one entry past a table on a loop's last pass; GCC took that as proof the pass never runs and dropped it (Peach's third down special item)
+  -fno-builtin               # no folding sin() at compile time or sqrt() into an instruction: the game's own maths decides
+  -ffp-contract=on           # fuse a*b+c only inside one expression, as the console compiler did
+  -fexec-charset=CP932       # the game's string literals are Shift-JIS at run time
+  -w)
+# M0 evidence build only: counts non-finite inputs to the maths routines (include/mu_math_audit.h).
+option(MU_MATH_AUDIT "Count non-finite inputs to audited maths routines" OFF)
+if(MU_MATH_AUDIT)
+  target_compile_definitions(game_flags INTERFACE MU_MATH_AUDIT)
+endif()
+set(MELEE_CPU_BASELINE "AVX2" CACHE STRING "Instruction set baseline, matching the host: AVX2, AVX or SSE2")
+if(MELEE_CPU_BASELINE STREQUAL "AVX2")
+  target_compile_options(game_flags INTERFACE -mavx2 -mfma)
+elseif(MELEE_CPU_BASELINE STREQUAL "AVX")
+  target_compile_options(game_flags INTERFACE -mavx)
+endif()
+# Disc pointers are 32-bit slots holding real addresses, so everything the game can point at has to
+# sit below 4 GB: the image at a fixed base with relocation off, MEM1 placed by the host.
+if(WIN32)
+  set(LOW_IMAGE_LINK_OPTIONS -static-libgcc -static-libstdc++ -Wl,--disable-dynamicbase -Wl,--disable-high-entropy-va)
+  set(LOW_TEST_LINK_OPTIONS ${LOW_IMAGE_LINK_OPTIONS} -Wl,--image-base,0x90000000)
+else()
+  # A low non-PIE executable is sufficient for pointer-slot unit tests. The game
+  # itself remains an ELF shared object at its console-compatible preferred base.
+  set(LOW_IMAGE_LINK_OPTIONS -Wl,-Bsymbolic -Wl,-z,defs)
+  set(LOW_TEST_LINK_OPTIONS -no-pie -Wl,-Ttext-segment=0x40000000)
+endif()
+
+add_executable(mu_disc_layout_test EXCLUDE_FROM_ALL tests/disc_layout.c shim/mu_disc_layout.c)
+set_target_properties(mu_disc_layout_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_disc_layout_test PRIVATE game_flags)
+add_test(NAME native_disc_layout COMMAND mu_disc_layout_test)
+
+add_executable(mu_command_test EXCLUDE_FROM_ALL tests/command.c "${D}/src/melee/lb/lbcommand.c"
+                                                "${D}/src/melee/lb/lb_013B.c")
+set_target_properties(mu_command_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_command_test PRIVATE game_flags)
+target_link_options(mu_command_test PRIVATE ${LOW_TEST_LINK_OPTIONS})
+add_test(NAME native_command_loop COMMAND mu_command_test)
+
+add_executable(mu_match_test EXCLUDE_FROM_ALL tests/match_override.c shim/mu_match.c)
+set_target_properties(mu_match_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_match_test PRIVATE game_flags)
+target_include_directories(mu_match_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${REPO}/port/runtime/abi")
+add_test(NAME native_match_override COMMAND mu_match_test)
+
+# Run the exact production major runner with scene stubs, plus the content hook's real cache calls.
+set(CONTENT_MAJOR_RUNNER "${CMAKE_CURRENT_BINARY_DIR}/content_major_runner.h")
+if(MELEE_PYTHON)
+  set(CONTENT_TEST_PYTHON "${MELEE_PYTHON}")
+else()
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  set(CONTENT_TEST_PYTHON "${Python3_EXECUTABLE}")
+endif()
+add_custom_command(OUTPUT "${CONTENT_MAJOR_RUNNER}"
+  COMMAND "${CONTENT_TEST_PYTHON}" "${REPO}/tools/native_major_fixture.py"
+    "${D}/src/melee/gm/gm_1A3F.c" "${CONTENT_MAJOR_RUNNER}"
+  DEPENDS "${REPO}/tools/native_major_fixture.py" "${D}/src/melee/gm/gm_1A3F.c"
+  VERBATIM)
+add_executable(mu_content_transition_test EXCLUDE_FROM_ALL
+  tests/content_transition.c shim/mu_content.c "${CONTENT_MAJOR_RUNNER}")
+set_target_properties(mu_content_transition_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_content_transition_test PRIVATE game_flags)
+target_include_directories(mu_content_transition_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+add_test(NAME native_content_transition COMMAND mu_content_transition_test)
+
+set(CREDITS_PARTICLE_FUNCTION "${CMAKE_CURRENT_BINARY_DIR}/credits_particle_function.h")
+add_custom_command(OUTPUT "${CREDITS_PARTICLE_FUNCTION}"
+  COMMAND "${CONTENT_TEST_PYTHON}" "${REPO}/tools/native_major_fixture.py"
+    "${D}/src/melee/gm/gmstaffroll.c" "${CREDITS_PARTICLE_FUNCTION}" --function gm_801AB200_ptcl
+  DEPENDS "${REPO}/tools/native_major_fixture.py" "${D}/src/melee/gm/gmstaffroll.c"
+  VERBATIM)
+foreach(credits_variant native console)
+  add_executable(mu_credits_${credits_variant}_test EXCLUDE_FROM_ALL
+    tests/credits_particle.c "${CREDITS_PARTICLE_FUNCTION}")
+  set_target_properties(mu_credits_${credits_variant}_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+  target_include_directories(mu_credits_${credits_variant}_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+  if(credits_variant STREQUAL "native")
+    target_compile_definitions(mu_credits_${credits_variant}_test PRIVATE MU_NATIVE)
+  endif()
+  add_test(NAME credits_particle_${credits_variant} COMMAND mu_credits_${credits_variant}_test)
+endforeach()
+
+if(NOT MU_NO_SLIPPI)   # tests the replay recording, which a MU_NO_SLIPPI tree does not have (option: see below)
+add_executable(mu_record_start_test tests/record_start.c)
+set_target_properties(mu_record_start_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_record_start_test PRIVATE game_flags)
+target_compile_options(mu_record_start_test PRIVATE -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables)
+target_link_options(mu_record_start_test PRIVATE -Wl,--gc-sections)
+add_test(NAME native_record_start COMMAND mu_record_start_test)
+endif()
+
+add_executable(mu_setjmp_test EXCLUDE_FROM_ALL tests/setjmp.c shim/mu_setjmp.c)
+set_target_properties(mu_setjmp_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_setjmp_test PRIVATE game_flags)
+add_test(NAME native_setjmp COMMAND mu_setjmp_test)
+
+add_executable(mu_alarm_test EXCLUDE_FROM_ALL tests/alarm.c shim/mu_os.c)
+set_target_properties(mu_alarm_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_alarm_test PRIVATE game_flags)
+add_test(NAME native_alarm COMMAND mu_alarm_test)
+
+add_executable(mu_preload_compaction_test EXCLUDE_FROM_ALL
+  tests/preload_compaction.c "${D}/src/sysdolphin/baselib/archive.c")
+set_target_properties(mu_preload_compaction_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_preload_compaction_test PRIVATE game_flags)
+target_compile_options(mu_preload_compaction_test PRIVATE
+  -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables)
+target_link_options(mu_preload_compaction_test PRIVATE ${LOW_TEST_LINK_OPTIONS} -Wl,--gc-sections)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_options(mu_preload_compaction_test PRIVATE -Wl,--section-start=.test_arena=0x90000000)
+endif()
+add_test(NAME native_preload_compaction COMMAND mu_preload_compaction_test)
+
+# Exercise the actual private sound-bank bookkeeping without disc/renderer dependencies.
+add_executable(mu_synth_bank_test EXCLUDE_FROM_ALL tests/synth_bank.c)
+set_target_properties(mu_synth_bank_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_synth_bank_test PRIVATE game_flags)
+target_compile_options(mu_synth_bank_test PRIVATE -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables)
+target_link_options(mu_synth_bank_test PRIVATE -Wl,--gc-sections)
+add_test(NAME native_synth_bank COMMAND mu_synth_bank_test)
+
+# Exercise the production AX voice service path when full and partial address
+# updates are coalesced before the DSP copy runs.
+add_executable(mu_ax_addr_sync_test tests/ax_addr_sync.c)
+set_target_properties(mu_ax_addr_sync_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_ax_addr_sync_test PRIVATE game_flags)
+target_compile_options(mu_ax_addr_sync_test PRIVATE -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables)
+target_link_options(mu_ax_addr_sync_test PRIVATE -Wl,--gc-sections)
+add_test(NAME native_ax_addr_sync COMMAND mu_ax_addr_sync_test)
+
+add_executable(mu_ax_commands_test tests/ax_commands.c)
+set_target_properties(mu_ax_commands_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_ax_commands_test PRIVATE game_flags)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_link_libraries(mu_ax_commands_test PRIVATE m)
+endif()
+target_compile_options(mu_ax_commands_test PRIVATE -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables)
+target_link_options(mu_ax_commands_test PRIVATE -Wl,--gc-sections)
+add_test(NAME native_ax_commands COMMAND mu_ax_commands_test)
+
+add_executable(mu_synth_ratio_test tests/synth_ratio.c)
+set_target_properties(mu_synth_ratio_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_synth_ratio_test PRIVATE game_flags)
+target_compile_options(mu_synth_ratio_test PRIVATE -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables)
+target_link_options(mu_synth_ratio_test PRIVATE -Wl,--gc-sections)
+add_test(NAME native_synth_ratio COMMAND mu_synth_ratio_test)
+# Wobbuffet's decaying counter damage converts below zero as the console does (B-281).
+add_executable(mu_sonans_damage_test EXCLUDE_FROM_ALL tests/sonans_damage.c tests/sonans_damage_stubs.c)
+set_target_properties(mu_sonans_damage_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_sonans_damage_test PRIVATE game_flags)
+target_compile_options(mu_sonans_damage_test PRIVATE -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables)
+target_link_options(mu_sonans_damage_test PRIVATE -Wl,--gc-sections)
+add_test(NAME native_sonans_damage COMMAND mu_sonans_damage_test)
+
+# Verify field-aware card payload byte-order conversion for save and name-tag data.
+add_executable(mu_card_endian_test tests/card_endian.c "${D}/src/melee/lb/lbcardserial.c")
+set_target_properties(mu_card_endian_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_link_libraries(mu_card_endian_test PRIVATE game_flags)
+add_test(NAME native_card_endian COMMAND mu_card_endian_test)
+
+# Every annotated DISC_STRUCT field sits at its console offset in the host layout (tools/disc_offset_audit.py).
+# An 8-byte pointer field in a disc struct shifted Link's attributes from +0x94 and went unnoticed.
+add_test(NAME native_disc_offsets COMMAND "${CONTENT_TEST_PYTHON}" "${REPO}/tools/disc_offset_audit.py"
+  --build "${CMAKE_CURRENT_BINARY_DIR}" --decomp "${D}" --ninja "${CMAKE_MAKE_PROGRAM}")
+
+# ---- source implementations of assembly-only SDK maths ----
+# Native game builds never consume generated PPC translations or a retail DOL.
+add_library(sdk_math OBJECT math/sdk_math.c math/estimates.c)
+target_link_libraries(sdk_math PRIVATE game_flags)
+target_compile_options(sdk_math PRIVATE -ffp-contract=off)
+set_target_properties(sdk_math PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+
+# ---- what is compiled ----
+file(GLOB_RECURSE GAME_SOURCES CONFIGURE_DEPENDS "${D}/src/melee/*.c" "${D}/src/sysdolphin/*.c")
+# Define the CPU's hitlag decision in a private input, preserving the user's decomp checkout.
+set(MU_CPU_SOURCE "${D}/src/melee/ft/kinds/ftCommon/ftCo_0A01.c")
+set(MU_CPU_FIXED "${CMAKE_CURRENT_BINARY_DIR}/native-cpu/ftCo_0A01.c")
+add_custom_command(OUTPUT "${MU_CPU_FIXED}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/native_cpu_overlay.py"
+    "${MU_CPU_SOURCE}" "${MU_CPU_FIXED}"
+  DEPENDS "${MU_CPU_SOURCE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/native_cpu_overlay.py"
+  VERBATIM)
+list(REMOVE_ITEM GAME_SOURCES "${MU_CPU_SOURCE}")
+list(APPEND GAME_SOURCES "${MU_CPU_FIXED}")
+set_source_files_properties("${MU_CPU_FIXED}" PROPERTIES
+  INCLUDE_DIRECTORIES "${D}/src/melee/ft/kinds/ftCommon")
+# card.c builds each card command in a stack local, sets only the fields its type uses and copies the
+# whole struct into its ring (fn_803AC168). Zeroed locals keep the unset union bytes and padding free of
+# stack bytes, so two processes at the same frame hold the same ring (Friends join-in-progress).
+set_source_files_properties("${D}/src/sysdolphin/baselib/card.c" PROPERTIES
+  COMPILE_OPTIONS "-ftrivial-auto-var-init=zero")
+set(MU_CPU_HITLAG_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/native_cpu_hitlag_branch.h")
+add_custom_command(OUTPUT "${MU_CPU_HITLAG_FIXTURE}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/native_cpu_overlay.py"
+    "${MU_CPU_SOURCE}" "${MU_CPU_HITLAG_FIXTURE}" --hitlag-fixture
+  DEPENDS "${MU_CPU_SOURCE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/native_cpu_overlay.py"
+  VERBATIM)
+add_executable(mu_cpu_hitlag_test EXCLUDE_FROM_ALL tests/cpu_hitlag.c "${MU_CPU_HITLAG_FIXTURE}")
+set_target_properties(mu_cpu_hitlag_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+target_include_directories(mu_cpu_hitlag_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+add_test(NAME native_cpu_hitlag COMMAND mu_cpu_hitlag_test)
+# The console's C library is kept only where its results reach the simulation: the maths, and rand.
+set(LIBC_SOURCES "${D}/src/MSL/math.c" "${D}/src/MSL/math_1.c" "${D}/src/MSL/math_data.c" "${D}/src/MSL/trigf.c" "${D}/src/MSL/float.c" "${D}/src/MSL/rand.c")
+# The halves of the SDK that sit above the hardware. What sat below it is the host's job.
+file(GLOB SDK_SOURCES CONFIGURE_DEPENDS "${SDK}/gx/*.c" "${SDK}/ax/*.c" "${SDK}/axfx/*.c" "${SDK}/mtx/*.c"
+  "${SDK}/thp/*.c")   # THP is a video decoder: computation, no hardware. MCC/FIO: see shim/mu_devkit.c
+list(APPEND SDK_SOURCES "${SDK}/os/OSAlloc.c" "${SDK}/os/OSArena.c" "${SDK}/pad/PadClamp.c")
+# Written for the hardware itself, or in its assembly; the native build has its own versions of these.
+list(REMOVE_ITEM SDK_SOURCES "${SDK}/gx/GXFifo.c" "${SDK}/mtx/psmtx.c")
+file(GLOB_RECURSE SHIM_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shim/*.c")
+# Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+option(MELEE_SQUAD_STRIKE "Build Squad Strike for offline VS" ON)
+# CSS accesses mncharsel's private state through one include, never a second TU.
+list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_squad_css.c")
+if(MELEE_SQUAD_STRIKE)
+  target_compile_definitions(game_flags INTERFACE MU_SQUAD=1)
+else()
+  list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_squad.c")
+  list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_squad_online.c")
+endif()
+# A game library with no Slippi code in it (-DMU_NO_SLIPPI=ON, its own build directory): the online
+# menus, replay playback and recording, practice matchmaking and the online rule codes are left out.
+# Three small files stand in for them: the entry points the game sources call (shim/mu_noslippi.c),
+# the match block copy a network match starts from (shim/mu_match_info.c) and the menu-less entry
+# into such a match (shim/mu_p2p_entry.c). The rollback engine itself (shim/mu_online*.c) stays.
+# The library keeps its names: melee_game.dll, .dbg and .snapexcl.
+option(MU_NO_SLIPPI "Build the game without the Slippi menus, replays and online codes" OFF)
+set(MU_NO_SLIPPI_ONLY mu_noslippi.c mu_match_info.c mu_p2p_entry.c)
+if(MU_NO_SLIPPI)
+  foreach(removed mu_slippi_menu.c mu_slippi_css.c mu_slippi_chat.c mu_slippi_splash.c mu_slippi_sss.c
+                  mu_replay.c mu_replay_abi.c mu_practice.c mu_online_rules.c mu_framedata.c mu_tourney.c
+                  mu_replay_defend.c mu_ranked_setup.c mu_ranked_setup_online.c mu_ranked_rank.c mu_ranked_reveal.c
+                  mu_online_options.c)
+    list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/${removed}")
+  endforeach()
+  target_compile_definitions(game_flags INTERFACE MU_NO_SLIPPI)
+else()
+  foreach(removed ${MU_NO_SLIPPI_ONLY})
+    list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/${removed}")
+  endforeach()
+endif()
+# Replacements for SDK files written against the hardware itself (see the REMOVE_ITEM above).
+file(GLOB GXNATIVE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/gxnative/*.c")
+list(APPEND SHIM_SOURCES ${GXNATIVE_SOURCES})
+# The SDK's AXOut.c with the Faster sound effects switch (axnative/AXOut.c).
+list(REMOVE_ITEM SDK_SOURCES "${SDK}/ax/AXOut.c")
+list(APPEND SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/axnative/AXOut.c")
+# Akaneia's added fighters, native (akaneia/INTEGRATION.md): the registry and each fighter's own C.
+# A fighter is offered on the character select only when its descriptor carries MU_AK_READY
+# (mu_ak_fighters.c); the others stay locked. ACE's fighters (ace/) build only with
+# -DMU_ACE_FIGHTERS=ON until their own checks are done.
+option(MU_AKANEIA_FIGHTERS "Build the native Akaneia fighters" ON)
+option(MU_ACE_FIGHTERS "Build the native ACE fighters as well" ON)
+list(APPEND SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighters.c")
+if(MU_AKANEIA_FIGHTERS)
+  target_compile_definitions(game_flags INTERFACE MU_AKANEIA_FIGHTERS=1)
+  add_executable(mu_ak_character_kind_test EXCLUDE_FROM_ALL tests/ak_character_kind.c)
+  set_target_properties(mu_ak_character_kind_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+  target_link_libraries(mu_ak_character_kind_test PRIVATE game_flags)
+  target_compile_options(mu_ak_character_kind_test PRIVATE -ffunction-sections -fdata-sections -fno-asynchronous-unwind-tables)
+  target_link_options(mu_ak_character_kind_test PRIVATE -Wl,--gc-sections)
+  add_test(NAME native_ak_character_kind COMMAND mu_ak_character_kind_test)
+  file(GLOB_RECURSE AKANEIA_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/*/*.c")
+  if(MU_ACE_FIGHTERS)
+    file(GLOB_RECURSE ACE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/ace/*/*.c")
+    list(APPEND AKANEIA_SOURCES ${ACE_SOURCES})
+  endif()
+  list(APPEND SHIM_SOURCES ${AKANEIA_SOURCES})
+  # The registry list: one line per fighter descriptor in those sources (a line that starts
+  # "const MuAkFighter mu_ak_<name> = "), so a new fighter folder under akaneia/ or ace/ needs no
+  # edit here or in mu_ak_fighters.c. Track contents as well as added/removed files so a
+  # descriptor added to an existing source refreshes the registry on the next build.
+  set(MU_AK_REGISTRY "")
+  foreach(ak_source ${AKANEIA_SOURCES})
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ak_source}")
+    file(STRINGS "${ak_source}" ak_lines REGEX "^const MuAkFighter mu_ak_[A-Za-z0-9_]+ = ")
+    foreach(ak_line ${ak_lines})
+      string(REGEX REPLACE "^const MuAkFighter (mu_ak_[A-Za-z0-9_]+) = .*$" "\\1" ak_symbol "${ak_line}")
+      string(APPEND MU_AK_REGISTRY "MU_AK_FIGHTER(${ak_symbol})\n")
+    endforeach()
+  endforeach()
+  # m-ex fighters compiled from their MexTK C (mexft/): each mexft/<fighter>/ holds the port's own
+  # C, unchanged, and mexft.txt (its name and the fighter file MxDt names). The C is prepared here
+  # (tools/mexft/mexft_prepare.py: its raw console addresses named, its exports found) and built
+  # below as a module of its own, like TM-CE's; the descriptor generated next to it joins the
+  # registry. Edits to the C or the manifest re-run the preparation.
+  set(MEXFT_MODULES)
+  # Fighter plugins (mexft/mexft_plugin.h): the game loads a fighter's code at startup from a file
+  # of its own. The loader is always built. MEXFT_PLUGINS names the mexft fighters built as
+  # plugins (target mexft_plugins, into fighters/ beside the library) instead of linked in:
+  # a list of folder names, or ALL.
+  list(APPEND SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugins.c")
+  set(MEXFT_PLUGINS "" CACHE STRING "mexft fighters built as plugins instead of linked in (names, or ALL)")
+  set(MEXFT_PLUGIN_NAMES)
+  set(MEXFT_LINKED_NAMES)   # the mexft fighters linked into the library (mexft_linked.h below)
+  file(GLOB MEXFT_MANIFESTS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/mexft/*/mexft.txt")
+  if(MEXFT_MANIFESTS AND NOT Python3_EXECUTABLE)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  endif()
+  set(MEXFT_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_prepare.py")
+  if(MEXFT_MANIFESTS)
+    # m-ex's runtime calls (MEX_GetFtItemID...), native, on the registry's services.
+    list(APPEND SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_runtime.c")
+    # The MexTK headers the fighters build against: tmce/MexTK plus newer m-ex member names.
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_overlay.py"
+              --tmce "${CMAKE_CURRENT_SOURCE_DIR}/tmce"
+              --compat "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/compat_fields.txt"
+              --out "${CMAKE_CURRENT_BINARY_DIR}/mexft/overlay"
+      RESULT_VARIABLE mexft_rc OUTPUT_VARIABLE mexft_log ERROR_VARIABLE mexft_err
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT mexft_rc EQUAL 0)
+      message(FATAL_ERROR "mexft overlay: ${mexft_err}")
+    endif()
+    message(STATUS "${mexft_log}")
+    file(GLOB_RECURSE mexft_overlay_inputs "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK/*.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tmce/native/*.h")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${mexft_overlay_inputs}
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_overlay.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/compat_fields.txt")
+  endif()
+  # The id of the layouts fighter code is compiled against (tools/mexft/mexft_abi.py): the game
+  # has it, each plugin has the one it was built with, and the game loads a plugin with its own.
+  if(NOT Python3_EXECUTABLE)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  endif()
+  set(MEXFT_ABI_INPUTS "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighter.h")
+  if(MEXFT_MANIFESTS)
+    list(APPEND MEXFT_ABI_INPUTS "${CMAKE_CURRENT_BINARY_DIR}/mexft/overlay")
+  else()
+    list(APPEND MEXFT_ABI_INPUTS "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK")
+  endif()
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_abi.py"
+            --out "${CMAKE_CURRENT_BINARY_DIR}/mexft/abi/mexft_abi.h" ${MEXFT_ABI_INPUTS}
+    RESULT_VARIABLE mexft_rc OUTPUT_VARIABLE mexft_log ERROR_VARIABLE mexft_err OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(NOT mexft_rc EQUAL 0)
+    message(FATAL_ERROR "mexft abi: ${mexft_err}")
+  endif()
+  message(STATUS "${mexft_log}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugin.h" "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighter.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_abi.py")
+  set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugins.c" APPEND PROPERTY
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}/mexft/abi")
+  foreach(mexft_manifest ${MEXFT_MANIFESTS})
+    get_filename_component(mexft_dir "${mexft_manifest}" DIRECTORY)
+    get_filename_component(mexft_name "${mexft_dir}" NAME)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mexft_manifest}")
+    # A glob, so that adding a native.edits file reconfigures too.
+    file(GLOB mexft_edits CONFIGURE_DEPENDS "${mexft_dir}/native.edits")
+    if(mexft_edits)
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${mexft_edits})
+    endif()
+    # "hold <reason>" in the manifest: code that needs a hand edit first; the fighter stays locked.
+    file(STRINGS "${mexft_manifest}" mexft_hold REGEX "^hold ")
+    if(mexft_hold)
+      message(STATUS "mexft ${mexft_name}: held, stays locked (${mexft_hold})")
+      continue()
+    endif()
+    file(GLOB_RECURSE mexft_sources CONFIGURE_DEPENDS "${mexft_dir}/*.c")
+    set(mexft_out "${CMAKE_CURRENT_BINARY_DIR}/mexft/${mexft_name}")
+    execute_process(
+      COMMAND "${Python3_EXECUTABLE}" "${MEXFT_TOOL}" --manifest "${mexft_manifest}" --name ${mexft_name}
+              --out "${mexft_out}" --symbols "${MU_DECOMP_REAL}/config/GALE01/symbols.txt"
+              --functions "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/ftFunction.txt"
+              --functions "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK/ftFunction.txt"
+              --item-functions "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/itFunction.txt"
+              --item-functions "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK/itFunction.txt"
+              --shim "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h"
+              --adapter "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h"
+              --mextk "${CMAKE_CURRENT_SOURCE_DIR}/tmce/MexTK/include"
+              --mex-link "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/m-ex/melee.link"
+              --mex-include "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/m-ex/include" ${mexft_sources}
+      RESULT_VARIABLE mexft_rc OUTPUT_VARIABLE mexft_log ERROR_VARIABLE mexft_err
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT mexft_rc EQUAL 0)
+      message(FATAL_ERROR "mexft/${mexft_name}: ${mexft_err}")
+    endif()
+    message(STATUS "${mexft_log}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mexft_manifest}" ${mexft_sources}
+      "${MEXFT_TOOL}" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_adapter.h" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mex.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/m-ex/melee.link")
+    if(MEXFT_PLUGINS STREQUAL "ALL" OR mexft_name IN_LIST MEXFT_PLUGINS)
+      list(APPEND MEXFT_PLUGIN_NAMES ${mexft_name})
+      set(MEXFT_PLUGIN_MODULES_${mexft_name})
+      # What MxDt calls the fighter: the manifest's "mex-name" line, else its "name".
+      file(STRINGS "${mexft_manifest}" mexft_mex_name REGEX "^mex-name ")
+      if(NOT mexft_mex_name)
+        file(STRINGS "${mexft_manifest}" mexft_mex_name REGEX "^name ")
+      endif()
+      list(GET mexft_mex_name 0 mexft_mex_name)
+      string(REGEX REPLACE "^(mex-)?name +" "" mexft_mex_name "${mexft_mex_name}")
+      string(STRIP "${mexft_mex_name}" MEXFT_PLUGIN_MEX_NAME_${mexft_name})
+    else()
+      list(APPEND SHIM_SOURCES "${mexft_out}/mexft_${mexft_name}.c")
+      list(APPEND MEXFT_LINKED_NAMES ${mexft_name})
+      string(APPEND MU_AK_REGISTRY "MU_AK_FIGHTER(mu_ak_mexft_${mexft_name})\n")
+    endif()
+    file(STRINGS "${mexft_out}/modules.txt" mexft_modules)
+    foreach(mexft_module ${mexft_modules})
+      list(APPEND MEXFT_MODULES "${mexft_name}/${mexft_module}")
+    endforeach()
+  endforeach()
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mu_ak/mu_ak_registry.inc" CONTENT "${MU_AK_REGISTRY}")
+  # The linked ones by name, for the library's mu_fighter_plugin_info (mexft_plugins.c; the host's
+  # --print-info reads it): a comma-separated C string, empty when every fighter is a plugin.
+  string(REPLACE ";" "," mexft_linked_text "${MEXFT_LINKED_NAMES}")
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mexft/abi/mexft_linked.h"
+    CONTENT "/* Generated by sourceport/game/CMakeLists.txt: do not edit. */\n#define MEXFT_LINKED_FIGHTERS \"${mexft_linked_text}\"\n")
+  set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighters.c" APPEND PROPERTY
+    COMPILE_DEFINITIONS MU_AK_REGISTRY_GENERATED)
+  set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighters.c" APPEND PROPERTY
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}/mu_ak")
+endif()
+# A fighter joins the registry once akaneia/<fighter>/<fighter>.c exists (that file defines
+# mu_ak_<fighter>); until then the registry leaves it out and the fighter stays locked.
+foreach(ak_fighter wolf diddy charizard lucas sonic dedede tails)
+  if(MU_AKANEIA_FIGHTERS AND (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/${ak_fighter}/${ak_fighter}.c"
+      OR EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/${ak_fighter}/ft${ak_fighter}.c"))
+    string(TOUPPER "${ak_fighter}" ak_upper)
+    set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/akaneia/mu_ak_fighters.c" APPEND PROPERTY
+      COMPILE_DEFINITIONS "MU_AK_HAVE_${ak_upper}")
+  endif()
+endforeach()
+
+# m-ex stages with their own code, native (shim/mu_mex_stage.h, run-source/rel09-stages/LAYER.md
+# phase B): each stage's C under mexstages/<stage>/, helpers in mexstages/common/. The registry is
+# one line per "const MuGrStage mu_gr_<name> = " line in those sources, so a new stage folder needs
+# no edit here. A stage is offered only when its descriptor carries MU_GR_READY; without this option
+# every row that needs its own code stays locked (the data only rows play either way).
+option(MU_MEX_STAGES "Build the native m-ex stage code (mexstages/)" ON)
+if(MU_MEX_STAGES)
+  file(GLOB_RECURSE MEX_STAGE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/mexstages/*/*.c")
+  list(APPEND SHIM_SOURCES ${MEX_STAGE_SOURCES})
+  set(MU_GR_REGISTRY "")
+  foreach(gr_source ${MEX_STAGE_SOURCES})
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${gr_source}")
+    file(STRINGS "${gr_source}" gr_lines REGEX "^const MuGrStage mu_gr_[A-Za-z0-9_]+ = ")
+    foreach(gr_line ${gr_lines})
+      string(REGEX REPLACE "^const MuGrStage (mu_gr_[A-Za-z0-9_]+) = .*$" "\\1" gr_symbol "${gr_line}")
+      string(APPEND MU_GR_REGISTRY "MU_GR_STAGE(${gr_symbol})\n")
+    endforeach()
+  endforeach()
+  file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/mu_gr/mu_gr_registry.inc" CONTENT "${MU_GR_REGISTRY}")
+  set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_mex_stage.c" APPEND PROPERTY
+    COMPILE_DEFINITIONS MU_GR_REGISTRY_GENERATED)
+  set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_mex_stage.c" APPEND PROPERTY
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_BINARY_DIR}/mu_gr")
+endif()
+
+# rogueMelee's Rogue Mode, native (rogue/): its own C under rogue/melee/rogue (the include root is
+# rogue/, so the decomp's <melee/rogue/...> includes find it), and its edits to the game's source in
+# Rogue patch routines are gated by MU_ROGUE and require the player's disc.
+# rogue/mu_rogue.c). The flags are the release values of its own build (tools/lib/integration.py).
+option(MU_ROGUE "Build rogueMelee's Rogue Mode natively (rogue/)" ON)
+if(MU_ROGUE)
+  target_compile_definitions(game_flags INTERFACE MU_ROGUE=1 ROGUE_ENABLE_AERIALS=1 ROGUE_DEBUG=0
+    ROGUE_QA_EVENT_RELEASE=0 ROGUE_QA_CYCLES=0 ROGUE_QA_MODE=0 ROGUE_QA_MATCHES=20 ROGUE_QA_SETTLEMENT=0
+    ROGUE_QA_RECOVERY=0 ROGUE_QA_LIFECYCLE=0 ROGUE_QA_AERIAL_STRESS=0 ROGUE_QA_SPECIAL_START=0
+    ROGUE_QA_SPECIAL_COUNT=104)
+  target_include_directories(game_flags INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/rogue")
+  file(GLOB_RECURSE ROGUE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/rogue/*.c")
+  list(APPEND SHIM_SOURCES ${ROGUE_SOURCES})
+  # Melee Maker's borrowed-move engine, native (maker/, include root for its <engine/...>, <bam/...>,
+  # <platform/...>). Its edits share rogueMelee's lines in the game's source (include/mu_bm.h picks the
+  # engine of the loaded disc), so it builds with MU_ROGUE. Shim side: maker/mu_maker.c.
+  target_compile_definitions(game_flags INTERFACE MU_MAKER=1 BAM_ENABLE_AERIALS=1 BAM_DEBUG=0
+    BAM_VERSION="1.3.8")
+  target_include_directories(game_flags INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/maker")
+  file(GLOB_RECURSE MAKER_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/maker/*.c")
+  list(APPEND SHIM_SOURCES ${MAKER_SOURCES})
+endif()
+
+if(NOT Python3_EXECUTABLE)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+endif()
+
+# ---- Training Mode CE, compiled natively (tmce/) ----
+# TM-CE's own C, against MexTK headers regenerated for the native layouts (tools/tmce/gen_mextk.py).
+# Each module is linked on its own as on the console, where each is a separate .dat file: its
+# globals stay private, its exports get the module's prefix, and its MexTK calls are renamed to the
+# decomp functions at the same console addresses (tools/tmce/link_module.py).
+set(TMCE "${CMAKE_CURRENT_SOURCE_DIR}/tmce")
+get_filename_component(TMCE_TOOLCHAIN_BIN "${CMAKE_C_COMPILER}" DIRECTORY)
+# No debug info: TM-CE declares types with the decomp's names (ColorOverlay, CollData...), and the
+# layout tools (tools/tmce/gdb_decomp_info.py) must find only the decomp's in melee_game.dbg.
+set(TMCE_FLAGS -O2 -g0 -funsigned-char -fno-strict-aliasing -fwrapv -mno-ms-bitfields -mcmodel=small
+  -fno-builtin -ffp-contract=on -w)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND TMCE_FLAGS -fPIC -fvisibility=hidden -fno-tree-sra)
+endif()
+if(MELEE_CPU_BASELINE STREQUAL "AVX2")
+  list(APPEND TMCE_FLAGS -mavx2 -mfma)
+elseif(MELEE_CPU_BASELINE STREQUAL "AVX")
+  list(APPEND TMCE_FLAGS -mavx)
+endif()
+# -DMU_TMCE=OFF leaves Training Mode CE out: its modules and its game-side hooks (shim/mu_tmce*.c)
+# are not built, and shim/mu_tmce_off.c gives each hook the decomp calls a body that does nothing
+# (mu_tmce_active() and mu_tmce_enabled() return 0), so the game plays as it does without TM-CE's
+# disc. m-ex's runtime (tmce/mex) and the MexTK headers are built either way: the fighters use them.
+option(MU_TMCE "Build Training Mode CE into the game" ON)
+if(MU_TMCE)
+  list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_tmce_off.c")
+else()
+  foreach(removed mu_tmce.c mu_tmce_codes.c mu_tmce_enabled.c mu_tmce_ess.c mu_tmce_event.c mu_tmce_legacy.c
+                  mu_tmce_menu.c mu_tmce_osd.c)
+    list(REMOVE_ITEM SHIM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/shim/${removed}")
+  endforeach()
+endif()
+if(MU_TMCE)
+  # TM-CE's own C is not kept in this repository. Configuring fetches the upstream commit pinned in
+  # tmce/upstream.txt (that commit alone, by its full hash, into TMCE_UPSTREAM_DIR; nothing when it
+  # is already there, so later builds need no network) and checks it against the two hashes
+  # recorded there: the src/ files the build takes, and the ASM/ folder whose patches the native
+  # hooks port by hand. The build then makes the native source in tmce/src of the build tree
+  # (tools/tmce/prepare_src.py: upstream's files, native_edits.py, native_fixes.patch).
+  set(TMCE_UPSTREAM_DIR "${CMAKE_CURRENT_BINARY_DIR}/tmce-upstream" CACHE PATH
+    "A git repository holding Training Mode CE's pinned commit (fetched into it when missing)")
+  find_package(Git REQUIRED)
+  set(TMCE_TOOLS "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/tmce")
+  set(TMCE_PREPARE "${CMAKE_COMMAND}" -E env "TMCE_GIT=${GIT_EXECUTABLE}"
+    "${Python3_EXECUTABLE}" "${TMCE_TOOLS}/prepare_src.py" --upstream "${TMCE_UPSTREAM_DIR}")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${TMCE}/upstream.txt")
+  execute_process(COMMAND ${TMCE_PREPARE} --fetch --verify
+    RESULT_VARIABLE tmce_result OUTPUT_VARIABLE tmce_out ERROR_VARIABLE tmce_err
+    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
+  if(NOT tmce_result EQUAL 0)
+    message(FATAL_ERROR "${tmce_err}${tmce_out}\n"
+      "(Configuring with -DMU_TMCE=OFF builds the game without Training Mode CE.)")
+  endif()
+  message(STATUS "${tmce_out}")
+  execute_process(COMMAND ${TMCE_PREPARE} --list OUTPUT_VARIABLE TMCE_SRC_FILES
+    OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+  set(TMCE_SRC "${CMAKE_CURRENT_BINARY_DIR}/tmce/src")
+  list(TRANSFORM TMCE_SRC_FILES PREPEND "${TMCE_SRC}/" OUTPUT_VARIABLE TMCE_SRC_OUTPUTS)
+  add_custom_command(OUTPUT ${TMCE_SRC_OUTPUTS}
+    COMMAND ${TMCE_PREPARE} --out "${TMCE_SRC}"
+    DEPENDS "${TMCE}/upstream.txt" "${TMCE_TOOLS}/prepare_src.py" "${TMCE_TOOLS}/tmce_upstream.py"
+            "${TMCE_TOOLS}/native_edits.py" "${TMCE_TOOLS}/native_fixes.patch"
+    COMMENT "Training Mode CE: the native source from upstream"
+    VERBATIM)
+  add_custom_target(tmce_src DEPENDS ${TMCE_SRC_OUTPUTS})
+  # The game's TM/ data files: upstream's dats/ at the pin, checked against its dats-sha256, into
+  # TM/ beside melee_game.dll (the install and release scripts copy the folder with the game).
+  # The native game has TM-CE's code built in, so it needs only their data. Never committed.
+  execute_process(COMMAND ${TMCE_PREPARE} --list-dats OUTPUT_VARIABLE TMCE_DAT_FILES
+    OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+  list(TRANSFORM TMCE_DAT_FILES PREPEND "${CMAKE_CURRENT_BINARY_DIR}/TM/" OUTPUT_VARIABLE TMCE_DAT_OUTPUTS)
+  add_custom_command(OUTPUT ${TMCE_DAT_OUTPUTS}
+    COMMAND ${TMCE_PREPARE} --dats "${CMAKE_CURRENT_BINARY_DIR}/TM"
+    DEPENDS "${TMCE}/upstream.txt" "${TMCE_TOOLS}/prepare_src.py" "${TMCE_TOOLS}/tmce_upstream.py"
+    COMMENT "Training Mode CE: the TM/ data files from upstream"
+    VERBATIM)
+  add_custom_target(tmce_dats DEPENDS ${TMCE_DAT_OUTPUTS})
+  # The same check as a test, against whatever TMCE_UPSTREAM_DIR now holds.
+  add_test(NAME tmce_upstream_pin COMMAND ${TMCE_PREPARE} --verify)
+endif()
+set(TMCE_OBJECTS)
+function(tmce_module name exports)
+  cmake_parse_arguments(M "" "" "SOURCES;KEEP" ${ARGN})
+  add_library(tmce_${name}_objs OBJECT ${M_SOURCES})
+  target_compile_definitions(tmce_${name}_objs PRIVATE MU_NATIVE)
+  target_include_directories(tmce_${name}_objs PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")  # mu_gxpipe.h
+  target_compile_options(tmce_${name}_objs PRIVATE ${TMCE_FLAGS})
+  set_target_properties(tmce_${name}_objs PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+  set(keep)
+  foreach(k ${M_KEEP})
+    list(APPEND keep --keep "${k}")
+  endforeach()
+  set(out "${CMAKE_CURRENT_BINARY_DIR}/tmce_${name}.o")
+  add_custom_command(OUTPUT "${out}"
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/tmce/link_module.py"
+            --ld "${CMAKE_LINKER}" --nm "${CMAKE_NM}" --objcopy "${CMAKE_OBJCOPY}" --name ${name} --exports "${exports}"
+            ${keep} --redefine "${TMCE}/MexTK/mextk_redefine.txt" --out "${out}" $<TARGET_OBJECTS:tmce_${name}_objs>
+    DEPENDS tmce_${name}_objs $<TARGET_OBJECTS:tmce_${name}_objs> "${TMCE}/MexTK/mextk_redefine.txt"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/tmce/link_module.py"
+    COMMAND_EXPAND_LISTS VERBATIM)
+  set(TMCE_OBJECTS ${TMCE_OBJECTS} "${out}" PARENT_SCOPE)
+endfunction()
+# m-ex's C library and argument-order wrappers, for all code built against the MexTK headers.
+tmce_module(mexrt - SOURCES "${TMCE}/mex/mex_runtime.c" KEEP "mex_*")
+if(MU_TMCE)
+  # The runtime: the loader and the native parts written against TM-CE's own types (the original
+  # UnclePunch events in C, the on-screen displays).
+  file(GLOB TMCE_NATIVE_SOURCES CONFIGURE_DEPENDS "${TMCE}/native/*.c")
+  tmce_module(runtime - SOURCES ${TMCE_NATIVE_SOURCES} KEEP "mu_tmce_*" "MEX_*")
+  tmce_module(eventMenu "${TMCE}/MexTK/tmFunction.txt" SOURCES
+    "${TMCE_SRC}/events.c" "${TMCE_SRC}/menu.c" "${TMCE_SRC}/osds.c" "${TMCE_SRC}/savestate_v1.c")
+  tmce_module(labCSS "${TMCE}/MexTK/cssFunction.txt" SOURCES "${TMCE_SRC}/lab_css.c")
+  set(TMCE_EVENTS lab lcancel ledgedash wavedash powershield dthrowknee edgeguard fc sweetspot laserland eggs techchase slalom)
+  foreach(ev ${TMCE_EVENTS})
+    tmce_module(${ev} "${TMCE}/MexTK/evFunction.txt" SOURCES "${TMCE_SRC}/${ev}.c")
+  endforeach()
+  foreach(m runtime eventMenu labCSS ${TMCE_EVENTS})
+    add_dependencies(tmce_${m}_objs tmce_src)
+    # Upstream's files include "../MexTK/mex.h" (a sibling folder there): found from tmce/MexTK.
+    # The runtime includes "../src/events.h": found from the build tree's tmce/src. (tmce/native's
+    # headers stay as they are: they are part of the fighter plugins' layout id, mexft_abi.py.)
+    # The files' names in the code are the ones they had when they were kept in tmce/src.
+    target_compile_options(tmce_${m}_objs PRIVATE "-iquote${TMCE}/MexTK" "-iquote${TMCE_SRC}"
+      "-ffile-prefix-map=${TMCE_SRC}=./sourceport/game/tmce/src")
+  endforeach()
+endif()
+# The m-ex fighters prepared from their MexTK C (mexft/, above with the registry): the fighter's
+# own code and each of its articles, a module each.
+foreach(mexft_entry ${MEXFT_MODULES})
+  get_filename_component(mexft_module "${mexft_entry}" NAME)
+  set(mexft_dir "${CMAKE_CURRENT_BINARY_DIR}/mexft/${mexft_entry}")
+  file(GLOB mexft_prepared "${mexft_dir}/src/*.c")
+  tmce_module(${mexft_module} "${mexft_dir}/exports.txt" SOURCES ${mexft_prepared})
+  # Callback slots whose MexTK type changed between m-ex versions (an IASA kept as int or void):
+  # the same function pointer either way, so GCC 14's error is only a warning here.
+  target_compile_options(tmce_${mexft_module}_objs PRIVATE -Wno-error=incompatible-pointer-types)
+  target_include_directories(tmce_${mexft_module}_objs PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/mexft/overlay")
+  get_filename_component(mexft_fighter "${mexft_entry}" DIRECTORY)
+  if(mexft_fighter IN_LIST MEXFT_PLUGIN_NAMES)
+    list(REMOVE_ITEM TMCE_OBJECTS "${CMAKE_CURRENT_BINARY_DIR}/tmce_${mexft_module}.o")
+    list(APPEND MEXFT_PLUGIN_MODULES_${mexft_fighter} "${CMAKE_CURRENT_BINARY_DIR}/tmce_${mexft_module}.o")
+  endif()
+endforeach()
+set_source_files_properties(${TMCE_OBJECTS} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+
+add_library(melee_game SHARED ${GAME_SOURCES} ${LIBC_SOURCES} ${SDK_SOURCES} ${SHIM_SOURCES} $<TARGET_OBJECTS:sdk_math>
+  ${TMCE_OBJECTS})
+set_target_properties(melee_game PROPERTIES PREFIX "" C_STANDARD 11 C_EXTENSIONS ON EXCLUDE_FROM_ALL ON)
+target_link_libraries(melee_game PRIVATE game_flags)
+if(NOT MU_TMCE)
+  # Fighter plugins call the C library's sqrtf by name (MexTK's math.h); without TM-CE's modules
+  # nothing else in the library brings it in, and a plugin that needs it would be refused.
+  target_link_options(melee_game PRIVATE -Wl,--undefined=sqrtf)
+else()
+  add_dependencies(melee_game tmce_dats)   # the game and its TM/ data files, built together
+endif()
+
+# Right after MEM1 (see port/app/source_host.cpp): the image's statics then have physical addresses
+# GX can hold. The debug information goes to melee_game.dbg so the loaded image stays small enough
+# to fit below 64 MB physical; addr2line reads the .dbg.
+target_link_options(melee_game PRIVATE ${LOW_IMAGE_LINK_OPTIONS}
+  "-Wl,-Map,${CMAKE_CURRENT_BINARY_DIR}/melee_game.map")
+if(WIN32)
+  # The build id names this exact image: a fighter plugin is linked against its addresses.
+  target_link_options(melee_game PRIVATE -Wl,--image-base,0x82800000 -Wl,--build-id)
+else()
+  target_link_libraries(melee_game PRIVATE m)
+  set(MU_ELF_LAYOUT "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/game-linux-layout.ld")
+  target_link_options(melee_game PRIVATE -Wl,-Ttext-segment=0x82800000 "-Wl,-T,${MU_ELF_LAYOUT}")
+  set_property(TARGET melee_game APPEND PROPERTY LINK_DEPENDS "${MU_ELF_LAYOUT}")
+  add_test(NAME native_elf_game_load COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_elf_load.py" $<TARGET_FILE:melee_game>)
+endif()
+add_custom_command(TARGET melee_game POST_BUILD
+  COMMAND "${CMAKE_OBJCOPY}" --only-keep-debug $<TARGET_FILE:melee_game> $<TARGET_FILE_DIR:melee_game>/melee_game.dbg
+  COMMAND "${CMAKE_OBJCOPY}" --strip-debug --add-gnu-debuglink=$<TARGET_FILE_DIR:melee_game>/melee_game.dbg $<TARGET_FILE:melee_game>
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../tools/check_game_image.py"
+          $<TARGET_FILE:melee_game> --base 0x82800000
+  # The sound driver's whole state, left out of rollback snapshots as a console savestate does.
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/snapshot_audio_ranges.py"
+          "${CMAKE_CURRENT_BINARY_DIR}/melee_game.map" 82800000 $<TARGET_FILE_DIR:melee_game>/melee_game.snapexcl
+          $<TARGET_FILE:melee_game>
+  VERBATIM)
+
+# ---- fighter plugins ----
+# What the game reads to link a fighter plugin (mexft/mexft_plugins.c): its own symbols by name,
+# beside the library and of the same build.
+if(WIN32)
+  add_custom_command(TARGET melee_game POST_BUILD
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_syms.py"
+            --nm "${CMAKE_NM}" --library $<TARGET_FILE:melee_game>
+            --out $<TARGET_FILE_DIR:melee_game>/melee_game.syms $<TARGET_FILE_DIR:melee_game>/melee_game.dbg
+    VERBATIM)
+endif()
+# Each MEXFT_PLUGINS fighter as fighters/<name>.mufighter beside the library: its modules and its
+# descriptor as one relocatable object (tools/mexft/mexft_plugin.py). It depends on the layouts
+# it was compiled with (mexft_abi.h), not on a build of the library.
+if(WIN32 AND MEXFT_PLUGIN_NAMES)
+  set(MEXFT_PLUGIN_FILES)
+  foreach(mexft_name ${MEXFT_PLUGIN_NAMES})
+    add_library(mexft_desc_${mexft_name} OBJECT "${CMAKE_CURRENT_BINARY_DIR}/mexft/${mexft_name}/mexft_${mexft_name}.c")
+    target_link_libraries(mexft_desc_${mexft_name} PRIVATE game_flags)
+    set_target_properties(mexft_desc_${mexft_name} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+    set(mexft_plugin_file "${CMAKE_CURRENT_BINARY_DIR}/fighters/${mexft_name}.mufighter")
+    add_custom_command(OUTPUT "${mexft_plugin_file}"
+      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_plugin.py"
+              --gcc "${CMAKE_C_COMPILER}" --ld "${CMAKE_LINKER}" --objcopy "${CMAKE_OBJCOPY}" --nm "${CMAKE_NM}"
+              --header-dir "${CMAKE_CURRENT_SOURCE_DIR}/mexft" --abi-dir "${CMAKE_CURRENT_BINARY_DIR}/mexft/abi"
+              --name ${mexft_name} --fighter "mu_ak_mexft_${mexft_name}=${MEXFT_PLUGIN_MEX_NAME_${mexft_name}}"
+              --out "${mexft_plugin_file}" ${MEXFT_PLUGIN_MODULES_${mexft_name}} $<TARGET_OBJECTS:mexft_desc_${mexft_name}>
+      DEPENDS ${MEXFT_PLUGIN_MODULES_${mexft_name}} $<TARGET_OBJECTS:mexft_desc_${mexft_name}>
+              "${CMAKE_CURRENT_SOURCE_DIR}/../../tools/mexft/mexft_plugin.py" "${CMAKE_CURRENT_SOURCE_DIR}/mexft/mexft_plugin.h"
+              "${CMAKE_CURRENT_BINARY_DIR}/mexft/abi/mexft_abi.h"
+      COMMAND_EXPAND_LISTS VERBATIM)
+    list(APPEND MEXFT_PLUGIN_FILES "${mexft_plugin_file}")
+  endforeach()
+  add_custom_target(mexft_plugins DEPENDS ${MEXFT_PLUGIN_FILES})
+endif()
+
+# Record the actual configured game inputs for the source-only package audit.
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/native-game-sources.txt"
+  CONTENT "$<JOIN:$<TARGET_PROPERTY:melee_game,SOURCES>,\n>\n$<JOIN:$<TARGET_PROPERTY:sdk_math,SOURCES>,\n>\n")
+
+# Extract the actual Training exit routine, so an absent CPU exercises the same code that ships.
+set(MU_TRAINING_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/training_select_body.h")
+add_custom_command(OUTPUT "${MU_TRAINING_FIXTURE}"
+  COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/native_major_fixture.py"
+          "${D}/src/melee/gm/gmtrainingmode.c" "${MU_TRAINING_FIXTURE}" --function gm_801B1C24
+  DEPENDS "${D}/src/melee/gm/gmtrainingmode.c" "${REPO}/tools/native_major_fixture.py" VERBATIM)
+add_executable(mu_training_select_test EXCLUDE_FROM_ALL tests/training_select.c "${MU_TRAINING_FIXTURE}")
+target_include_directories(mu_training_select_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_options(mu_training_select_test PRIVATE -UNDEBUG)
+add_test(NAME native_training_select COMMAND mu_training_select_test)
+
+set(MU_FIGHTER_SCREEN_FIXTURE "${CMAKE_CURRENT_BINARY_DIR}/fighter_screen_position_body.h")
+add_custom_command(OUTPUT "${MU_FIGHTER_SCREEN_FIXTURE}"
+  COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/native_major_fixture.py"
+          "${D}/src/melee/if/ifnametag.c" "${MU_FIGHTER_SCREEN_FIXTURE}" --function mu_fighter_screen_position
+  DEPENDS "${D}/src/melee/if/ifnametag.c" "${REPO}/tools/native_major_fixture.py" VERBATIM)
+add_executable(mu_fighter_screen_position_test EXCLUDE_FROM_ALL tests/fighter_screen_position.c "${MU_FIGHTER_SCREEN_FIXTURE}")
+target_include_directories(mu_fighter_screen_position_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_options(mu_fighter_screen_position_test PRIVATE -UNDEBUG)
+add_test(NAME native_fighter_screen_position COMMAND mu_fighter_screen_position_test)
+
+set(MU_SIS_STACK_FIXTURES)
+foreach(MU_SIS_STACK_FUNCTION HSD_SisLib_803A7684 HSD_SisLib_803A7F0C sisRejectInvalidCursor)
+  set(MU_SIS_STACK_BODY "${CMAKE_CURRENT_BINARY_DIR}/${MU_SIS_STACK_FUNCTION}_body.h")
+  add_custom_command(OUTPUT "${MU_SIS_STACK_BODY}"
+    COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/native_major_fixture.py"
+            "${D}/src/sysdolphin/baselib/hsd_3A76.c" "${MU_SIS_STACK_BODY}" --function "${MU_SIS_STACK_FUNCTION}"
+    DEPENDS "${D}/src/sysdolphin/baselib/hsd_3A76.c" "${REPO}/tools/native_major_fixture.py" VERBATIM)
+  list(APPEND MU_SIS_STACK_FIXTURES "${MU_SIS_STACK_BODY}")
+endforeach()
+add_executable(mu_sis_state_stack_test EXCLUDE_FROM_ALL tests/sis_state_stack.c ${MU_SIS_STACK_FIXTURES})
+target_include_directories(mu_sis_state_stack_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_compile_options(mu_sis_state_stack_test PRIVATE -UNDEBUG)
+add_test(NAME native_sis_state_stack COMMAND mu_sis_state_stack_test)
+
+function(mu_boundary_fixture name source)
+  set(bodies)
+  foreach(fn IN LISTS ARGN)
+    set(body "${CMAKE_CURRENT_BINARY_DIR}/${fn}_body.h")
+    add_custom_command(OUTPUT "${body}"
+      COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/native_major_fixture.py" "${source}" "${body}" --function "${fn}"
+      DEPENDS "${source}" "${REPO}/tools/native_major_fixture.py" VERBATIM)
+    list(APPEND bodies "${body}")
+  endforeach()
+  add_executable(mu_${name}_test EXCLUDE_FROM_ALL tests/${name}.c ${bodies})
+  target_include_directories(mu_${name}_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+  target_compile_options(mu_${name}_test PRIVATE -UNDEBUG)
+  add_test(NAME native_${name} COMMAND mu_${name}_test)
+endfunction()
+mu_boundary_fixture(hud_nana "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_hud_scale.c" mu_live_fighter mu_nana_damage)
+mu_boundary_fixture(practice_destination "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_practice.c"
+  mu_practice_resolve_pending_mode mu_practice_enter_mode)
+mu_boundary_fixture(boot_match_destination "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_boot_match.c" mu_boot_match_resolve)
+mu_boundary_fixture(skin_cycle_bridge "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_content.c" mu_skin_cycle)
+mu_boundary_fixture(costume_parts "${D}/src/melee/ft/ftparts.c" ftParts_80074D7C ftParts_80074CA0)
+mu_boundary_fixture(stage_item_link "${D}/src/melee/it/kinds/itwhitebea.c" mu_whitebea_block_alive mu_whitebea_validate_block)
+mu_boundary_fixture(envelope_ready "${D}/src/sysdolphin/baselib/pobj.c" PObjNativeEnvelopeReady)
+mu_boundary_fixture(fod_scenery "${D}/src/melee/gr/grizumi.c"
+  mu_fod_joint_uses_image mu_fod_scenery_plan mu_fod_draw_scenery mu_fod_render_reflection_scene)
+# The Mods menu's release switches: an off category's row unavailable, reading "Coming soon."
+mu_boundary_fixture(mods_release "${CMAKE_CURRENT_SOURCE_DIR}/shim/mu_mods_menu.c"
+  category_on row_category mu_mods_menu_rows mu_mods_menu_available mu_mods_menu_describe)
+
+# The checks the game runs on a stage's collision and a particle bank pair from a mod file, built
+# from the production functions with the game's own types (big-endian disc structs, 32-bit disc
+# pointers: the fixtures' data lies in the low image).
+function(mu_data_check_fixture name source)
+  mu_boundary_fixture(${name} "${source}" ${ARGN})
+  set_target_properties(mu_${name}_test PROPERTIES C_STANDARD 11 C_EXTENSIONS ON)
+  target_link_libraries(mu_${name}_test PRIVATE game_flags)
+  target_link_options(mu_${name}_test PRIVATE ${LOW_TEST_LINK_OPTIONS})
+endfunction()
+mu_data_check_fixture(stage_collision_check "${D}/src/melee/mp/mplib.c" mpRangeOk mpCollDataCheck)
+mu_data_check_fixture(particle_bank_check "${D}/src/sysdolphin/baselib/particle.c"
+  ps_word ps_room ps_offset ps_banks_check)
+
+add_test(NAME native_collision_geometry
+  COMMAND "${Python3_EXECUTABLE}" "${REPO}/tools/check_collision_geometry.py" "${D}/src/melee/lb/lbcollision.c")
+
+# Build every registered executable fixture, including normally excluded targets, before CTest.
+get_property(MU_GAME_DIRECTORY_TARGETS DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+set(MU_GAME_TEST_TARGETS)
+foreach(mu_target IN LISTS MU_GAME_DIRECTORY_TARGETS)
+  get_target_property(mu_target_type "${mu_target}" TYPE)
+  if(mu_target_type STREQUAL "EXECUTABLE" AND mu_target MATCHES "^mu_.*_test$")
+    list(APPEND MU_GAME_TEST_TARGETS "${mu_target}")
+  endif()
+endforeach()
+add_custom_target(mu_game_tests DEPENDS melee_game ${MU_GAME_TEST_TARGETS})

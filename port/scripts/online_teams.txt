@@ -1,0 +1,55 @@
+# Online Play (opens on Ranked) -> Teams (three rows down) -> the Teams submenu (Lobbies, Create, Enter code)
+# -> Enter code (two rows down) -> Teams select, staying on the red team. From the select's first frame
+# (@scene 8:0): pick a character (Mario) -> Start opens connect-code entry -> Z accepts the suggested code
+# (the user folder needs teams-codes.json, tools/online_quad.py writes one) -> Start jumps to OK -> A
+# confirms (search). The submenu is there while doubles lobbies are on (the default; not in a Vanilla run).
+# The @match section is online_bot.txt's: a character that dashes, hops, attacks and shields.
+280 DD
+286
+300 DD
+306
+320 DD
+326
+350 A
+356
+480 DD
+486
+520 DD
+526
+560 A
+566
+@scene 8:0
+0
+440 sx=61 sy=127
+457
+480 A
+490
+540 START
+550
+640 Z
+646
+680 START
+686
+720 A
+726
+@match
+@loop 360
+0
+60 sx=80
+90 sx=80 A
+96
+120 sx=-80
+150 sx=-80 A
+156
+180 X
+183
+190 sx=0 A
+200
+220 sy=-80 A
+230
+250 L
+280
+300 sx=80 Y
+303 sx=80
+320 sx=80 B
+330

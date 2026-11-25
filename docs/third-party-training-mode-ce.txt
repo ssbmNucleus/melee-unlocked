@@ -1,0 +1,15 @@
+Training Mode - Community Edition
+
+Nucleus runs Training Mode CE natively, as part of the game: on the 1-P menu, the Event Match row
+reads "Training Mode" and opens Training Mode CE's event menu (the Training Lab and the drills).
+Its C source is compiled into melee_game.dll, and the game-side changes its PowerPC patches make
+are written as C at the same points in the game's source. Its data files (the TM folder beside
+the game: eventMenu.dat, lab.dat, labCSS.dat and wavedash.dat) are upstream's own dats/ files,
+unchanged, taken by the game's build from the same commit and checked against the hash recorded
+in sourceport/game/tmce/upstream.txt.
+
+Training Mode CE by Aitch (Alexander Harrison) and contributors: an expanded and updated version
+of UnclePunch's training modpack for Super Smash Bros. Melee.
+https://github.com/AlexanderHarrison/TrainingMode-CommunityEdition
+Commit dda765bc5770c88e482c463e42da8f11cdb830a8. The repository declares no license at that commit
+(no LICENSE file, no license statement in its README).

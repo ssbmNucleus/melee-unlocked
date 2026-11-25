@@ -1,0 +1,522 @@
+/* Slippi online menus: VS splash, in-game name tags and the online results screen, native.
+ * Covers GALE01r2.ini codes InitVsSplash (4913) + CheckAltStageName (5658) + FG_CreateSubtext
+ * (5844, plain mode), PlayOpponentCharAnnouncer (5033), HideAllJObjs (5055), HideLetterJObjs
+ * (5076), SkipStageNumberShow (5093), InitInGame (4039), ParseNumbersBetter (4230, removed in
+ * Slippi 3.7.0), ControlAllPanels (4231), GrayPanelsForRemotePlayers (4245). Every entry point is inert unless
+ * the menus flag is on and the matching online scene is current. Console struct offsets from the
+ * asm are translated to decomp field names; MSRB game info stays console layout (raw bytes). */
+#include <string.h>
+#include <stdio.h>
+#include <melee/gm/gm_1601.h>
+#include <melee/gm/gmmain_lib.h>
+#include <melee/gm/types.h>
+#include <melee/if/ifall.h>
+#include <melee/lb/lbarchive.h>
+#include <melee/lb/lbspdisplay.h>
+#include <melee/pl/player.h>
+#include <melee/sc/types.h>
+#include <sysdolphin/baselib/cobj.h>
+#include <sysdolphin/baselib/controller.h>
+#include <sysdolphin/baselib/dobj.h>
+#include <sysdolphin/baselib/gobj.h>
+#include <sysdolphin/baselib/gobjgxlink.h>
+#include <sysdolphin/baselib/gobjobject.h>
+#include <sysdolphin/baselib/jobj.h>
+#include <sysdolphin/baselib/mobj.h>
+#include <sysdolphin/baselib/sislib.h>
+#include <sysdolphin/baselib/sislib_font.h>
+#include <mu_native.h>
+#include <mu_ranked.h>
+#if MU_SQUAD
+#include "mu_squad.h"
+#endif
+
+/* MSRB game info (console StartMeleeData): rules 0x60 bytes, then 0x24 per player. */
+#define GI_IS_TEAMS 0x8
+#define GI_STAGE 0xE
+#define GI_PLAYER(i) (0x60 + (i) * 0x24)
+#define GP_CKIND 0x0
+#define GP_SLOT_TYPE 0x1
+#define GP_TEAM 0x9
+
+static const MuMatchState* load_ms(void)
+{
+    mu_slippi_load_match_state(NULL);
+    return mu_slippi_match_state();
+}
+
+static int gi_u8(const MuMatchState* ms, int off)
+{
+    return ms->game_info[off];
+}
+
+/* ---------------------------------------------------------------- VS splash (8:4) */
+
+int mu_slippi_splash_active(void)
+{
+    return mu_slippi_menus_enabled() && mu_slippi_on_online_splash();
+}
+
+/* FG_CreateSubtext, plain mode: init, size, colour, then the formatted contents. */
+static int create_subtext(HSD_Text* t, const GXColor* color, float scale, float x, float y,
+                          const char* fmt, const char* arg)
+{
+    int idx = HSD_SisLib_803A6B98(t, x, y, fmt, arg);
+    HSD_SisLib_803A7548(t, idx, scale, scale);
+    HSD_SisLib_803A74F0(t, idx, (GXColor*) color);
+    HSD_SisLib_803A70A0(t, idx, (char*) fmt, arg);
+    return idx;
+}
+
+/* Stage-name SIS ids by stage-select id (mnstagesw.c mnStageSw_stageIcons, static there;
+ * the asm reads it at mnStageSw_803ED488 + 0x5C). */
+static const u8 stage_name_ids[0x1D] = {
+    0x08, 0x09, 0x11, 0x0A, 0x0C, 0x06, 0x0B, 0x07, 0x0E, 0x0D,
+    0x1D, 0x17, 0x0F, 0x10, 0x12, 0x13, 0x14, 0x15, 0x1A, 0x1B,
+    0x1C, 0x16, 0x18, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24,
+};
+
+static const GXColor splash_colors[5] = {
+    { 0xE5, 0x4C, 0x4C, 0xFF }, /* red */
+    { 0x4B, 0x4C, 0xE5, 0xFF }, /* blue */
+    { 0xFF, 0xCB, 0x00, 0xFF }, /* yellow */
+    { 0x00, 0xB2, 0x00, 0xFF }, /* green */
+    { 0xFF, 0xFF, 0xFF, 0xFF }, /* white */
+};
+static const char* const team_labels[3] = { "RT", "BT", "GT" };
+static const char* const port_labels[4] = { "P1", "P2", "P3", "P4" };
+
+static void splash_player(HSD_Text* t, const MuMatchState* ms, int p, float x, float y)
+{
+    const float size = 0.5f;
+    if (gi_u8(ms, GI_IS_TEAMS) == 0) {
+        create_subtext(t, &splash_colors[p & 3], size, x, y, "%s", port_labels[p & 3]);
+    } else {
+        int team = gi_u8(ms, GI_PLAYER(p) + GP_TEAM);
+        int col = team >= 2 ? team + 1 : team; /* team 2 is green: skip yellow */
+        if (col > 4) {
+            col = 4;
+        }
+        create_subtext(t, &splash_colors[col], size, x, y, "%s",
+                       team < 3 ? team_labels[team] : "");
+    }
+    create_subtext(t, &splash_colors[4], size, x + 36.0f, y, "%s", ms->names[p]);
+}
+
+/* InitVsSplash: gm_Scene_IntroEasy_OnEnter, right after fn_80186634. */
+void mu_slippi_splash_text(void)
+{
+    const MuMatchState* ms;
+    HSD_Text* t;
+    int local, local_team, left = 0, right = 0, p, stage, sel;
+
+    if (!mu_slippi_splash_active()) {
+        return;
+    }
+
+    HSD_SisLib_803A62A0(0, "SdSlChr.usd", "SIS_SelCharData");
+    ms = load_ms();
+
+    t = HSD_SisLib_803A6754(0, 0);
+    t->default_kerning = 1;
+    t->default_alignment = 0;
+    t->pos_z = 0.0f;
+    t->font_size.x = 1.0f;
+    t->font_size.y = 1.0f;
+
+    local = ms->local_index & 3;
+    local_team = gi_u8(ms, GI_PLAYER(local) + GP_TEAM);
+    for (p = 3; p >= 0; p--) {
+        int go_left, count;
+        float base, fc;
+        if (gi_u8(ms, GI_PLAYER(p) + GP_SLOT_TYPE) >= 3) {
+            continue;
+        }
+        if (p == local) {
+            go_left = 1;
+        } else if (gi_u8(ms, GI_IS_TEAMS) == 0) {
+            go_left = 0;
+        } else {
+            go_left = gi_u8(ms, GI_PLAYER(p) + GP_TEAM) == local_team;
+        }
+        if (go_left) {
+            count = left++;
+            base = 60.0f;
+        } else {
+            count = right++;
+            base = 420.0f;
+        }
+        fc = (float) count;
+        splash_player(t, ms, p, base + fc * -22.0f, 80.0f + fc * -22.0f);
+    }
+
+    if (mu_slippi_state()->mode == MU_SLP_MODE_RANKED) {
+        char score[64];
+        const MuRankedSet* set = mu_ranked_set();
+        /* The set's score is by port; the local player is always drawn on the left, so the local
+         * count comes first (build 25 read "0:1" under Ada | Bo after Ada won game 1). The line
+         * sits in the black band above the names, clear of the character art. The splash follows
+         * the setup screen, so there is no "what comes next" line: the game starts. */
+        const unsigned me = local == 1;
+        if (set->cur_game && set->max_games) {
+            sprintf(score, "Game %u - %u:%u", (unsigned) set->cur_game,
+                    (unsigned) set->score[me], (unsigned) set->score[!me]);
+            create_subtext(t, &splash_colors[4], 0.5f, 250.0f, 45.0f, "%s", score);
+        }
+    }
+
+#if MU_SQUAD
+    /* Based on Squad Strike by Chris (x9x9x9x9x9), https://github.com/x9x9x9x9x9/squad-strike v1.0.0, used with the author's permission (11-03-2026)
+     * The squads were trimmed to fit memory: both players see it here, before the first frame,
+     * centred in the black band above the names, split after the colon. */
+    if (gmSquad_OnlineReady() && gmSquad_OnlineTrimNotice()[0]) {
+        char first[80];
+        const char* notice = gmSquad_OnlineTrimNotice();
+        const char* rest = strchr(notice, ':');
+        size_t n = rest ? (size_t) (rest - notice + 1) : strlen(notice);
+        if (n >= sizeof first) n = sizeof first - 1;
+        memcpy(first, notice, n);
+        first[n] = 0;
+        t = HSD_SisLib_803A6754(0, 0);
+        t->default_kerning = 1;
+        t->default_alignment = 1; /* centred on x */
+        t->pos_z = 0.0f;
+        t->font_size.x = 1.0f;
+        t->font_size.y = 1.0f;
+        create_subtext(t, &splash_colors[2], 0.45f, 320.0f, 28.0f, "%s", first);
+        if (rest) {
+            while (*++rest == ' ') {}
+            create_subtext(t, &splash_colors[2], 0.45f, 320.0f, 50.0f, "%s", rest);
+        }
+    }
+#endif
+
+    /* Stage name */
+    t = HSD_SisLib_803A6754(0, 0);
+    t->pos_x = 238.0f;
+    t->pos_y = 440.0f;
+    t->box_size_x = 160.0f;
+    t->box_size_y = 300.0f;
+    t->font_size.x = 1.0f;
+    t->font_size.y = 1.0f;
+    t->default_alignment = 1;
+    t->default_kerning = 1;
+    t->pos_z = 0.0f;
+    stage = (ms->game_info[GI_STAGE] << 8) | ms->game_info[GI_STAGE + 1];
+    if (stage == 3 && ms->alt_stage_mode != 0) { /* CheckAltStageName */
+        HSD_SisLib_803A6368(t, 89);              /* Frozen Pokemon Stadium */
+        return;
+    }
+    for (sel = 0; sel < 0x1D; sel++) {
+        if ((int) gm_801641CC((u8) sel) == stage) {
+            break;
+        }
+    }
+    if (sel >= 0x1D) {
+        sel = 0;
+    }
+    HSD_SisLib_803A6368(t, stage_name_ids[sel]);
+}
+
+/* PlayOpponentCharAnnouncer: the announcer names the remote player's character. */
+unsigned int mu_slippi_splash_announce_char(unsigned int vanilla)
+{
+    const MuMatchState* ms;
+    if (!mu_slippi_splash_active()) {
+        return vanilla;
+    }
+    ms = load_ms();
+    return (unsigned int) gi_u8(ms, GI_PLAYER(ms->remote_index & 3) + GP_CKIND);
+}
+
+/* HideLetterJObjs: after HSD_JObjAnimAll in fn_80184AB8, strip the anims of children 9-13. */
+void mu_slippi_splash_hide_letters(HSD_JObj* jobj)
+{
+    int i;
+    if (!mu_slippi_splash_active()) {
+        return;
+    }
+    for (i = 9; i < 14; i++) {
+        HSD_JObj* child = NULL;
+        lb_80011E24(jobj, &child, i, -1);
+        if (child != NULL) {
+            HSD_JObjRemoveAnimAll(child);
+        }
+    }
+}
+
+/* SkipStageNumberShow (global in Slippi, gated to the online splash here). */
+int mu_slippi_splash_skip_stage_number(void)
+{
+    return mu_slippi_splash_active();
+}
+
+/* HideAllJObjs: fn_8018504C hides the 27 stage-preview joints and returns early. */
+int mu_slippi_splash_hide_stage(HSD_JObj* jobj)
+{
+    int i;
+    if (!mu_slippi_splash_active() || jobj == NULL) {
+        return 0;
+    }
+    for (i = 0; i < 27; i++) {
+        HSD_JObj* child = NULL;
+        lb_80011E24(jobj, &child, i, -1);
+        if (child != NULL) {
+            child->flags |= JOBJ_HIDDEN;
+        }
+    }
+    return 1;
+}
+
+/* ---------------------------------------------------------------- in game (8:2) */
+
+static int hud_canvas = -1;
+static HSD_Text* hud_text;
+
+HSD_Text* mu_slippi_hud_text(void)
+{
+    return hud_text;
+}
+
+int mu_slippi_hud_canvas(void)
+{
+    return hud_canvas;
+}
+
+static void hud_cobj_cb(HSD_GObj* gobj, intptr_t pass)
+{
+    /* The asm also skips drawing while the name-tag pause flag (ifnametag.c un_804D6D6C, static)
+     * is set; online matches do not pause, so it is not mirrored. */
+    HSD_GObj_803910D8(gobj, pass);
+}
+
+/* The name under a damage percent and the dark plate behind it.
+ *
+ * The plate is as wide as the name is drawn, plus the same margin on both sides at every length.
+ * name_units() measures the encoded name the way the game lays it out (HSD_SisLib_803A8134: a
+ * glyph advances 32 less its two side bearings, a space 16), in glyph units before any scale. The
+ * name is drawn at NAME_SCALE and squeezed to NAME_BOX when it is wider (default_fitting), so a
+ * name of fifteen wide letters stays inside its own slot and so does its plate: in a four-player
+ * match the slots are 14 world units apart and the widest plate is NAME_BOX * NAME_FONT +
+ * 2 * PLATE_MARGIN, 9.8 (a world unit is 16 pixels of a 960 wide picture). (Slippi's own count, 20 less the left bearing per glyph from one
+ * byte past the first, came out at its floor of 60 for every name here: a short name sat on the
+ * plate and a long one ran off both ends.) */
+#define NAME_FONT 0.06f       /* the text's font size: world units per glyph unit */
+#define NAME_SCALE 0.54f      /* the name's own scale */
+#define NAME_BOX 150.0f       /* the widest a name is drawn, in scaled glyph units */
+#define PLATE_MARGIN 0.40f    /* world units of plate left and right of the name */
+#define PLATE_WORLD 5.55f     /* the plate model's width at scale 1, in world units (measured) */
+
+static float name_units(HSD_Text* t)
+{
+    s32 size = 0;
+    float width = 0.0f;
+    const TextGlyphMetrics* ext = NULL;
+    const u8* cur = fn_803A6FEC(t->sis_buffer, 0, &size);
+    int guard;
+    if (cur == NULL) {
+        return 0.0f;
+    }
+    cur += 14; /* the subtext's header: 07 x x y y, 0C r g b, 0E scale x, scale y */
+    if (HSD_SisLib_804D1124[t->font_idx] != NULL) {
+        ext = (const TextGlyphMetrics*) DP(HSD_SisLib_804D1124[t->font_idx][1]);
+    }
+    for (guard = 0; guard < 256; guard++) {
+        const u8 op = cur[0];
+        if (op >= 0x20) {
+            const unsigned code = ((unsigned) cur[0] << 8) | cur[1];
+            int left = 0, right = 0;
+            if (code < 0x4000) {
+                if (code - 0x2000 < 288) {
+                    left = HSD_SisLib_8040CB00[code - 0x2000].left;
+                    right = HSD_SisLib_8040CB00[code - 0x2000].right;
+                }
+            } else if (ext != NULL) {
+                left = ext[code - 0x4000].left;
+                right = ext[code - 0x4000].right;
+            }
+            width += 32.0f - (float) (left + right - 2);
+            cur += 2;
+        } else if (op == 0x1A) {
+            width += 16.0f;
+            cur += 1;
+        } else if (op == 0x00 || op == 0x0D || op == 0x0F) {
+            break;
+        } else if (op == 0x06 || op == 0x0A || op == 0x0E) {
+            cur += 5;
+        } else if (op == 0x0C) {
+            cur += 4;
+        } else if (op == 0x05) {
+            cur += 3;
+        } else {
+            cur += 1;
+        }
+    }
+    return width;
+}
+
+/* The plate's X scale for a name of that many glyph units; 0 for no name (no plate). */
+static float plate_scale(float units)
+{
+    float drawn = units * NAME_SCALE;
+    if (units <= 0.0f) {
+        return 0.0f;
+    }
+    if (drawn > NAME_BOX) {
+        drawn = NAME_BOX;
+    }
+    return (drawn * NAME_FONT + 2.0f * PLATE_MARGIN) / PLATE_WORLD;
+}
+
+/* InitInGame: end of ifStatus_802F665C. */
+void mu_slippi_ingame_hud_init(void)
+{
+    SceneDesc* sd = NULL;
+    HSD_CObj* cobj;
+    HSD_GObj* cam;
+    HSD_Text* t;
+    const MuMatchState* ms;
+    DISC_PTR(DynamicModelDesc)* tag_models = NULL;
+    HSD_Joint* tag_joint = NULL;
+    int i;
+
+    if (!(mu_slippi_menus_enabled() && mu_slippi_in_online_game())) {
+        return;
+    }
+
+    lbArchive_LoadSections(*ifAll_GetArchive(), (void**) &sd, "ScInfDmg_scene_data", NULL);
+    if (sd == NULL) {
+        return;
+    }
+    cobj = HSD_CObjLoadDesc(DP(DP(sd->cameras)[0].desc));
+    cam = GObj_Create(19, 20, 0);
+    HSD_GObjObject_80390A70(cam, HSD_GObj_CameraKind, cobj);
+    GObj_SetupGXLinkMax(cam, hud_cobj_cb, 8);
+    cam->gxlink_prios = 1ULL << 12;
+    hud_canvas = HSD_SisLib_803A611C(2, cam, 9, 13, 0, 12, 80, 8);
+
+    /* Text struct for the disconnect/desync messages (online core). */
+    t = HSD_SisLib_803A6754(2, hud_canvas);
+    t->default_kerning = 1;
+    t->default_alignment = 1;
+    t->pos_z = 0.0f;
+    t->font_size.x = 0.1f;
+    t->font_size.y = 0.1f;
+    hud_text = t;
+
+    ms = load_ms();
+
+    t = HSD_SisLib_803A6754(2, hud_canvas);
+    t->default_kerning = 1;
+    t->default_alignment = 2;
+    t->pos_z = 0.0f;
+    t->font_size.x = 0.1f;
+    t->font_size.y = 0.1f;
+    t->active_color.a = 0x80;
+    HSD_SisLib_803A6B98(t, 270.0f, 207.0f, "Delay: %df", (int) ms->delay_frames);
+    HSD_SisLib_803A7548(t, 0, 0.33f, 0.33f);
+
+    lbArchive_LoadSections(*ifAll_GetArchive(), (void**) &tag_models, "ScInfPnm_scene_models",
+                           NULL);
+    if (tag_models != NULL) {
+        tag_joint = DP(DP(tag_models[0])->joint);
+    }
+
+    for (i = 0; i < 6; i++) {
+        float hud_x, units;
+        HSD_GObj* bg_gobj;
+        HSD_JObj* bg;
+        HSD_JObj* child = NULL;
+        if (Player_GetPlayerSlotType(i) == Gm_PKind_NA) {
+            continue;
+        }
+        hud_x = ifAll_GetPlayerHUDPosition(i)->x;
+
+        t = HSD_SisLib_803A6754(2, hud_canvas);
+        t->default_fitting = 1;
+        t->default_alignment = 1;
+        t->x4C = 1;
+        t->default_kerning = 1;
+        t->font_size.x = 0.06f;
+        t->font_size.y = 0.06f;
+        t->pos_x = hud_x + 0.8f;
+        t->pos_y = 20.64f;
+        t->pos_z = 0.0f;
+        t->box_size_x = NAME_BOX;
+        t->box_size_y = 150.0f;
+        HSD_SisLib_803A6B98(t, 0.0f, 0.0f, "%s", i < 4 ? ms->names[i] : "");
+        HSD_SisLib_803A7548(t, 0, NAME_SCALE, NAME_SCALE);
+
+        units = name_units(t);
+        OSReport("[hud] name plate: port %d, name %.1f units, plate scale %.3f, hud x %.2f\n", i, units,
+                 plate_scale(units), hud_x);
+        if (tag_joint == NULL || units <= 0.0f) {
+            continue;   /* no name (an agent copy's own port): no plate either */
+        }
+        bg_gobj = GObj_Create(14, 15, 0);
+        bg = HSD_JObjLoadJoint(tag_joint);
+        HSD_GObjObject_80390A70(bg_gobj, HSD_GObj_JObjKind, bg);
+        GObj_SetupGXLink(bg_gobj, HSD_GObj_JObjCallback, 12, 0);
+        HSD_JObjSetTranslateX(bg, hud_x + 0.775f);
+        HSD_JObjSetTranslateY(bg, -24.06f);
+        HSD_JObjSetScaleY(bg, 0.62f);
+        lb_80011E24(bg, &child, 1, -1);
+        if (child != NULL && child->u.dobj != NULL) {
+            HSD_DObj* d = child->u.dobj;
+            HSD_JObjSetTranslateZ(child, 0.0f);
+            d->flags |= DOBJ_HIDDEN;
+            if (d->next != NULL) {
+                d = d->next;
+                d->flags |= DOBJ_HIDDEN;
+                if (d->next != NULL && d->next->mobj != NULL && d->next->mobj->mat != NULL) {
+                    HSD_Material* mat = d->next->mobj->mat;
+                    GXColor black = { 0, 0, 0, 255 };
+                    mat->alpha = 0.33f;
+                    mat->diffuse = black;
+                }
+            }
+        }
+        HSD_JObjSetScaleX(bg, plate_scale(units));
+    }
+}
+
+/* ParseNumbersBetter: Slippi 3.7.0 removed it to restore the vanilla monospaced numbers, so digits
+ * keep their kerning-start bytes everywhere again. The hook stays for the caller in hsd_3A64.c. */
+int mu_slippi_digits_no_kerning(void)
+{
+    return 0;
+}
+
+/* ---------------------------------------------------------------- results (8:3, Party) */
+
+static int results_active(void)
+{
+    return mu_slippi_menus_enabled() && mu_slippi_on_online_results();
+}
+
+/* ControlAllPanels: every port reads the 1P port's pad. */
+void mu_slippi_results_control_all_panels(void)
+{
+    int src, i;
+    if (!results_active()) {
+        return;
+    }
+    src = gmMainLib_804D3EE0->vs.unk_530.x6 & 3;
+    for (i = 0; i < 4; i++) {
+        if (i != src) {
+            HSD_PadCopyStatus[i] = HSD_PadCopyStatus[src];
+        }
+    }
+}
+
+/* GrayPanelsForRemotePlayers: remote panels take the CPU (grey) colour. */
+u8 mu_slippi_results_slot_type(int port, u8 slot_type)
+{
+    if (!results_active()) {
+        return slot_type;
+    }
+    if (port == mu_slippi_state()->game_local_index) {
+        return slot_type;
+    }
+    return 1;
+}

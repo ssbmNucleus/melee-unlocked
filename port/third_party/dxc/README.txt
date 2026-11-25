@@ -1,0 +1,15 @@
+DirectX Shader Compiler v1.9.2609 (https://github.com/microsoft/DirectXShaderCompiler), release dxc_2026_09_29.zip.
+
+bin/dxcompiler.dll   LICENSE-LLVM.txt
+bin/dxil.dll         LICENSE-MS.txt
+
+Unmodified. librashader (third_party/librashader) compiles shader presets with it on Direct3D 12.
+Both files sit beside the program; without them a chosen preset stays off on Direct3D 12.
+The two DLLs are not in the repository: tools/fetch_graphics_dlls.py extracts them (bin/x64) from
+that release and checks them by SHA-256.
+
+port/third_party/dxc/linux/libdxcompiler.so and include/dxc (dxcapi.h, WinAdapter.h, dxcerrors.h): the same
+release for Linux (linux_dxc_2026_09_28.x86_x64.tar.gz, unmodified). The Linux Vulkan renderer compiles its
+shaders with it (runtime/gx/gx_dxc_linux.cpp); the Linux package ships it in bin/.
+libdxcompiler.so is not in the repository: python3 tools/fetch_graphics_dlls.py --dxc-linux extracts it
+(lib/libdxcompiler.so) from that release and checks it by SHA-256.

@@ -1,0 +1,58 @@
+# Same as online_teams.txt, but on the Teams select it first cycles the team to blue: the hand starts on
+# the P1 HMN button, moves right onto the team button (9 frames), A toggles red -> blue, then it moves
+# back to where it started so the character pick below lands exactly as in the red script.
+280 DD
+286
+300 DD
+306
+320 DD
+326
+350 A
+356
+480 DD
+486
+520 DD
+526
+560 A
+566
+@scene 8:0
+0
+400 sx=80 sy=-8
+409
+412 A
+414
+416 sx=-80 sy=8
+425
+440 sx=61 sy=127
+457
+480 A
+490
+540 START
+550
+640 Z
+646
+680 START
+686
+720 A
+726
+@match
+@loop 360
+0
+60 sx=80
+90 sx=80 A
+96
+120 sx=-80
+150 sx=-80 A
+156
+180 X
+183
+190 sx=0 A
+200
+220 sy=-80 A
+230
+250 L
+280
+300 sx=80 Y
+303 sx=80
+320 sx=80 B
+330

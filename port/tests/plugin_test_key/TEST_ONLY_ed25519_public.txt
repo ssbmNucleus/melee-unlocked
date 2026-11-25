@@ -1,0 +1,2 @@
+# TEST ONLY. The public half of TEST_ONLY_ed25519_seed.txt; see there.
+76c56968360ad8274b6104c58a7309f273a6f8fc70432bc736a6fcdef08a8ef4

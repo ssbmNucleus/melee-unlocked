@@ -1,0 +1,5 @@
+# the stale-move attack instance (console fp+206C, the decomp's u16 x206C_attack_instance) by its
+# native place, MexTK's x206c, not by its console offset
+@@ code/fighter.c
+-    return *(u16 *)((u8 *)fd+0x206C);
++    return *(u16 *)&fd->x206c;
